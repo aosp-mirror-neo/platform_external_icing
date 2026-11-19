@@ -206,6 +206,18 @@ public interface IcingSearchEngineInterface extends Closeable {
     throw new UnsupportedOperationException("getBlobKey is not supported.");
   }
 
+  /**
+   * Re-wraps the encryption key of a committed blob to the given server public key after verifying
+   * the server attestation. Only implementations that can verify the attestation, such as the
+   * isolated storage pVM, support this.
+   */
+  default BlobProto rewrapBlobKey(
+      PropertyProto.BlobHandleProto blobHandle,
+      byte[] serverPublicKey,
+      byte[] serverAttestation) {
+    throw new UnsupportedOperationException("rewrapBlobKey is not supported.");
+  }
+
   /** Gets all the blob info from the blob store. */
   BlobProto getAllBlobInfos();
 
