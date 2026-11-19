@@ -86,6 +86,11 @@ class DocumentAssociatedScoreData {
     scorable_property_cache_index_ = scorable_property_cache_index;
   }
 
+  void set_effective_last_update_timestamp_ms(
+      int64_t effective_last_update_timestamp_ms) {
+    effective_last_update_timestamp_ms_ = effective_last_update_timestamp_ms;
+  }
+
  private:
   int64_t creation_timestamp_ms_;
   int64_t effective_last_update_timestamp_ms_;
