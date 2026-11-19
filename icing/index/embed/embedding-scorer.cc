@@ -59,11 +59,10 @@ EmbeddingScorer::Create(
 namespace {
 
 // ---------------------------------------------------------------------------
-// Quantized document scoring (8-bit query x 8-bit doc and float32 query x
-// 8-bit doc).
+// 8-bit x 8-bit quantized scoring.
 //
-// When scoring against 8-bit quantized documents, the score is reconstructed
-// from accumulated sums without dequantizing individual document elements.
+// When both operands are 8-bit quantized, the score is reconstructed from
+// exact integer sums without dequantizing individual elements.
 //
 // A quantizer maps a byte v to a float via v/s + m, where s is
 // Quantizer::scale_factor() and m is Quantizer::float_min(). Expanding the dot
@@ -74,11 +73,6 @@ namespace {
 //          + (m_q / s_d)       * sum(d[i])
 //          + dimension * m_q * m_d
 //
-// When the query Q is unquantized float32 and only D is 8-bit quantized:
-//
-//   <Q, D> = (1 / s_d) * sum(q[i] * d[i])
-//          + m_d       * sum(q[i])
-//
 // and, for a single vector,
 //
 //   ||V||^2 = (1 / s^2)   * sum(v[i]^2)
@@ -86,7 +80,7 @@ namespace {
 //           + dimension * m^2
 //
 // Query-dependent terms are precomputed once in EmbeddingQuery, so the
-// per-document loop accumulates only document-dependent sums.
+// per-document loop accumulates only document-dependent integer sums.
 // ---------------------------------------------------------------------------
 
 // Integer sums produced by the per-document accumulation loop.
@@ -94,13 +88,6 @@ struct QuantizedAccumulators {
   uint32_t dot = 0;         // sum(q[i] * d[i])
   uint32_t doc_sum = 0;     // sum(d[i])
   uint32_t doc_sum_sq = 0;  // sum(d[i] * d[i]); populated when kNeedDocSumSq.
-};
-
-// Sums produced when the query is float32 and the document is 8-bit quantized.
-struct FloatAndQuantizedAccumulators {
-  double dot = 0.0;         // sum(q[i] * d[i])
-  uint32_t doc_sum = 0;     // sum(d[i]); populated when kNeedDocNormSq.
-  uint32_t doc_sum_sq = 0;  // sum(d[i] * d[i]); populated when kNeedDocNormSq.
 };
 
 // Returns 1/scale_factor, or 0 when the quantizer is degenerate.
@@ -130,20 +117,9 @@ inline double FoilDotProduct(int dimension, const QuantizedAccumulators& acc,
          (static_cast<double>(dimension) * query_min * doc_min);
 }
 
-// Reconstructs <Q, D> = (1 / s_d) * sum(q[i] * d[i]) + m_d * sum(q[i]).
-inline double FoilDotProduct(int /*dimension*/,
-                             const FloatAndQuantizedAccumulators& acc,
-                             const EmbeddingQuery& query,
-                             const Quantizer& doc_quantizer,
-                             double inv_doc_scale) {
-  const double doc_min = static_cast<double>(doc_quantizer.float_min());
-  return (acc.dot * inv_doc_scale) + (doc_min * query.float_sum());
-}
-
 // Reconstructs the dequantized squared L2 norm of the document from integer
 // sums.
-template <typename Accumulators>
-inline double FoilDocNormSq(int dimension, const Accumulators& acc,
+inline double FoilDocNormSq(int dimension, const QuantizedAccumulators& acc,
                             const Quantizer& doc_quantizer,
                             double inv_doc_scale) {
   const double doc_min = static_cast<double>(doc_quantizer.float_min());
@@ -152,8 +128,7 @@ inline double FoilDocNormSq(int dimension, const Accumulators& acc,
          (static_cast<double>(dimension) * doc_min * doc_min);
 }
 
-template <typename Accumulators>
-inline float FinishDotProduct(int dimension, const Accumulators& acc,
+inline float FinishDotProduct(int dimension, const QuantizedAccumulators& acc,
                               const EmbeddingQuery& query,
                               const Quantizer& doc_quantizer) {
   return static_cast<float>(FoilDotProduct(dimension, acc, query, doc_quantizer,
@@ -162,8 +137,7 @@ inline float FinishDotProduct(int dimension, const Accumulators& acc,
 
 inline double NonNegativeOrNan(double x) { return x < 0.0 ? 0.0 : x; }
 
-template <typename Accumulators>
-inline float FinishCosine(int dimension, const Accumulators& acc,
+inline float FinishCosine(int dimension, const QuantizedAccumulators& acc,
                           const EmbeddingQuery& query,
                           const Quantizer& doc_quantizer) {
   const double inv_doc_scale = InvScale(doc_quantizer);
@@ -180,8 +154,7 @@ inline float FinishCosine(int dimension, const Accumulators& acc,
   return std::clamp(static_cast<float>(dot_product / divisor), -1.0f, 1.0f);
 }
 
-template <typename Accumulators>
-inline float FinishEuclidean(int dimension, const Accumulators& acc,
+inline float FinishEuclidean(int dimension, const QuantizedAccumulators& acc,
                              const EmbeddingQuery& query,
                              const Quantizer& doc_quantizer) {
   const double inv_doc_scale = InvScale(doc_quantizer);
@@ -194,9 +167,8 @@ inline float FinishEuclidean(int dimension, const Accumulators& acc,
   return static_cast<float>(std::sqrt(NonNegativeOrNan(dist_sq)));
 }
 
-// Beyond this dimension, the uint32_t accumulators in AccumulateQuantized() and
-// AccumulateFloatAndQuantized() can wrap (maximum per-element contribution is
-// 255 * 255 = 65,025).
+// Beyond this dimension, the uint32_t accumulators in AccumulateQuantized()
+// can wrap (maximum per-element contribution is 255 * 255 = 65,025).
 constexpr size_t kMaxQuantizedScoringDimension =
     std::numeric_limits<uint32_t>::max() / (255u * 255u);  // 66,051
 
@@ -260,65 +232,6 @@ QuantizedAccumulators AccumulateQuantized(
   return {dot, doc_sum, doc_sum_sq};
 }
 
-// Accumulates sum(q[i] * d[i]) and, when kNeedDocNormSq is true, sum(d[i]) and
-// sum(d[i] * d[i]) across `dimension` elements.
-//
-// Each product is rounded to float32, then summed in double so rounding error
-// does not build up across the sum.
-template <bool kNeedDocNormSq>
-FloatAndQuantizedAccumulators AccumulateFloatAndQuantized(
-    int dimension, const float* __restrict__ query_values,
-    const uint8_t* __restrict__ doc_values) {
-  double dot0 = 0.0, dot1 = 0.0, dot2 = 0.0, dot3 = 0.0;
-  uint32_t doc_sum0 = 0, doc_sum1 = 0, doc_sum2 = 0, doc_sum3 = 0;
-  uint32_t doc_sum_sq0 = 0, doc_sum_sq1 = 0, doc_sum_sq2 = 0, doc_sum_sq3 = 0;
-
-  int i = 0;
-  for (; i + 4 <= dimension; i += 4) {
-    dot0 += static_cast<double>(query_values[i] *
-                                static_cast<float>(doc_values[i]));
-    dot1 += static_cast<double>(query_values[i + 1] *
-                                static_cast<float>(doc_values[i + 1]));
-    dot2 += static_cast<double>(query_values[i + 2] *
-                                static_cast<float>(doc_values[i + 2]));
-    dot3 += static_cast<double>(query_values[i + 3] *
-                                static_cast<float>(doc_values[i + 3]));
-
-    if (kNeedDocNormSq) {
-      doc_sum0 += doc_values[i];
-      doc_sum1 += doc_values[i + 1];
-      doc_sum2 += doc_values[i + 2];
-      doc_sum3 += doc_values[i + 3];
-
-      doc_sum_sq0 += static_cast<uint32_t>(doc_values[i]) * doc_values[i];
-      doc_sum_sq1 +=
-          static_cast<uint32_t>(doc_values[i + 1]) * doc_values[i + 1];
-      doc_sum_sq2 +=
-          static_cast<uint32_t>(doc_values[i + 2]) * doc_values[i + 2];
-      doc_sum_sq3 +=
-          static_cast<uint32_t>(doc_values[i + 3]) * doc_values[i + 3];
-    }
-  }
-
-  double dot = (dot0 + dot2) + (dot1 + dot3);
-  uint32_t doc_sum = 0;
-  uint32_t doc_sum_sq = 0;
-  if (kNeedDocNormSq) {
-    doc_sum = (doc_sum0 + doc_sum2) + (doc_sum1 + doc_sum3);
-    doc_sum_sq = (doc_sum_sq0 + doc_sum_sq2) + (doc_sum_sq1 + doc_sum_sq3);
-  }
-
-  for (; i < dimension; ++i) {
-    dot += static_cast<double>(query_values[i] *
-                               static_cast<float>(doc_values[i]));
-    if (kNeedDocNormSq) {
-      doc_sum += doc_values[i];
-      doc_sum_sq += static_cast<uint32_t>(doc_values[i]) * doc_values[i];
-    }
-  }
-  return {dot, doc_sum, doc_sum_sq};
-}
-
 }  // namespace
 
 libtextclassifier3::StatusOr<EmbeddingQuery>
@@ -369,75 +282,46 @@ EmbeddingQuery::CreateFromQuantized(
 }
 
 libtextclassifier3::StatusOr<EmbeddingQuery> EmbeddingQuery::CreateFromFloats(
-    std::vector<float> floats, bool enable_quantization_scoring_optimization) {
+    std::vector<float> floats) {
   if (floats.empty()) {
     return absl_ports::InvalidArgumentError("Query vector is empty");
   }
-  if (!enable_quantization_scoring_optimization ||
-      floats.size() > kMaxQuantizedScoringDimension) {
-    return EmbeddingQuery(std::move(floats));
-  }
-  double float_sum = 0.0;
-  double norm_sq = 0.0;
-  for (float element : floats) {
-    float_sum += element;
-    norm_sq += static_cast<double>(element) * element;
-  }
-  const double norm = std::sqrt(norm_sq);
-  return EmbeddingQuery(std::move(floats), float_sum, norm, norm_sq);
+  return EmbeddingQuery(std::move(floats));
 }
 
 float CosineEmbeddingScorer::Score(int dimension, const EmbeddingQuery& v1,
                                    const uint8_t* v2,
                                    const Quantizer& quantizer) const {
-  if (!v1.is_scoring_optimization_enabled()) {
+  if (!v1.is_quantized()) {
     return Score(dimension, v1.floats().data(), v2, quantizer);
   }
-  if (v1.is_quantized()) {
-    return FinishCosine(dimension,
-                        AccumulateQuantized</*kNeedDocSumSq=*/true>(
-                            dimension, v1.quantized_data(), v2),
-                        v1, quantizer);
-  }
   return FinishCosine(dimension,
-                      AccumulateFloatAndQuantized</*kNeedDocNormSq=*/true>(
-                          dimension, v1.floats().data(), v2),
+                      AccumulateQuantized</*kNeedDocSumSq=*/true>(
+                          dimension, v1.quantized_data(), v2),
                       v1, quantizer);
 }
 
 float DotProductEmbeddingScorer::Score(int dimension, const EmbeddingQuery& v1,
                                        const uint8_t* v2,
                                        const Quantizer& quantizer) const {
-  if (!v1.is_scoring_optimization_enabled()) {
+  if (!v1.is_quantized()) {
     return Score(dimension, v1.floats().data(), v2, quantizer);
   }
-  if (v1.is_quantized()) {
-    return FinishDotProduct(dimension,
-                            AccumulateQuantized</*kNeedDocSumSq=*/false>(
-                                dimension, v1.quantized_data(), v2),
-                            v1, quantizer);
-  }
   return FinishDotProduct(dimension,
-                          AccumulateFloatAndQuantized</*kNeedDocNormSq=*/false>(
-                              dimension, v1.floats().data(), v2),
+                          AccumulateQuantized</*kNeedDocSumSq=*/false>(
+                              dimension, v1.quantized_data(), v2),
                           v1, quantizer);
 }
 
 float EuclideanDistanceEmbeddingScorer::Score(
     int dimension, const EmbeddingQuery& v1, const uint8_t* v2,
     const Quantizer& quantizer) const {
-  if (!v1.is_scoring_optimization_enabled()) {
+  if (!v1.is_quantized()) {
     return Score(dimension, v1.floats().data(), v2, quantizer);
   }
-  if (v1.is_quantized()) {
-    return FinishEuclidean(dimension,
-                           AccumulateQuantized</*kNeedDocSumSq=*/true>(
-                               dimension, v1.quantized_data(), v2),
-                           v1, quantizer);
-  }
   return FinishEuclidean(dimension,
-                         AccumulateFloatAndQuantized</*kNeedDocNormSq=*/true>(
-                             dimension, v1.floats().data(), v2),
+                         AccumulateQuantized</*kNeedDocSumSq=*/true>(
+                             dimension, v1.quantized_data(), v2),
                          v1, quantizer);
 }
 

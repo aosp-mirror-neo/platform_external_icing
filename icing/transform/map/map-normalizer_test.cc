@@ -51,15 +51,13 @@ TEST(MapNormalizerTest, AlreadyNormalized) {
   ICING_ASSERT_OK_AND_ASSIGN(auto normalizer,
                              normalizer_factory::Create(options));
 
-  EXPECT_THAT(normalizer->NormalizeTerm("", /*is_query_term=*/false),
-              EqualsNormalizedTerm(""));
-  EXPECT_THAT(normalizer->NormalizeTerm("hello world", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm(""), EqualsNormalizedTerm(""));
+  EXPECT_THAT(normalizer->NormalizeTerm("hello world"),
               EqualsNormalizedTerm("hello world"));
-  EXPECT_THAT(normalizer->NormalizeTerm("你好", /*is_query_term=*/false),
-              EqualsNormalizedTerm("你好"));
-  EXPECT_THAT(normalizer->NormalizeTerm("キャンパス", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("你好"), EqualsNormalizedTerm("你好"));
+  EXPECT_THAT(normalizer->NormalizeTerm("キャンパス"),
               EqualsNormalizedTerm("キャンパス"));
-  EXPECT_THAT(normalizer->NormalizeTerm("안녕하세요", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("안녕하세요"),
               EqualsNormalizedTerm("안녕하세요"));
 }
 
@@ -68,9 +66,8 @@ TEST(MapNormalizerTest, UppercaseToLowercase) {
   ICING_ASSERT_OK_AND_ASSIGN(auto normalizer,
                              normalizer_factory::Create(options));
 
-  EXPECT_THAT(normalizer->NormalizeTerm("MDI", /*is_query_term=*/false),
-              EqualsNormalizedTerm("mdi"));
-  EXPECT_THAT(normalizer->NormalizeTerm("Icing", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("MDI"), EqualsNormalizedTerm("mdi"));
+  EXPECT_THAT(normalizer->NormalizeTerm("Icing"),
               EqualsNormalizedTerm("icing"));
 }
 
@@ -79,76 +76,56 @@ TEST(MapNormalizerTest, LatinLetterRemoveAccent) {
   ICING_ASSERT_OK_AND_ASSIGN(auto normalizer,
                              normalizer_factory::Create(options));
 
-  EXPECT_THAT(normalizer->NormalizeTerm("Zürich", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("Zürich"),
               EqualsNormalizedTerm("zurich"));
-  EXPECT_THAT(normalizer->NormalizeTerm("après-midi", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("après-midi"),
               EqualsNormalizedTerm("apres-midi"));
-  EXPECT_THAT(normalizer->NormalizeTerm("Buenos días", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("Buenos días"),
               EqualsNormalizedTerm("buenos dias"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ÀÁÂÃÄÅĀĂĄḀḁàáâãäåāăą",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ÀÁÂÃÄÅĀĂĄḀḁàáâãäåāăą"),
               EqualsNormalizedTerm("aaaaaaaaaaaaaaaaaaaa"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ḂḄḆḃḅḇ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ḂḄḆḃḅḇ"),
               EqualsNormalizedTerm("bbbbbb"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ÇĆĈĊČḈḉćĉċčç",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ÇĆĈĊČḈḉćĉċčç"),
               EqualsNormalizedTerm("cccccccccccc"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ÐĎĐḊḌḎḐḒḋḍḏḑḓďđ",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ÐĎĐḊḌḎḐḒḋḍḏḑḓďđ"),
               EqualsNormalizedTerm("ddddddddddddddd"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ÈÉÊËĒĔĖĘḔḖḘḚḜḕḗḙḛḝèéêëēĕėęě",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ÈÉÊËĒĔĖĘḔḖḘḚḜḕḗḙḛḝèéêëēĕėęě"),
               EqualsNormalizedTerm("eeeeeeeeeeeeeeeeeeeeeeeeeee"));
-  EXPECT_THAT(normalizer->NormalizeTerm("Ḟḟ", /*is_query_term=*/false),
-              EqualsNormalizedTerm("ff"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ĜĞĠĢḠḡĝğġģ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("Ḟḟ"), EqualsNormalizedTerm("ff"));
+  EXPECT_THAT(normalizer->NormalizeTerm("ĜĞĠĢḠḡĝğġģ"),
               EqualsNormalizedTerm("gggggggggg"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ĤḢḤḦḨḪḣḥḧḩḫĥẖ",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ĤḢḤḦḨḪḣḥḧḩḫĥẖ"),
               EqualsNormalizedTerm("hhhhhhhhhhhhh"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ÌÍÎÏĨĪĬḬḭḯìíîïĩīĭ",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ÌÍÎÏĨĪĬḬḭḯìíîïĩīĭ"),
               EqualsNormalizedTerm("iiiiiiiiiiiiiiiii"));
-  EXPECT_THAT(normalizer->NormalizeTerm("Ĵĵ", /*is_query_term=*/false),
-              EqualsNormalizedTerm("jj"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ĶḰḲḴḵḱḳķ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("Ĵĵ"), EqualsNormalizedTerm("jj"));
+  EXPECT_THAT(normalizer->NormalizeTerm("ĶḰḲḴḵḱḳķ"),
               EqualsNormalizedTerm("kkkkkkkk"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ĹĻĽḶḸḼḷḹḻḽĺļľ",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ĹĻĽḶḸḼḷḹḻḽĺļľ"),
               EqualsNormalizedTerm("lllllllllllll"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ḾṀṂḿṁṃ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ḾṀṂḿṁṃ"),
               EqualsNormalizedTerm("mmmmmm"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ÑŃŅŇṄṆṈṊṅṇṉṋñńņň",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ÑŃŅŇṄṆṈṊṅṇṉṋñńņň"),
               EqualsNormalizedTerm("nnnnnnnnnnnnnnnn"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ŌŎŐÒÓÔÕÖṌṎṐṒṍṏṑṓòóôõöōŏő",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ŌŎŐÒÓÔÕÖṌṎṐṒṍṏṑṓòóôõöōŏő"),
               EqualsNormalizedTerm("oooooooooooooooooooooooo"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ṔṖṕṗ", /*is_query_term=*/false),
-              EqualsNormalizedTerm("pppp"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ŔŖŘṘṚṜṞṙṛṝṟŕŗř",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ṔṖṕṗ"), EqualsNormalizedTerm("pppp"));
+  EXPECT_THAT(normalizer->NormalizeTerm("ŔŖŘṘṚṜṞṙṛṝṟŕŗř"),
               EqualsNormalizedTerm("rrrrrrrrrrrrrr"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ŚŜŞŠȘṠṢṤṦṨṡṣṥṧṩșśŝşš",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ŚŜŞŠȘṠṢṤṦṨṡṣṥṧṩșśŝşš"),
               EqualsNormalizedTerm("ssssssssssssssssssss"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ŢŤȚṪṬṮṰṫṭṯṱțţť",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ŢŤȚṪṬṮṰṫṭṯṱțţť"),
               EqualsNormalizedTerm("tttttttttttttt"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ŨŪŬÙÚÛÜṲṴṶṸṺṳṵṷṹṻùúûüũūŭ",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ŨŪŬÙÚÛÜṲṴṶṸṺṳṵṷṹṻùúûüũūŭ"),
               EqualsNormalizedTerm("uuuuuuuuuuuuuuuuuuuuuuuu"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ṼṾṽṿ", /*is_query_term=*/false),
-              EqualsNormalizedTerm("vvvv"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ŴẀẂẄẆẈẁẃẅẇẉŵ",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ṼṾṽṿ"), EqualsNormalizedTerm("vvvv"));
+  EXPECT_THAT(normalizer->NormalizeTerm("ŴẀẂẄẆẈẁẃẅẇẉŵ"),
               EqualsNormalizedTerm("wwwwwwwwwwww"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ẊẌẋẍ", /*is_query_term=*/false),
-              EqualsNormalizedTerm("xxxx"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ÝŶŸẎẏŷýÿ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ẊẌẋẍ"), EqualsNormalizedTerm("xxxx"));
+  EXPECT_THAT(normalizer->NormalizeTerm("ÝŶŸẎẏŷýÿ"),
               EqualsNormalizedTerm("yyyyyyyy"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ŹŻŽẐẒẔẑẓẕźżž",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ŹŻŽẐẒẔẑẓẕźżž"),
               EqualsNormalizedTerm("zzzzzzzzzzzz"));
 }
 
@@ -160,16 +137,15 @@ TEST(MapNormalizerTest, NonLatinLetterNotRemoveAccent) {
                              normalizer_factory::Create(options));
 
   // Katakana
-  EXPECT_THAT(normalizer->NormalizeTerm("ダヂヅデド", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ダヂヅデド"),
               EqualsNormalizedTerm("ダヂヅデド"));
   // Greek
-  EXPECT_THAT(normalizer->NormalizeTerm("kαλημέρα", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("kαλημέρα"),
               EqualsNormalizedTerm("kαλημέρα"));
-  EXPECT_THAT(normalizer->NormalizeTerm("εγγραφή", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("εγγραφή"),
               EqualsNormalizedTerm("εγγραφή"));
   // Hebrew
-  EXPECT_THAT(normalizer->NormalizeTerm("אָלֶף־בֵּית עִבְרִי",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("אָלֶף־בֵּית עִבְרִי"),
               EqualsNormalizedTerm("אָלֶף־בֵּית עִבְרִי"));
 }
 
@@ -179,21 +155,18 @@ TEST(MapNormalizerTest, FullWidthCharsToASCII) {
                              normalizer_factory::Create(options));
 
   // Full-width punctuation to ASCII punctuation
-  EXPECT_THAT(normalizer->NormalizeTerm("‘’．，！？：“”", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("‘’．，！？：“”"),
               EqualsNormalizedTerm("''.,!?:\"\""));
   // Full-width 0-9
-  EXPECT_THAT(normalizer->NormalizeTerm("０１２３４５６７８９",
-                                        /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("０１２３４５６７８９"),
               EqualsNormalizedTerm("0123456789"));
   // Full-width A-Z
   EXPECT_THAT(normalizer->NormalizeTerm(
-                  "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ",
-                  /*is_query_term=*/false),
+                  "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"),
               EqualsNormalizedTerm("abcdefghijklmnopqrstuvwxyz"));
   // Full-width a-z
   EXPECT_THAT(normalizer->NormalizeTerm(
-                  "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
-                  /*is_query_term=*/false),
+                  "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ"),
               EqualsNormalizedTerm("abcdefghijklmnopqrstuvwxyz"));
 }
 
@@ -202,8 +175,7 @@ TEST(MapNormalizerTest, IdeographicToASCII) {
   ICING_ASSERT_OK_AND_ASSIGN(auto normalizer,
                              normalizer_factory::Create(options));
 
-  EXPECT_THAT(normalizer->NormalizeTerm("，。", /*is_query_term=*/false),
-              EqualsNormalizedTerm(",."));
+  EXPECT_THAT(normalizer->NormalizeTerm("，。"), EqualsNormalizedTerm(",."));
 }
 
 TEST(MapNormalizerTest, HiraganaToKatakana) {
@@ -211,37 +183,36 @@ TEST(MapNormalizerTest, HiraganaToKatakana) {
   ICING_ASSERT_OK_AND_ASSIGN(auto normalizer,
                              normalizer_factory::Create(options));
 
-  EXPECT_THAT(normalizer->NormalizeTerm("あいうえお", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("あいうえお"),
               EqualsNormalizedTerm("アイウエオ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("かきくけこ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("かきくけこ"),
               EqualsNormalizedTerm("カキクケコ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("さしすせそ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("さしすせそ"),
               EqualsNormalizedTerm("サシスセソ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("たちつてと", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("たちつてと"),
               EqualsNormalizedTerm("タチツテト"));
-  EXPECT_THAT(normalizer->NormalizeTerm("なにぬねの", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("なにぬねの"),
               EqualsNormalizedTerm("ナニヌネノ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("はひふへほ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("はひふへほ"),
               EqualsNormalizedTerm("ハヒフヘホ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("まみむめも", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("まみむめも"),
               EqualsNormalizedTerm("マミムメモ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("やゆよ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("やゆよ"),
               EqualsNormalizedTerm("ヤユヨ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("らりるれろ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("らりるれろ"),
               EqualsNormalizedTerm("ラリルレロ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("わゐゑを", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("わゐゑを"),
               EqualsNormalizedTerm("ワヰヱヲ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ん", /*is_query_term=*/false),
-              EqualsNormalizedTerm("ン"));
-  EXPECT_THAT(normalizer->NormalizeTerm("がぎぐげご", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ん"), EqualsNormalizedTerm("ン"));
+  EXPECT_THAT(normalizer->NormalizeTerm("がぎぐげご"),
               EqualsNormalizedTerm("ガギグゲゴ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ざじずぜぞ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ざじずぜぞ"),
               EqualsNormalizedTerm("ザジズゼゾ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("だぢづでど", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("だぢづでど"),
               EqualsNormalizedTerm("ダヂヅデド"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ばびぶべぼ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ばびぶべぼ"),
               EqualsNormalizedTerm("バビブベボ"));
-  EXPECT_THAT(normalizer->NormalizeTerm("ぱぴぷぺぽ", /*is_query_term=*/false),
+  EXPECT_THAT(normalizer->NormalizeTerm("ぱぴぷぺぽ"),
               EqualsNormalizedTerm("パピプペポ"));
 }
 
@@ -252,24 +223,22 @@ TEST(MapNormalizerTest, Truncate) {
                                normalizer_factory::Create(options));
 
     // Won't be truncated
-    EXPECT_THAT(normalizer->NormalizeTerm("hi", /*is_query_term=*/false),
-                EqualsNormalizedTerm("hi"));
-    EXPECT_THAT(normalizer->NormalizeTerm("hello", /*is_query_term=*/false),
+    EXPECT_THAT(normalizer->NormalizeTerm("hi"), EqualsNormalizedTerm("hi"));
+    EXPECT_THAT(normalizer->NormalizeTerm("hello"),
                 EqualsNormalizedTerm("hello"));
 
     // Truncated to length 5.
-    EXPECT_THAT(normalizer->NormalizeTerm("hello!", /*is_query_term=*/false),
+    EXPECT_THAT(normalizer->NormalizeTerm("hello!"),
                 EqualsNormalizedTerm("hello"));
 
     // Each Japanese character has 3 bytes, so truncating to length 5 results in
     // only 1 character.
-    EXPECT_THAT(normalizer->NormalizeTerm("キャンパス", /*is_query_term=*/false),
+    EXPECT_THAT(normalizer->NormalizeTerm("キャンパス"),
                 EqualsNormalizedTerm("キ"));
 
     // Each Greek character has 2 bytes, so truncating to length 5 results in 2
     // character.
-    EXPECT_THAT(normalizer->NormalizeTerm("αβγδε", /*is_query_term=*/false),
-                EqualsNormalizedTerm("αβ"));
+    EXPECT_THAT(normalizer->NormalizeTerm("αβγδε"), EqualsNormalizedTerm("αβ"));
   }
 
   {
@@ -278,8 +247,7 @@ TEST(MapNormalizerTest, Truncate) {
                                normalizer_factory::Create(options));
     // The Japanese character has 3 bytes, truncating it results in an empty
     // string.
-    EXPECT_THAT(normalizer->NormalizeTerm("キ", /*is_query_term=*/false),
-                EqualsNormalizedTerm(""));
+    EXPECT_THAT(normalizer->NormalizeTerm("キ"), EqualsNormalizedTerm(""));
   }
 }
 
@@ -291,11 +259,9 @@ TEST(MapNormalizerTest, InvalidUtf8) {
   // "\xff" is an invalid UTF-8 character. MapNormalizer should skip it and
   // continue, resulting in an empty normalizer term if only "\xff" is passed,
   // or filtering it out of a larger string.
-  EXPECT_THAT(normalizer->NormalizeTerm("\xff", /*is_query_term=*/false),
-              EqualsNormalizedTerm(""));
+  EXPECT_THAT(normalizer->NormalizeTerm("\xff"), EqualsNormalizedTerm(""));
   EXPECT_THAT(normalizer->NormalizeTerm("foo\xff"
-                                        "bar",
-                                        /*is_query_term=*/false),
+                                        "bar"),
               EqualsNormalizedTerm("foobar"));
 }
 

@@ -22,7 +22,6 @@
 #include <iterator>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -316,28 +315,8 @@ BlobProto BlobStore::OpenRead(
   return CreateBlobProtoFromFileDescriptor(file_descriptor);
 }
 
-BlobProto BlobStore::GetBlobKey(
-    const PropertyProto::BlobHandleProto& blob_handle) const {
-  ICING_ASSIGN_OR_RETURN(BlobInfoProto blob_info, GetBlobInfo(blob_handle),
-                         CreateBlobProtoFromError(_));
-  if (!blob_info.is_committed()) {
-    return CreateBlobProtoFromError(
-        absl_ports::NotFoundError(absl_ports::StrCat(
-            "Cannot find the blob for handle: ", blob_handle.digest())));
-  }
-  BlobProto blob_proto;
-  blob_proto.mutable_status()->set_code(StatusProto::OK);
-  // A committed blob without a blob key is not an error. Leave blob_key unset
-  // so that callers can distinguish it via has_blob_key().
-  if (blob_info.has_blob_key()) {
-    *blob_proto.mutable_blob_key() = std::move(*blob_info.mutable_blob_key());
-  }
-  return blob_proto;
-}
-
 libtextclassifier3::Status BlobStore::CommitBlobMetadata(
-    const PropertyProto::BlobHandleProto& blob_handle,
-    std::optional<BlobKeyProto> blob_key) {
+    const PropertyProto::BlobHandleProto& blob_handle) {
   ICING_RETURN_IF_ERROR(ValidateBlobHandle(blob_handle));
 
   std::string blob_handle_str = BuildBlobHandleStr(blob_handle);
@@ -362,9 +341,6 @@ libtextclassifier3::Status BlobStore::CommitBlobMetadata(
   ICING_RETURN_IF_ERROR(blob_info_log_->EraseProto(pending_blob_info_offset));
   has_mutated_ = true;
   blob_info_proto.set_is_committed(true);
-  if (blob_key.has_value()) {
-    *blob_info_proto.mutable_blob_key() = std::move(*blob_key);
-  }
   auto blob_info_offset_or = blob_info_log_->WriteProto(blob_info_proto);
   if (!blob_info_offset_or.ok()) {
     ICING_LOG(ERROR) << blob_info_offset_or.status().error_message()
@@ -376,23 +352,13 @@ libtextclassifier3::Status BlobStore::CommitBlobMetadata(
 }
 
 BlobProto BlobStore::CommitBlob(
-    const PropertyProto::BlobHandleProto& blob_handle,
-    std::optional<BlobKeyProto> blob_key) {
-  // Validate the blob key before any state is changed, so that the blob stays
-  // uncommitted and can be committed again with a valid key.
-  if (blob_key.has_value() && blob_key->key().empty()) {
-    return CreateBlobProtoFromError(absl_ports::InvalidArgumentError(
-        absl_ports::StrCat("The blob key must not be empty for handle: ",
-                           blob_handle.digest())));
-  }
-
+    const PropertyProto::BlobHandleProto& blob_handle) {
   BlobProto blob_proto;
   blob_proto.mutable_status()->set_code(StatusProto::OK);
 
   if (!manage_blob_files_) {
-    ICING_RETURN_EXPRESSION_IF_ERROR(
-        CommitBlobMetadata(blob_handle, std::move(blob_key)),
-        CreateBlobProtoFromError(_))
+    ICING_RETURN_EXPRESSION_IF_ERROR(CommitBlobMetadata(blob_handle),
+                                     CreateBlobProtoFromError(_))
     return blob_proto;
   }
 
@@ -450,9 +416,8 @@ BlobProto BlobStore::CommitBlob(
         "The blob content doesn't match to the digest."));
   }
   // Mark the blob as committed.
-  ICING_RETURN_EXPRESSION_IF_ERROR(
-      CommitBlobMetadata(blob_handle, std::move(blob_key)),
-      CreateBlobProtoFromError(_));
+  ICING_RETURN_EXPRESSION_IF_ERROR(CommitBlobMetadata(blob_handle),
+                                   CreateBlobProtoFromError(_));
   return blob_proto;
 }
 

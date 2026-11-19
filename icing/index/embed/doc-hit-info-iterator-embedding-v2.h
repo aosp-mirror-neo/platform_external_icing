@@ -141,9 +141,6 @@ class DocHitInfoIteratorEmbeddingV2
     }
   }
 
-  // For testing only.
-  const EmbeddingQuery& embedding_query() const { return query_; }
-
  private:
   struct HitWithScore {
     BasicHit hit;
