@@ -22,6 +22,21 @@ option java_package = "com.google.android.icing.proto";
 option java_multiple_files = true;
 option objc_class_prefix = "ICNG";
 
+// The request for IcingSearchEngine.GetDocumentChanges.
+// Next tag: 3
+message GetDocumentChangesRequestProto {
+  // If non-empty, only changes to documents whose schema type is in
+  // schema_filters are returned. If empty, changes to documents of all schema
+  // types are returned.
+  repeated string schema_filters = 1;
+
+  // Changes that occurred after page_token.last_sync_timestamp_ms are returned.
+  // To start syncing, set last_sync_timestamp_ms to the time from which changes
+  // are wanted. To continue, pass the next_page_token of the previous
+  // DocumentChangeResponseProto.
+  optional DocumentChangeResponseProto.PaginationToken page_token = 2;
+}
+
 // The result of a call to IcingSearchEngine.GetDocumentChanges, containing the
 // set of documents that have been added, updated, or deleted after some
 // timestamp.

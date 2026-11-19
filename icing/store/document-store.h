@@ -33,6 +33,7 @@
 #include "icing/file/persistent-id-to-string-mapper.h"
 #include "icing/file/portable-file-backed-proto-log.h"
 #include "icing/proto/debug.pb.h"
+#include "icing/proto/deletion.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/document_wrapper.pb.h"
 #include "icing/proto/internal/scorable_property_set.pb.h"
@@ -45,6 +46,7 @@
 #include "icing/schema/schema-store.h"
 #include "icing/store/corpus-associated-scoring-data.h"
 #include "icing/store/corpus-id.h"
+#include "icing/store/deletion-store.h"
 #include "icing/store/document-associated-score-data.h"
 #include "icing/store/document-change.h"
 #include "icing/store/document-filter-data.h"
@@ -139,8 +141,14 @@ class DocumentStore {
   // If initialize_stats is present, the fields related to DocumentStore will be
   // populated.
   //
-  // Does not take any ownership, and all pointers except initialize_stats must
-  // refer to valid objects that outlive the one constructed.
+  // If deletion_store is non-null and offline observers are enabled, a
+  // DeletionEvent is put into deletion_store whenever a document is deleted
+  // (see Delete() and ForceDelete()). Deleting the old version of a document
+  // when it is replaced by Put() is not a deletion.
+  //
+  // Does not take any ownership, and all pointers except initialize_stats and
+  // deletion_store must refer to valid objects that outlive the one
+  // constructed. If non-null, deletion_store must also outlive it.
   //
   // TODO(cassiewang): Consider returning a status indicating that derived files
   // were regenerated. This may be helpful in logs.
@@ -156,7 +164,8 @@ class DocumentStore {
       bool force_recovery_and_revalidate_documents, bool pre_mapping_fbv,
       bool use_persistent_hash_map, int32_t compression_level,
       uint32_t compression_threshold_bytes, int32_t compression_mem_level,
-      InitializeStatsProto* initialize_stats);
+      InitializeStatsProto* initialize_stats,
+      DeletionStore* deletion_store = nullptr);
 
   // Discards all derived data in the document store.
   //
@@ -299,6 +308,9 @@ class DocumentStore {
   // Deletes the document identified by the given document_id, only if it is
   // still alive. The document proto will be erased immediately.
   //
+  // If deletion events are enabled (see Create()), also puts a DeletionEvent
+  // for the document into the DeletionStore.
+  //
   // NOTE:
   //    Space is not reclaimed for deleted documents until Optimize() is
   //    called.
@@ -306,7 +318,8 @@ class DocumentStore {
   // Returns:
   //   OK on success
   //   NOT_FOUND if the document doesn't exist (i.e. deleted or expired)
-  //   INTERNAL_ERROR on IO error
+  //   INTERNAL_ERROR on IO error, including failing to put the DeletionEvent
+  //     after the document was deleted
   //   INVALID_ARGUMENT if document_id is invalid.
   libtextclassifier3::Status Delete(DocumentId document_id,
                                     int64_t current_time_ms);
@@ -317,6 +330,10 @@ class DocumentStore {
   // Different from Delete(), this method promises that the document proto will
   // be erased even if the document is expired.
   //
+  // If deletion events are enabled (see Create()), also puts a DeletionEvent
+  // for the document into the DeletionStore, unless the document has already
+  // been replaced by a newer document with the same namespace and uri.
+  //
   // NOTE:
   //    Space is not reclaimed for deleted documents until Optimize() is
   //    called.
@@ -324,10 +341,24 @@ class DocumentStore {
   // Returns:
   //   DocumentMetadata of the deleted document on success
   //   NOT_FOUND_ERROR if the document doesn't exist or has been deleted
-  //   INTERNAL_ERROR on IO error
+  //   INTERNAL_ERROR on IO error, including failing to put the DeletionEvent
+  //     after the document was deleted
   //   INVALID_ARGUMENT_ERROR if document_id is invalid.
   libtextclassifier3::StatusOr<DocumentMetadata> ForceDelete(
       DocumentId document_id);
+
+  // Puts the DeletionEvents of the expired documents that OptimizeInto() didn't
+  // copy (see OptimizeResult::expired_document_deletion_events) into the
+  // DeletionStore, in order, issuing a deletion timestamp for each. Should be
+  // called on the new document store once the caller has switched to it.
+  //
+  // No-op if deletion events are not enabled (see Create()).
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::Status PutExpiredDocumentDeletionEvents(
+      std::vector<DeletionEvent> expired_document_deletion_events);
 
   // Returns the NamespaceId of the string namespace
   //
@@ -658,6 +689,16 @@ class DocumentStore {
 
     // A set of blob handles that are dead and need to be removed.
     std::unordered_set<std::string> dead_blob_handles;
+
+    // DeletionEvents for the expired documents that weren't copied into the
+    // new directory, in order of document id. Their deletion timestamps are
+    // not set, since the deletion only happens once the caller switches to the
+    // new document store; see PutExpiredDocumentDeletionEvents(). Expired
+    // documents that have been replaced by a newer document with the same
+    // namespace and uri are skipped (see IsReplaced()).
+    //
+    // Only populated if deletion events are enabled (see Create()).
+    std::vector<DeletionEvent> expired_document_deletion_events;
   };
   // Copy data from current base directory into a new directory. Any outdated or
   // deleted data won't be copied. During the process, document/namespace ids
@@ -725,12 +766,18 @@ class DocumentStore {
                          bool pre_mapping_fbv, bool use_persistent_hash_map,
                          int32_t compression_level,
                          uint32_t compression_threshold_bytes,
-                         int32_t compression_mem_level);
+                         int32_t compression_mem_level,
+                         DeletionStore* deletion_store);
 
   const Filesystem* const filesystem_;
   const std::string base_dir_;
   const Clock& clock_;
   const FeatureFlags& feature_flags_;  // Does not own.
+
+  // Stores a DeletionEvent for every deleted document. Does not own. May be
+  // null, in which case (or if offline observers are disabled) no
+  // DeletionEvents are put.
+  DeletionStore* const deletion_store_;
 
   // Handles the ground truth schema and all of the derived data off of the
   // schema
@@ -891,6 +938,68 @@ class DocumentStore {
   // header checksum mismatch or by an older version of the code), and the
   // score cache covers every document that is still in the log.
   void RestoreLastIssuedTimestamp();
+
+  // Returns whether DeletionEvents should be put into deletion_store_.
+  bool ShouldPutDeletionEvents() const {
+    return feature_flags_.enable_offline_observers() &&
+           deletion_store_ != nullptr;
+  }
+
+  // Returns whether document, which has document_id, has been replaced by a
+  // newer document with the same namespace and uri.
+  //
+  // An expired document isn't deleted when a newer document with the same
+  // namespace and uri is put, so it can still be removed (e.g. force deleted or
+  // purged by optimize) afterwards. Its namespace and uri then refer to the
+  // newer document, which still exists, so the removal isn't a deletion from
+  // the client's perspective and shouldn't get a DeletionEvent.
+  //
+  // Returns:
+  //   Whether the document has been replaced on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::StatusOr<bool> IsReplaced(
+      DocumentId document_id, const DocumentProto& document) const;
+
+  // Creates a DeletionEvent, without a deletion timestamp, for document, which
+  // has document_id. The last update timestamp is read from the score cache, so
+  // this must be called before the document's derived data is cleared.
+  //
+  // Returns:
+  //   The DeletionEvent on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::StatusOr<DeletionEvent> CreateDeletionEvent(
+      DocumentId document_id, const DocumentProto& document) const;
+
+  // Reads the expired document with document_id from the DocumentLog, creates
+  // its DeletionEvent with CreateDeletionEvent, and appends it to
+  // deletion_events. Nothing is appended if the document has been replaced
+  // (see IsReplaced()).
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::Status AppendDeletionEvent(
+      DocumentId document_id,
+      std::vector<DeletionEvent>* deletion_events) const;
+
+  // Issues a deletion timestamp for deletion_event and puts it into
+  // deletion_store_.
+  //
+  // REQUIRES: ShouldPutDeletionEvents() is true.
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::Status PutDeletionEvent(DeletionEvent deletion_event);
+
+  // Implementation of Delete(document_id, current_time_ms). is_replacement is
+  // true when the document is deleted because a newer document with the same
+  // namespace and uri replaced it (see InternalPut()). Unless is_replacement is
+  // true, also puts a DeletionEvent for the document if
+  // ShouldPutDeletionEvents() is true.
+  libtextclassifier3::Status InternalDelete(DocumentId document_id,
+                                            int64_t current_time_ms,
+                                            bool is_replacement);
 
   // Resets the unique_ptr to the document_key_mapper, deletes the underlying
   // file, and re-creates a new instance of the document_key_mapper .

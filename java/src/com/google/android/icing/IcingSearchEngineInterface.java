@@ -10,8 +10,10 @@ import com.google.android.icing.proto.DeleteByNamespaceResultProto;
 import com.google.android.icing.proto.DeleteByQueryResultProto;
 import com.google.android.icing.proto.DeleteBySchemaTypeResultProto;
 import com.google.android.icing.proto.DeleteResultProto;
+import com.google.android.icing.proto.DocumentChangeResponseProto;
 import com.google.android.icing.proto.DocumentProto;
 import com.google.android.icing.proto.GetAllNamespacesResultProto;
+import com.google.android.icing.proto.GetDocumentChangesRequestProto;
 import com.google.android.icing.proto.GetNextPageRequestProto;
 import com.google.android.icing.proto.GetOptimizeInfoResultProto;
 import com.google.android.icing.proto.GetResultProto;
@@ -124,6 +126,18 @@ public interface IcingSearchEngineInterface extends Closeable {
 
   /** Gets all namespaces. */
   GetAllNamespacesResultProto getAllNamespaces();
+
+  /**
+   * Gets the documents that were added, updated or deleted after the timestamp in the request's
+   * page token, grouped by namespace and schema type.
+   *
+   * <p>Results are paginated. If {@code has_more_changes} is true in the response, call this
+   * again with the response's {@code next_page_token} to get the next page.
+   */
+  default DocumentChangeResponseProto getDocumentChanges(
+      GetDocumentChangesRequestProto getDocumentChangesRequest) {
+    throw new UnsupportedOperationException("getDocumentChanges is not supported.");
+  }
 
   /**
    * Searches over the documents.

@@ -16,7 +16,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include "icing/icing-search-engine.h"
@@ -25,6 +27,7 @@
 #include "icing/jni/scoped-utf-chars.h"
 #include "icing/proto/ann.pb.h"
 #include "icing/proto/blob.pb.h"
+#include "icing/proto/change_notification.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/initialize.pb.h"
 #include "icing/proto/optimize.pb.h"
@@ -291,6 +294,34 @@ jbyteArray nativeGetAllNamespaces(JNIEnv* env, jclass clazz, jobject object) {
       icing->GetAllNamespaces();
 
   return SerializeProtoToJniByteArray(env, get_all_namespaces_result_proto);
+}
+
+// TODO(b/568469783) - pre-register this API explicitly via RegisterNatives
+// in JNI_OnLoad once Jetpack build is dropped back into g3
+JNIEXPORT jbyteArray JNICALL
+Java_com_google_android_icing_IcingSearchEngineImpl_nativeGetDocumentChanges(
+    JNIEnv* env, jclass clazz, jobject object,
+    jbyteArray get_document_changes_request_bytes) {
+  icing::lib::IcingSearchEngine* icing =
+      GetIcingSearchEnginePointer(env, object);
+
+  icing::lib::GetDocumentChangesRequestProto get_document_changes_request;
+  if (!ParseProtoFromJniByteArray(env, get_document_changes_request_bytes,
+                                  &get_document_changes_request)) {
+    ICING_LOG(icing::lib::ERROR)
+        << "Failed to parse GetDocumentChangesRequestProto in "
+           "nativeGetDocumentChanges";
+    return nullptr;
+  }
+  std::unordered_set<std::string> schemas(
+      get_document_changes_request.schema_filters().begin(),
+      get_document_changes_request.schema_filters().end());
+
+  icing::lib::DocumentChangeResponseProto document_change_response_proto =
+      icing->GetDocumentChanges(schemas,
+                                get_document_changes_request.page_token());
+
+  return SerializeProtoToJniByteArray(env, document_change_response_proto);
 }
 
 jbyteArray nativeGetNextPage(JNIEnv* env, jclass clazz, jobject object,
