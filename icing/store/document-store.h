@@ -46,6 +46,7 @@
 #include "icing/store/corpus-associated-scoring-data.h"
 #include "icing/store/corpus-id.h"
 #include "icing/store/document-associated-score-data.h"
+#include "icing/store/document-change.h"
 #include "icing/store/document-filter-data.h"
 #include "icing/store/document-group-info.h"
 #include "icing/store/document-id.h"
@@ -387,6 +388,36 @@ class DocumentStore {
   //   INTERNAL_ERROR on IO error
   libtextclassifier3::StatusOr<std::string> GetUri(
       DocumentId document_id) const;
+
+  // Returns the alive (not deleted and not expired) documents that were added
+  // or updated after timestamp_ms, i.e. whose effective last update timestamp
+  // is strictly greater than timestamp_ms, as DocumentChanges sorted by
+  // operation timestamp. A document that was updated multiple times after
+  // timestamp_ms is only returned once, for its latest version. Deleted
+  // documents are not returned, including documents that were added and then
+  // deleted after timestamp_ms.
+  //
+  // If schemas is non-empty, only documents whose schema type is in schemas
+  // are returned. Schema types in schemas that don't exist are ignored. If
+  // schemas is empty, documents of all schema types are returned.
+  //
+  // At most max_changes changes are returned, so none are returned if
+  // max_changes is 0. If there are more changes after the returned ones,
+  // next_change_timestamp_ms is set to the operation timestamp of the first
+  // one. See DocumentChangeResult for how to fetch the next page.
+  //
+  // REQUIRES: effective last update timestamps in the score cache are
+  //   non-decreasing in document id order. This is used to binary search for
+  //   the first document updated after timestamp_ms.
+  //
+  // Returns:
+  //   A DocumentChangeResult on success
+  //   INVALID_ARGUMENT if max_changes is negative
+  //   FAILED_PRECONDITION if offline observers are not enabled
+  //   INTERNAL_ERROR on IO error or inconsistent derived data
+  libtextclassifier3::StatusOr<DocumentChangeResult> GetAddedOrUpdatedDocuments(
+      int64_t timestamp_ms, const std::unordered_set<std::string>& schemas,
+      int max_changes, int64_t current_time_ms) const;
 
   // Returns the CorpusId associated with the given namespace and schema.
   //
@@ -839,6 +870,20 @@ class DocumentStore {
   //             zero-filled entries).
   //   Error on failure.
   libtextclassifier3::Status RegenerateDerivedFiles(bool revalidate_documents);
+
+  // Fills the effective_last_update_timestamp_ms of score cache entries that
+  // are 0 (documents put without a timestamp, and erased documents), so that
+  // the score cache is non-decreasing by document id.
+  //
+  // Does nothing if no timestamp has been issued yet, i.e. the document log
+  // header value is 0 and every entry is 0. Otherwise every 0 entry is filled:
+  //   - Entries followed by a non-zero entry get the timestamp of the next
+  //     non-zero entry.
+  //   - Trailing entries get max(current system time, largest + 1), where
+  //     largest is the max of the last non-zero entry and the document log
+  //     header value, and the value is recorded in the document log header.
+  // No document entries in the document log are modified.
+  libtextclassifier3::Status FillMissingEffectiveLastUpdateTimestamps();
 
   // Sets last_issued_timestamp_ms_ to the largest of the value stored in the
   // document log header and the largest effective_last_update_timestamp_ms in
