@@ -50,7 +50,7 @@ class DeletionLogCreator {
   static libtextclassifier3::StatusOr<DeletionLogCreator::CreateResult> Create(
       const Filesystem* filesystem, const std::string& base_dir,
       int32_t compression_level, uint32_t compression_threshold_bytes,
-      int32_t compression_mem_level);
+      int32_t compression_mem_level, bool enable_compression_mem_level = false);
 
   // Returns the filename of the deletion log, without any directory prefixes.
   // Used mainly for testing purposes.

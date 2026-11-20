@@ -122,17 +122,24 @@ class PortableFileBackedProtoLog {
     // BEST_COMPRESSION and SPEED = 9
     const int32_t compression_mem_level;
 
+    // Whether to apply compression_mem_level to GzipOutputStream::Options in
+    // WriteProto(). When false, GzipOutputStream falls back to default
+    // memLevel 8.
+    const bool enable_compression_mem_level;
+
     // Must specify values for options.
     Options() = delete;
     explicit Options(bool compress_in, const int32_t max_proto_size_in,
                      const int32_t compression_level_in,
                      const uint32_t compression_threshold_bytes_in,
-                     const int32_t compression_mem_level_in)
+                     const int32_t compression_mem_level_in,
+                     const bool enable_compression_mem_level_in = false)
         : compress(compress_in),
           max_proto_size(max_proto_size_in),
           compression_level(compression_level_in),
           compression_threshold_bytes(compression_threshold_bytes_in),
-          compression_mem_level(compression_mem_level_in) {}
+          compression_mem_level(compression_mem_level_in),
+          enable_compression_mem_level(enable_compression_mem_level_in) {}
   };
 
   // Level of compression, BEST_SPEED = 1, BEST_COMPRESSION = 9
@@ -709,13 +716,11 @@ class PortableFileBackedProtoLog {
 
  private:
   // Object can only be instantiated via the ::Create factory.
-  explicit PortableFileBackedProtoLog(const Filesystem* filesystem,
-                                      const std::string& file_path,
-                                      std::unique_ptr<Header> header,
-                                      int64_t file_size,
-                                      int32_t compression_level,
-                                      uint32_t compression_threshold_bytes,
-                                      int32_t compression_mem_level);
+  explicit PortableFileBackedProtoLog(
+      const Filesystem* filesystem, const std::string& file_path,
+      std::unique_ptr<Header> header, int64_t file_size,
+      int32_t compression_level, uint32_t compression_threshold_bytes,
+      int32_t compression_mem_level, bool enable_compression_mem_level);
 
   // Initializes a new proto log.
   //
@@ -839,6 +844,7 @@ class PortableFileBackedProtoLog {
   const int32_t compression_level_;
   const uint32_t compression_threshold_bytes_;
   const int32_t compression_mem_level_;
+  const bool enable_compression_mem_level_;
 
   mutable std::unique_ptr<uint8_t[]> read_buffer_ ICING_GUARDED_BY(mutex_);
   mutable size_t read_buffer_size_ ICING_GUARDED_BY(mutex_);
@@ -850,7 +856,7 @@ PortableFileBackedProtoLog<ProtoT>::PortableFileBackedProtoLog(
     const Filesystem* filesystem, const std::string& file_path,
     std::unique_ptr<Header> header, int64_t file_size,
     int32_t compression_level, uint32_t compression_threshold_bytes,
-    int32_t compression_mem_level)
+    int32_t compression_mem_level, bool enable_compression_mem_level)
     : filesystem_(filesystem),
       file_path_(file_path),
       header_(std::move(header)),
@@ -858,6 +864,7 @@ PortableFileBackedProtoLog<ProtoT>::PortableFileBackedProtoLog(
       compression_level_(compression_level),
       compression_threshold_bytes_(compression_threshold_bytes),
       compression_mem_level_(compression_mem_level),
+      enable_compression_mem_level_(enable_compression_mem_level),
       read_buffer_size_(0) {
   fd_.reset(filesystem_->OpenForAppend(file_path.c_str()));
 }
@@ -973,7 +980,8 @@ PortableFileBackedProtoLog<ProtoT>::InitializeNewFile(
               filesystem, file_path, std::move(header),
               /*file_size=*/kHeaderReservedBytes, options.compression_level,
               options.compression_threshold_bytes,
-              options.compression_mem_level)),
+              options.compression_mem_level,
+              options.enable_compression_mem_level)),
       /*data_loss=*/DataLoss::NONE, /*recalculated_checksum=*/false};
 
   return create_result;
@@ -1178,7 +1186,8 @@ PortableFileBackedProtoLog<ProtoT>::InitializeExistingFile(
           new PortableFileBackedProtoLog<ProtoT>(
               filesystem, file_path, std::move(header), file_size,
               options.compression_level, options.compression_threshold_bytes,
-              options.compression_mem_level)),
+              options.compression_mem_level,
+              options.enable_compression_mem_level)),
       data_loss, recalculated_checksum};
 
   return create_result;
@@ -1292,6 +1301,9 @@ PortableFileBackedProtoLog<ProtoT>::WriteProto(const ProtoT& proto) {
       options.compression_level = compression_level_;
     } else {
       options.compression_level = 0;
+    }
+    if (enable_compression_mem_level_) {
+      options.mem_level = compression_mem_level_;
     }
     options.buffer_size = proto_size;
     if (proto_size < 0 ||
