@@ -44,6 +44,7 @@
 #include "icing/legacy/index/icing-filesystem.h"
 #include "icing/performance-configuration.h"
 #include "icing/proto/blob.pb.h"
+#include "icing/proto/change_notification.pb.h"
 #include "icing/proto/debug.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/initialize.pb.h"
@@ -61,6 +62,7 @@
 #include "icing/schema/schema-store.h"
 #include "icing/scoring/scored-document-hit.h"
 #include "icing/store/blob-store.h"
+#include "icing/store/deletion-store.h"
 #include "icing/store/document-group-info.h"
 #include "icing/store/document-id.h"
 #include "icing/store/document-store.h"
@@ -345,6 +347,54 @@ class IcingSearchEngine {
   // Returns:
   //   All namespaces on success
   GetAllNamespacesResultProto GetAllNamespaces();
+
+  // Returns the documents that changed after the timestamp in page_token,
+  // grouped by namespace and schema. Each change is identified by the uri of
+  // the changed document and the time at which the change occurred.
+  //
+  // Returns both documents that were added or updated (and are still alive),
+  // and documents that were deleted. Every deletion after the timestamp in
+  // page_token is returned, regardless of when the deleted document was last
+  // added or updated. Icing can't tell which documents the caller has seen, so
+  // it can't safely skip deletions of documents added or updated after the
+  // timestamp. For example:
+  //   - The caller may have seen an earlier version of a document that was
+  //     updated after the timestamp and then deleted.
+  //   - The caller may retry with an old token after having already processed
+  //     documents that were added after it.
+  // As a result, callers may receive deletions of documents they never saw,
+  // and must tolerate them. Deletions are kept for a limited time, so
+  // deletions older than that may be missing.
+  //
+  // Expired documents are returned as deletions too, but only once they are
+  // purged, by Optimize or HandleExpiredDocuments, with the time of the purge
+  // as the time of the change. Until then, an expired document is neither
+  // returned as added or updated nor as deleted. An expired document that was
+  // replaced by a newer document with the same namespace and uri is not
+  // returned as deleted, since the newer document still exists.
+  //
+  // If schemas is non-empty, only documents whose schema type is in schemas
+  // are returned. If schemas is empty, documents of all schema types are
+  // returned.
+  //
+  // Results are paginated. If has_more_changes is true in the response, call
+  // GetDocumentChanges again with the returned next_page_token to get the next
+  // page. next_page_token is always populated, and can be saved by the caller
+  // to later retrieve changes that occur after this call. Retrieving changes is
+  // idempotent: calling this again with the same arguments returns the same
+  // changes, plus any that have happened since, so callers should be prepared
+  // to process the same change more than once. In particular, if a page ends in
+  // the middle of changes that share the same timestamp, the next page
+  // re-returns the changes at that timestamp that were already returned.
+  //
+  // Returns:
+  //   OK on success
+  //   FAILED_PRECONDITION if IcingSearchEngine has not been initialized yet, or
+  //     if offline observers are not enabled
+  //   INTERNAL_ERROR on IO error
+  DocumentChangeResponseProto GetDocumentChanges(
+      const std::unordered_set<std::string>& schemas,
+      const DocumentChangeResponseProto::PaginationToken& page_token);
 
   // Deletes the Document specified by the given namespace / uri pair from the
   // search engine. Delete changes are automatically applied to disk, callers
@@ -775,9 +825,17 @@ class IcingSearchEngine {
   // Stores and processes the schema
   std::unique_ptr<SchemaStore> schema_store_ ICING_GUARDED_BY(mutex_);
 
+  // Stores a DeletionEvent for every deleted or expired document, so that
+  // offline observers can retrieve deletions. Only created if offline observers
+  // are enabled, nullptr otherwise.
+  //
+  // Declared before document_store_, which holds a raw pointer to it, so that
+  // it is destroyed after document_store_.
+  std::unique_ptr<DeletionStore> deletion_store_ ICING_GUARDED_BY(mutex_);
+
   // Used to store all valid documents
   //
-  // Dependencies: schema_store_
+  // Dependencies: schema_store_, deletion_store_
   std::unique_ptr<DocumentStore> document_store_ ICING_GUARDED_BY(mutex_);
 
   // Used to manage pagination state of query results. Even though
@@ -993,6 +1051,37 @@ class IcingSearchEngine {
   //   INTERNAL on I/O error
   libtextclassifier3::Status InitializeSchemaStore(
       InitializeStatsProto* initialize_stats)
+      ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Creates the DeletionStore if offline observers are enabled. Otherwise,
+  // leaves deletion_store_ as nullptr. Must be called before
+  // InitializeDocumentStore, which passes deletion_store_ to the DocumentStore.
+  // Since document_store_ holds a raw pointer to deletion_store_, this resets
+  // document_store_ (and result_state_manager_, which depends on it) first.
+  //
+  // If the existing DeletionStore can't be created (e.g. its files are
+  // corrupted), its directory is deleted and an empty DeletionStore is created
+  // instead, discarding all stored DeletionEvents.
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL on I/O error, or if an empty DeletionStore can't be created
+  libtextclassifier3::Status InitializeDeletionStore()
+      ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Purges DeletionEvents that are older than the time to live from
+  // deletion_store_, if it exists. If deletion_store_ is still initialized
+  // after an error (e.g. the swap failed but deletion_store_ was re-initialized
+  // from the old or empty files), the error is logged and otherwise ignored.
+  // Otherwise, deletion_store_ can't be used until it is recreated, so like a
+  // DocumentStore that can't be recreated after Optimize, this marks Icing as
+  // uninitialized so that the next Initialize() recreates it.
+  //
+  // Returns:
+  //   OK on success, if deletion_store_ is null, or if deletion_store_ is still
+  //   initialized after an error.
+  //   INTERNAL if deletion_store_ is left uninitialized.
+  libtextclassifier3::Status OptimizeDeletionStore()
       ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Do any initialization/recovery necessary to create DocumentStore,

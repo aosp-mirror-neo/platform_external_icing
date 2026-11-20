@@ -42,6 +42,7 @@
 #include "icing/file/portable-file-backed-proto-log.h"
 #include "icing/legacy/core/icing-string-util.h"
 #include "icing/proto/debug.pb.h"
+#include "icing/proto/deletion.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/document_wrapper.pb.h"
 #include "icing/proto/internal/scorable_property_set.pb.h"
@@ -57,6 +58,7 @@
 #include "icing/store/blob-store.h"
 #include "icing/store/corpus-associated-scoring-data.h"
 #include "icing/store/corpus-id.h"
+#include "icing/store/deletion-store.h"
 #include "icing/store/document-associated-score-data.h"
 #include "icing/store/document-change.h"
 #include "icing/store/document-filter-data.h"
@@ -306,11 +308,13 @@ DocumentStore::DocumentStore(
     const Clock* clock, const SchemaStore* schema_store,
     const FeatureFlags* feature_flags, bool pre_mapping_fbv,
     bool use_persistent_hash_map, int32_t compression_level,
-    uint32_t compression_threshold_bytes, int32_t compression_mem_level)
+    uint32_t compression_threshold_bytes, int32_t compression_mem_level,
+    DeletionStore* deletion_store)
     : filesystem_(filesystem),
       base_dir_(base_dir),
       clock_(*clock),
       feature_flags_(*feature_flags),
+      deletion_store_(deletion_store),
       schema_store_(schema_store),
       document_validator_(schema_store),
       pre_mapping_fbv_(pre_mapping_fbv),
@@ -393,7 +397,7 @@ libtextclassifier3::StatusOr<DocumentStore::CreateResult> DocumentStore::Create(
     bool force_recovery_and_revalidate_documents, bool pre_mapping_fbv,
     bool use_persistent_hash_map, int32_t compression_level,
     uint32_t compression_threshold_bytes, int32_t compression_mem_level,
-    InitializeStatsProto* initialize_stats) {
+    InitializeStatsProto* initialize_stats, DeletionStore* deletion_store) {
   ICING_RETURN_ERROR_IF_NULL(filesystem);
   ICING_RETURN_ERROR_IF_NULL(clock);
   ICING_RETURN_ERROR_IF_NULL(schema_store);
@@ -402,7 +406,7 @@ libtextclassifier3::StatusOr<DocumentStore::CreateResult> DocumentStore::Create(
   auto document_store = std::unique_ptr<DocumentStore>(new DocumentStore(
       filesystem, base_dir, clock, schema_store, feature_flags, pre_mapping_fbv,
       use_persistent_hash_map, compression_level, compression_threshold_bytes,
-      compression_mem_level));
+      compression_mem_level, deletion_store));
   ICING_ASSIGN_OR_RETURN(
       InitializeResult initialize_result,
       document_store->Initialize(force_recovery_and_revalidate_documents,
@@ -1485,9 +1489,11 @@ DocumentStore::InternalPut(const DocumentWrapper& document_wrapper,
                                        /*to_document_id=*/new_document_id));
 
     // Delete the old document. It's fine if it's not found since it might have
-    // been deleted previously.
+    // been deleted previously. The document is replaced rather than deleted,
+    // so don't put a DeletionEvent.
     auto delete_status =
-        Delete(old_document_id, clock_.GetSystemTimeMilliseconds());
+        InternalDelete(old_document_id, clock_.GetSystemTimeMilliseconds(),
+                       /*is_replacement=*/true);
     if (delete_status.ok()) {
       // The old document had existed and was not previously deleted.
       put_result.old_document_id = old_document_id;
@@ -1968,6 +1974,12 @@ libtextclassifier3::Status DocumentStore::Delete(
 
 libtextclassifier3::Status DocumentStore::Delete(DocumentId document_id,
                                                  int64_t current_time_ms) {
+  return InternalDelete(document_id, current_time_ms,
+                        /*is_replacement=*/false);
+}
+
+libtextclassifier3::Status DocumentStore::InternalDelete(
+    DocumentId document_id, int64_t current_time_ms, bool is_replacement) {
   auto document_filter_data_optional =
       GetAliveDocumentFilterData(document_id, current_time_ms);
   if (!document_filter_data_optional) {
@@ -1987,9 +1999,30 @@ libtextclassifier3::Status DocumentStore::Delete(DocumentId document_id,
   }
   int64_t document_log_offset = *document_log_offset_or.ValueOrDie();
 
+  // A replaced document isn't deleted from the client's perspective, so it
+  // doesn't get a DeletionEvent. The DeletionEvent needs the namespace, uri and
+  // schema of the document, so read it before it is erased.
+  //
+  // No need to check IsReplaced() here: the document is alive, and putting a
+  // newer document with the same namespace and uri deletes the old document if
+  // it's alive, so an alive document can't have been replaced.
+  std::optional<DeletionEvent> deletion_event;
+  if (!is_replacement && ShouldPutDeletionEvents()) {
+    ICING_ASSIGN_OR_RETURN(DocumentWrapper document_wrapper,
+                           document_log_->ReadProto(document_log_offset));
+    ICING_ASSIGN_OR_RETURN(
+        deletion_event,
+        CreateDeletionEvent(document_id, document_wrapper.document()));
+  }
+
   // Erases document proto.
   ICING_RETURN_IF_ERROR(document_log_->EraseProto(document_log_offset));
-  return ClearDerivedData(document_id);
+  ICING_RETURN_IF_ERROR(ClearDerivedData(document_id));
+
+  if (deletion_event.has_value()) {
+    return PutDeletionEvent(std::move(deletion_event).value());
+  }
+  return libtextclassifier3::Status::OK;
 }
 
 libtextclassifier3::StatusOr<DocumentMetadata> DocumentStore::ForceDelete(
@@ -2025,15 +2058,94 @@ libtextclassifier3::StatusOr<DocumentMetadata> DocumentStore::ForceDelete(
   DocumentWrapper document_wrapper =
       std::move(document_wrapper_or).ValueOrDie();
 
+  // ForceDelete doesn't check expiry, so the document may be an expired
+  // document that has been replaced, which isn't a deletion.
+  std::optional<DeletionEvent> deletion_event;
+  if (ShouldPutDeletionEvents()) {
+    ICING_ASSIGN_OR_RETURN(
+        bool is_replaced,
+        IsReplaced(document_id, document_wrapper.document()));
+    if (!is_replaced) {
+      ICING_ASSIGN_OR_RETURN(
+          deletion_event,
+          CreateDeletionEvent(document_id, document_wrapper.document()));
+    }
+  }
+
   // Erases document proto.
   ICING_RETURN_IF_ERROR(document_log_->EraseProto(document_log_offset));
   ICING_RETURN_IF_ERROR(ClearDerivedData(document_id));
+
+  if (deletion_event.has_value()) {
+    ICING_RETURN_IF_ERROR(PutDeletionEvent(std::move(deletion_event).value()));
+  }
 
   return DocumentMetadata{
       .schema_type_name = document_wrapper.document().schema(),
       .name_space = document_wrapper.document().namespace_(),
       .uri = document_wrapper.document().uri(),
       .document_id = document_id};
+}
+
+libtextclassifier3::StatusOr<bool> DocumentStore::IsReplaced(
+    DocumentId document_id, const DocumentProto& document) const {
+  libtextclassifier3::StatusOr<DocumentId> current_document_id_or =
+      GetDocumentId(document.namespace_(), document.uri());
+  if (absl_ports::IsNotFound(current_document_id_or.status())) {
+    return false;
+  }
+  ICING_ASSIGN_OR_RETURN(DocumentId current_document_id,
+                         std::move(current_document_id_or));
+  return current_document_id != document_id;
+}
+
+libtextclassifier3::StatusOr<DeletionEvent> DocumentStore::CreateDeletionEvent(
+    DocumentId document_id, const DocumentProto& document) const {
+  ICING_ASSIGN_OR_RETURN(const DocumentAssociatedScoreData* score_data,
+                         score_cache_->Get(document_id));
+
+  DeletionEvent deletion_event;
+  deletion_event.set_name_space(document.namespace_());
+  deletion_event.set_uri(document.uri());
+  deletion_event.set_schema(document.schema());
+  deletion_event.set_last_update_timestamp_ms(
+      score_data->effective_last_update_timestamp_ms());
+  return deletion_event;
+}
+
+libtextclassifier3::Status DocumentStore::AppendDeletionEvent(
+    DocumentId document_id, std::vector<DeletionEvent>* deletion_events) const {
+  ICING_ASSIGN_OR_RETURN(const int64_t* document_log_offset,
+                         document_id_mapper_->Get(document_id));
+  ICING_ASSIGN_OR_RETURN(DocumentWrapper document_wrapper,
+                         document_log_->ReadProto(*document_log_offset));
+  ICING_ASSIGN_OR_RETURN(bool is_replaced,
+                         IsReplaced(document_id, document_wrapper.document()));
+  if (is_replaced) {
+    return libtextclassifier3::Status::OK;
+  }
+  ICING_ASSIGN_OR_RETURN(
+      DeletionEvent deletion_event,
+      CreateDeletionEvent(document_id, document_wrapper.document()));
+  deletion_events->push_back(std::move(deletion_event));
+  return libtextclassifier3::Status::OK;
+}
+
+libtextclassifier3::Status DocumentStore::PutDeletionEvent(
+    DeletionEvent deletion_event) {
+  deletion_event.set_deletion_timestamp_ms(IssueTimestampMs());
+  return deletion_store_->Put(deletion_event);
+}
+
+libtextclassifier3::Status DocumentStore::PutExpiredDocumentDeletionEvents(
+    std::vector<DeletionEvent> expired_document_deletion_events) {
+  if (!ShouldPutDeletionEvents()) {
+    return libtextclassifier3::Status::OK;
+  }
+  for (DeletionEvent& deletion_event : expired_document_deletion_events) {
+    ICING_RETURN_IF_ERROR(PutDeletionEvent(std::move(deletion_event)));
+  }
+  return libtextclassifier3::Status::OK;
 }
 
 libtextclassifier3::StatusOr<NamespaceId> DocumentStore::GetNamespaceId(
@@ -2688,6 +2800,10 @@ DocumentStore::OptimizeInto(
   }
 
   int64_t current_time_ms = clock_.GetSystemTimeMilliseconds();
+  // Expired documents aren't copied, so they are deleted once the caller
+  // switches to the new document store. Collect their DeletionEvents for the
+  // caller to put then.
+  bool collect_expired_document_deletion_events = ShouldPutDeletionEvents();
   for (DocumentId document_id = 0; document_id < document_cnt; document_id++) {
     libtextclassifier3::StatusOr<DocumentProto> document_or;
     if (feature_flags_.enable_optimize_improvements()) {
@@ -2697,6 +2813,10 @@ DocumentStore::OptimizeInto(
       } else if (!GetNonExpiredDocumentFilterData(document_id,
                                                   current_time_ms)) {
         ++num_expired_documents;
+        if (collect_expired_document_deletion_events) {
+          ICING_RETURN_IF_ERROR(AppendDeletionEvent(
+              document_id, &result.expired_document_deletion_events));
+        }
         continue;
       }
       // The only expected errors for Get are for deleted
@@ -2710,6 +2830,10 @@ DocumentStore::OptimizeInto(
         } else if (!GetNonExpiredDocumentFilterData(document_id,
                                                     current_time_ms)) {
           ++num_expired_documents;
+          if (collect_expired_document_deletion_events) {
+            ICING_RETURN_IF_ERROR(AppendDeletionEvent(
+                document_id, &result.expired_document_deletion_events));
+          }
         }
         continue;
       }

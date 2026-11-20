@@ -28,6 +28,7 @@
 #include "icing/file/portable-file-backed-proto-log.h"
 #include "icing/proto/deletion.pb.h"
 #include "icing/store/deletion-index-entry.h"
+#include "icing/store/document-change.h"
 #include "icing/util/data-loss.h"
 
 namespace icing {
@@ -112,9 +113,12 @@ class DeletionStore {
   //   INTERNAL on I/O error.
   libtextclassifier3::Status Put(const DeletionEvent& deletion_event);
 
-  // Returns all DeletionEvents for documents that existed as of timestamp_ms
-  // (update_timestamp_ms <= timestamp_ms) and were deleted after timestamp_ms
+  // Returns all DeletionEvents for documents deleted after timestamp_ms
   // (deletion_timestamp_ms > timestamp_ms), in the order they were put.
+  //
+  // DeletionEvents are not filtered by last_update_timestamp_ms, so this may
+  // include deletions of documents that were added after timestamp_ms. Callers
+  // must tolerate deletions of documents they never saw.
   //
   // If schemas is non-empty, only DeletionEvents whose schema is in schemas
   // are returned. If schemas is empty, DeletionEvents of all schemas are
@@ -128,6 +132,36 @@ class DeletionStore {
   libtextclassifier3::StatusOr<std::vector<DeletionEvent>> Get(
       int64_t timestamp_ms,
       const std::unordered_set<std::string>& schemas) const;
+
+  // Returns the deletions after timestamp_ms as a page of DocumentChanges, with
+  // operation_timestamp_ms set to the deletion time.
+  //
+  // Matches the same DeletionEvents as Get: every document deleted after
+  // timestamp_ms (deletion_timestamp_ms > timestamp_ms), regardless of when it
+  // was last added or updated. This may report deletions of documents the
+  // caller never saw, which is harmless since the caller has to look up each
+  // uri anyway. Filtering them out would be unsafe: a document re-put after
+  // timestamp_ms still existed at timestamp_ms, a retry with the same
+  // timestamp_ms must see the same deletions, and last_update_timestamp_ms may
+  // be backfilled for old documents.
+  //
+  // If schemas is non-empty, only deletions of documents whose schema is in
+  // schemas are returned.
+  //
+  // Returns at most max_changes changes, in the order they were put, which is
+  // sorted by deletion_timestamp_ms as long as Put's ordering requirement was
+  // met. If there are more changes, next_change_timestamp_ms is set to the
+  // deletion_timestamp_ms of the first remaining one.
+  //
+  // Returns:
+  //   A DocumentChangeResult on success.
+  //   INVALID_ARGUMENT if max_changes is negative.
+  //   FAILED_PRECONDITION if the DeletionStore is not initialized, e.g. after
+  //     a failed Optimize.
+  //   INTERNAL on I/O error.
+  libtextclassifier3::StatusOr<DocumentChangeResult> GetDocumentChanges(
+      int64_t timestamp_ms, const std::unordered_set<std::string>& schemas,
+      int max_changes) const;
 
   // Purges all DeletionEvents with deletion_timestamp_ms <= timestamp_ms, along
   // with their DeletionIndexEntries.
@@ -153,6 +187,11 @@ class DeletionStore {
   //     may be incomplete.
   //   INTERNAL on I/O error.
   libtextclassifier3::Status Optimize(int64_t timestamp_ms);
+
+  // Returns whether the DeletionStore is initialized. It is only uninitialized
+  // if a failed Optimize couldn't re-initialize it, in which case it can't be
+  // used until it is recreated.
+  bool is_initialized() const { return initialized_; }
 
   // Returns the filename of the DeletionIndex, without any directory prefixes.
   // Used mainly for testing purposes.
@@ -255,6 +294,17 @@ class DeletionStore {
   //   FAILED_PRECONDITION otherwise, e.g. after a failed Optimize left
   //     deletion_log_ or deletion_index_ null.
   libtextclassifier3::Status CheckInitialized() const;
+
+  // Implementation of Get. Returns up to max_events DeletionEvents that match
+  // timestamp_ms and schemas as described in Get, in the order they were put.
+  //
+  // Returns:
+  //   A vector of matching DeletionEvents on success.
+  //   FAILED_PRECONDITION if the DeletionStore is not initialized.
+  //   INTERNAL on I/O error.
+  libtextclassifier3::StatusOr<std::vector<DeletionEvent>> InternalGet(
+      int64_t timestamp_ms, const std::unordered_set<std::string>& schemas,
+      int64_t max_events) const;
 
   const Filesystem* const filesystem_;
   const std::string base_dir_;

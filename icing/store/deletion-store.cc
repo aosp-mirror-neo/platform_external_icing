@@ -15,7 +15,9 @@
 #include "icing/store/deletion-store.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -35,6 +37,7 @@
 #include "icing/proto/deletion.pb.h"
 #include "icing/store/deletion-index-entry.h"
 #include "icing/store/deletion-log-creator.h"
+#include "icing/store/document-change.h"
 #include "icing/util/data-loss.h"
 #include "icing/util/logging.h"
 #include "icing/util/status-macros.h"
@@ -335,6 +338,47 @@ libtextclassifier3::Status DeletionStore::Put(
 libtextclassifier3::StatusOr<std::vector<DeletionEvent>> DeletionStore::Get(
     int64_t timestamp_ms,
     const std::unordered_set<std::string>& schemas) const {
+  return InternalGet(timestamp_ms, schemas,
+                     /*max_events=*/std::numeric_limits<int64_t>::max());
+}
+
+libtextclassifier3::StatusOr<DocumentChangeResult>
+DeletionStore::GetDocumentChanges(
+    int64_t timestamp_ms, const std::unordered_set<std::string>& schemas,
+    int max_changes) const {
+  if (max_changes < 0) {
+    return absl_ports::InvalidArgumentError(absl_ports::StrCat(
+        "max_changes must be non-negative, but was ",
+        std::to_string(max_changes)));
+  }
+  // Get one extra DeletionEvent to find out where the next page starts.
+  ICING_ASSIGN_OR_RETURN(
+      std::vector<DeletionEvent> deletion_events,
+      InternalGet(timestamp_ms, schemas,
+                  /*max_events=*/int64_t{max_changes} + 1));
+
+  DocumentChangeResult result;
+  if (deletion_events.size() > static_cast<size_t>(max_changes)) {
+    // The page is full, so the last DeletionEvent belongs to the next page.
+    result.next_change_timestamp_ms =
+        deletion_events.back().deletion_timestamp_ms();
+    deletion_events.pop_back();
+  }
+  result.changes.reserve(deletion_events.size());
+  for (DeletionEvent& deletion_event : deletion_events) {
+    result.changes.push_back(DocumentChange{
+        .name_space = std::move(*deletion_event.mutable_name_space()),
+        .schema = std::move(*deletion_event.mutable_schema()),
+        .uri = std::move(*deletion_event.mutable_uri()),
+        .operation_timestamp_ms = deletion_event.deletion_timestamp_ms()});
+  }
+  return result;
+}
+
+libtextclassifier3::StatusOr<std::vector<DeletionEvent>>
+DeletionStore::InternalGet(int64_t timestamp_ms,
+                           const std::unordered_set<std::string>& schemas,
+                           int64_t max_events) const {
   ICING_RETURN_IF_ERROR(CheckInitialized());
   int32_t timestamp_m = static_cast<int32_t>(timestamp_ms / kMillisPerMinute);
   std::unordered_set<uint32_t> schema_fps;
@@ -355,13 +399,18 @@ libtextclassifier3::StatusOr<std::vector<DeletionEvent>> DeletionStore::Get(
       });
 
   std::vector<DeletionEvent> deletion_events;
-  for (; entry != entries_end; ++entry) {
-    // Pre-filter using the DeletionIndexEntry to avoid reading DeletionEvents
-    // from the DeletionLog. last_update_timestamp_m > timestamp_m implies that
-    // last_update_timestamp_ms > timestamp_ms.
-    if (entry->last_update_timestamp_m() > timestamp_m) {
-      continue;
-    }
+  for (; entry != entries_end &&
+         static_cast<int64_t>(deletion_events.size()) < max_events;
+       ++entry) {
+    // Pre-filter by schema using the DeletionIndexEntry to avoid reading
+    // DeletionEvents from the DeletionLog.
+    //
+    // Deliberately don't filter on last_update_timestamp_ms. A document updated
+    // after timestamp_ms may still have existed at timestamp_ms (e.g. re-put
+    // with the same uri), the same timestamp_ms may be retried, and
+    // last_update_timestamp_ms may be backfilled for old documents, so
+    // excluding those deletions could make callers miss them. Reporting a
+    // deletion the caller never saw is harmless.
     if (!schema_fps.empty() &&
         schema_fps.find(entry->schema_fp()) == schema_fps.end()) {
       continue;
@@ -371,10 +420,7 @@ libtextclassifier3::StatusOr<std::vector<DeletionEvent>> DeletionStore::Get(
     // check the DeletionEvent itself.
     ICING_ASSIGN_OR_RETURN(DeletionEvent deletion_event,
                            deletion_log_->ReadProto(entry->offset()));
-    if (deletion_event.deletion_timestamp_ms() <= timestamp_ms ||
-        deletion_event.last_update_timestamp_ms() > timestamp_ms) {
-      // Exclude documents not deleted after the timestamp or documents added or
-      // updated after the timestamp.
+    if (deletion_event.deletion_timestamp_ms() <= timestamp_ms) {
       continue;
     }
     if (!schemas.empty() &&

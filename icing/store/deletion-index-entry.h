@@ -65,12 +65,13 @@ class DeletionIndexEntry {
   int32_t deletion_timestamp_m_;
 
   // The time, in minutes since epoch, at which the deleted document was last
-  // created or updated. Used to filter out deletions of documents that did not
-  // exist before the query timestamp.
+  // created or updated.
   // The last_update_timestamp_m is populated by reducing the granularity of the
   // last_update_timestamp_ms field in the DeletionEvent, which is in
   // milliseconds since epoch, to minutes since epoch by dividing by 60*1000,
   // before casting to int32_t. This should be safe up to the year 6053.
+  // Not currently used to filter DeletionEvents, since filtering on it can drop
+  // deletions that callers need.
   int32_t last_update_timestamp_m_;
 
   // The 32-bit fingerprint of the deleted document's full schema type string.
