@@ -173,13 +173,16 @@ libtextclassifier3::StatusOr<BlobStore> BlobStore::Create(
   std::string blob_info_proto_file_name =
       MakeBlobInfoProtoLogFileName(base_dir);
 
+  bool enable_compression_mem_level =
+      feature_flags->enable_proto_log_compression_mem_level();
   ICING_ASSIGN_OR_RETURN(
       PortableFileBackedProtoLog<BlobInfoProto>::CreateResult log_create_result,
       PortableFileBackedProtoLog<BlobInfoProto>::Create(
           filesystem, blob_info_proto_file_name,
           PortableFileBackedProtoLog<BlobInfoProto>::Options(
               /*compress_in=*/true, constants::kMaxProtoSize, compression_level,
-              /*compression_threshold_bytes=*/0, compression_mem_level)));
+              /*compression_threshold_bytes=*/0, compression_mem_level,
+              enable_compression_mem_level)));
   // TODO(b/435513415): pass feature flags object down to BlobStore and use it.
   //   It is a remaining task to rollout new header format for proto log.
 
@@ -190,9 +193,9 @@ libtextclassifier3::StatusOr<BlobStore> BlobStore::Create(
 
   return BlobStore(
       filesystem, std::move(base_dir), clock, orphan_blob_time_to_live_ms,
-      compression_level, compression_mem_level, manage_blob_files,
-      std::move(log_create_result.proto_log), std::move(blob_handle_to_offset),
-      std::move(known_file_names));
+      compression_level, compression_mem_level, enable_compression_mem_level,
+      manage_blob_files, std::move(log_create_result.proto_log),
+      std::move(blob_handle_to_offset), std::move(known_file_names));
 }
 
 BlobProto BlobStore::OpenWrite(
@@ -605,7 +608,7 @@ libtextclassifier3::StatusOr<std::vector<std::string>> BlobStore::Optimize(
           PortableFileBackedProtoLog<BlobInfoProto>::Options(
               /*compress_in=*/true, constants::kMaxProtoSize,
               compression_level_, /*compression_threshold_bytes=*/0,
-              compression_mem_level_)));
+              compression_mem_level_, enable_compression_mem_level_)));
   // TODO(b/435513415): pass feature flags object down to BlobStore and use it.
   //   It is a remaining task to rollout new header format for proto log.
   blob_info_log_ = std::move(log_create_result.proto_log);
@@ -640,7 +643,7 @@ BlobStore::OptimizeBlobInfoInto(
           PortableFileBackedProtoLog<BlobInfoProto>::Options(
               /*compress_in=*/true, constants::kMaxProtoSize,
               compression_level_, /*compression_threshold_bytes=*/0,
-              compression_mem_level_)));
+              compression_mem_level_, enable_compression_mem_level_)));
   // TODO(b/435513415): pass feature flags object down to BlobStore and use it.
   //   It is a remaining task to rollout new header format for proto log.
   std::unique_ptr<PortableFileBackedProtoLog<BlobInfoProto>> new_blob_info_log =

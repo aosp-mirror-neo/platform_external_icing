@@ -79,12 +79,12 @@ std::string DeletionStore::GetDeletionIndexFilename() {
 libtextclassifier3::StatusOr<DeletionStore::CreateResult> DeletionStore::Create(
     const Filesystem* filesystem, const std::string& base_dir,
     int32_t compression_level, uint32_t compression_threshold_bytes,
-    int32_t compression_mem_level) {
+    int32_t compression_mem_level, bool enable_compression_mem_level) {
   ICING_RETURN_ERROR_IF_NULL(filesystem);
 
-  auto deletion_store = std::unique_ptr<DeletionStore>(
-      new DeletionStore(filesystem, base_dir, compression_level,
-                        compression_threshold_bytes, compression_mem_level));
+  auto deletion_store = std::unique_ptr<DeletionStore>(new DeletionStore(
+      filesystem, base_dir, compression_level, compression_threshold_bytes,
+      compression_mem_level, enable_compression_mem_level));
   ICING_ASSIGN_OR_RETURN(InitializeResult initialize_result,
                          deletion_store->Initialize());
 
@@ -99,12 +99,14 @@ libtextclassifier3::StatusOr<DeletionStore::CreateResult> DeletionStore::Create(
 DeletionStore::DeletionStore(const Filesystem* filesystem, std::string base_dir,
                              int32_t compression_level,
                              uint32_t compression_threshold_bytes,
-                             int32_t compression_mem_level)
+                             int32_t compression_mem_level,
+                             bool enable_compression_mem_level)
     : filesystem_(filesystem),
       base_dir_(std::move(base_dir)),
       compression_level_(compression_level),
       compression_threshold_bytes_(compression_threshold_bytes),
-      compression_mem_level_(compression_mem_level) {}
+      compression_mem_level_(compression_mem_level),
+      enable_compression_mem_level_(enable_compression_mem_level) {}
 
 DeletionStore::~DeletionStore() {
   if (initialized_) {
@@ -119,7 +121,7 @@ libtextclassifier3::StatusOr<DeletionStore::InitializeResult>
 DeletionStore::Initialize() {
   auto create_result_or = DeletionLogCreator::Create(
       filesystem_, base_dir_, compression_level_, compression_threshold_bytes_,
-      compression_mem_level_);
+      compression_mem_level_, enable_compression_mem_level_);
   if (!create_result_or.ok()) {
     return absl_ports::Annotate(create_result_or.status(),
                                 "Failed to initialize DeletionLog.");
@@ -481,7 +483,8 @@ libtextclassifier3::Status DeletionStore::Optimize(int64_t timestamp_ms) {
     ICING_ASSIGN_OR_RETURN(
         CreateResult temp_create_result,
         Create(filesystem_, temp_dir, compression_level_,
-               compression_threshold_bytes_, compression_mem_level_));
+               compression_threshold_bytes_, compression_mem_level_,
+               enable_compression_mem_level_));
     DeletionStore* temp_store = temp_create_result.deletion_store.get();
     for (const DeletionIndexEntry* entry = first_kept; entry != entries_end;
          ++entry) {

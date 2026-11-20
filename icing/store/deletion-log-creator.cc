@@ -48,7 +48,8 @@ DeletionLogCreator::Create(const Filesystem* filesystem,
                            const std::string& base_dir,
                            int32_t compression_level,
                            uint32_t compression_threshold_bytes,
-                           int32_t compression_mem_level) {
+                           int32_t compression_mem_level,
+                           bool enable_compression_mem_level) {
   std::string deletion_log_filename = MakeDeletionLogFilename(base_dir);
   bool new_file = !filesystem->FileExists(deletion_log_filename.c_str());
 
@@ -58,7 +59,8 @@ DeletionLogCreator::Create(const Filesystem* filesystem,
           filesystem, deletion_log_filename,
           PortableFileBackedProtoLog<DeletionEvent>::Options(
               /*compress_in=*/true, constants::kMaxProtoSize, compression_level,
-              compression_threshold_bytes, compression_mem_level)));
+              compression_threshold_bytes, compression_mem_level,
+              enable_compression_mem_level)));
 
   CreateResult create_result = {std::move(log_create_result), new_file};
   return create_result;
