@@ -66,6 +66,7 @@
 #include "icing/portable/endian.h"
 #include "icing/proto/ann.pb.h"
 #include "icing/proto/blob.pb.h"
+#include "icing/proto/change_notification.pb.h"
 #include "icing/proto/debug.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/initialize.pb.h"
@@ -101,6 +102,8 @@
 #include "icing/scoring/scored-document-hits-ranker.h"
 #include "icing/scoring/scoring-processor.h"
 #include "icing/store/blob-store.h"
+#include "icing/store/deletion-store.h"
+#include "icing/store/document-change.h"
 #include "icing/store/document-group-info.h"
 #include "icing/store/document-id.h"
 #include "icing/store/document-store.h"
@@ -137,6 +140,7 @@ constexpr int64_t kMaintainAnnIndexDelayMs = 600000;
 constexpr int kMaxMaintainAnnIndexRetries = 3;
 
 constexpr std::string_view kDocumentSubfolderName = "document_dir";
+constexpr std::string_view kDeletionSubfolderName = "deletion_dir";
 constexpr std::string_view kBlobSubfolderName = "blob_dir";
 constexpr std::string_view kIndexSubfolderName = "index_dir";
 constexpr std::string_view kIntegerIndexSubfolderName = "integer_index_dir";
@@ -163,6 +167,19 @@ constexpr std::string_view kDatabaseStablenessLogFilename =
 // state that we will tolerate before deleting all data and starting from a
 // fresh state.
 constexpr int kMaxUnsuccessfulInitAttempts = 5;
+
+// The maximum number of document changes returned in a single page by
+// GetDocumentChanges, across all sources of changes, to bound the size of the
+// response.
+constexpr int kMaxDocumentChangesPerPage = 1000;
+
+// How long DeletionEvents are kept in the DeletionStore. DeletionEvents older
+// than this are purged on Optimize.
+//
+// TODO(b/568469091): Consider making this configurable through
+//   IcingSearchEngineOptions.
+constexpr int64_t kDeletionEventTimeToLiveMs =
+    int64_t{30} * 24 * 60 * 60 * 1000;  // 30 days
 
 // Populates OptimizePrepareResultProto with the intermediate optimization
 // result state from Stage 1 (Prepare).
@@ -338,6 +355,12 @@ std::string MakeDocumentDirectoryPath(const std::string& base_dir) {
 
 std::string MakeBlobDirectoryPath(const std::string& base_dir) {
   return absl_ports::StrCat(base_dir, "/", kBlobSubfolderName);
+}
+
+// DeletionStore files are in a standalone subfolder, separate from the document
+// store's, since the document store subfolder is swapped on Optimize.
+std::string MakeDeletionDirectoryPath(const std::string& base_dir) {
+  return absl_ports::StrCat(base_dir, "/", kDeletionSubfolderName);
 }
 
 // Makes a temporary folder path for the document store which will be used
@@ -740,6 +763,7 @@ void IcingSearchEngine::ResetMembersLocked() {
   blob_store_.reset();
   result_state_manager_.reset();
   document_store_.reset();
+  deletion_store_.reset();
   schema_store_.reset();
 }
 
@@ -1094,6 +1118,8 @@ libtextclassifier3::Status IcingSearchEngine::InitializeMembers(
         MakeEmbeddingIndexWorkingPath(options_.base_dir());
     const std::string blob_store_dir =
         MakeBlobDirectoryPath(options_.base_dir());
+    const std::string deletion_store_dir =
+        MakeDeletionDirectoryPath(options_.base_dir());
 
     if (!filesystem_->DeleteDirectoryRecursively(doc_store_dir.c_str()) ||
         !filesystem_->DeleteDirectoryRecursively(index_dir.c_str()) ||
@@ -1102,13 +1128,14 @@ libtextclassifier3::Status IcingSearchEngine::InitializeMembers(
                                        qualified_id_join_index_dir)
              .ok() ||
         !EmbeddingIndex::Discard(*filesystem_, embedding_index_dir).ok() ||
-        !filesystem_->DeleteDirectoryRecursively(blob_store_dir.c_str())) {
+        !filesystem_->DeleteDirectoryRecursively(blob_store_dir.c_str()) ||
+        !filesystem_->DeleteDirectoryRecursively(deletion_store_dir.c_str())) {
       initialize_stats->set_failure_stage(
           InitializeStatsProto::FailureStage::DISCARD_COMPONENTS);
       return absl_ports::InternalError(absl_ports::StrCat(
           "Could not delete directories: ", index_dir, ", ", integer_index_dir,
           ", ", qualified_id_join_index_dir, ", ", embedding_index_dir, ", ",
-          blob_store_dir, " and ", doc_store_dir));
+          blob_store_dir, ", ", deletion_store_dir, " and ", doc_store_dir));
     }
 
     // Initialize (empty) blob store.
@@ -1121,6 +1148,9 @@ libtextclassifier3::Status IcingSearchEngine::InitializeMembers(
           InitializeStatsProto::FailureStage::BLOB_STORE_INSTANTIATION);
       return blob_store_init_status;
     }
+
+    // Initialize (empty) deletion store.
+    ICING_RETURN_IF_ERROR(InitializeDeletionStore());
 
     // Initialize (empty) document store.
     ICING_ASSIGN_OR_RETURN(
@@ -1160,6 +1190,8 @@ libtextclassifier3::Status IcingSearchEngine::InitializeMembers(
           InitializeStatsProto::FailureStage::BLOB_STORE_INSTANTIATION);
       return blob_store_init_status;
     }
+
+    ICING_RETURN_IF_ERROR(InitializeDeletionStore());
 
     // Initialize document store. This also rebuilds all derived files in the
     // document store.
@@ -1207,6 +1239,8 @@ libtextclassifier3::Status IcingSearchEngine::InitializeMembers(
           InitializeStatsProto::FailureStage::BLOB_STORE_INSTANTIATION);
       return blob_store_init_status;
     }
+
+    ICING_RETURN_IF_ERROR(InitializeDeletionStore());
 
     // Initialize document store. This also rebuilds all derived files in the
     // document store.
@@ -1320,6 +1354,98 @@ libtextclassifier3::Status IcingSearchEngine::InitializeSchemaStore(
   return libtextclassifier3::Status::OK;
 }
 
+libtextclassifier3::Status IcingSearchEngine::InitializeDeletionStore() {
+  // document_store_ holds a raw pointer to deletion_store_, so it must not
+  // outlive the current deletion_store_. It may still exist if a previous
+  // initialization failed partway, and is recreated by InitializeDocumentStore
+  // right after this anyway. result_state_manager_ depends on document_store_.
+  result_state_manager_.reset();
+  document_store_.reset();
+  deletion_store_.reset();
+
+  if (!feature_flags_.enable_offline_observers()) {
+    // TODO(b/568469091): Consider deleting the deletion store directory, since
+    // it won't have any deletions until offline observers are enabled again.
+    return libtextclassifier3::Status::OK;
+  }
+
+  const std::string deletion_dir =
+      MakeDeletionDirectoryPath(options_.base_dir());
+  // Make sure the sub-directory exists
+  if (!filesystem_->CreateDirectoryRecursively(deletion_dir.c_str())) {
+    return absl_ports::InternalError(
+        absl_ports::StrCat("Could not create directory: ", deletion_dir));
+  }
+
+  auto create_result_or = DeletionStore::Create(
+      filesystem_.get(), deletion_dir, options_.compression_level(),
+      options_.compression_threshold_bytes(), options_.compression_mem_level());
+  if (!create_result_or.ok()) {
+    // The DeletionStore only holds DeletionEvents for offline observers, so
+    // rather than failing Initialize() (which causes clients to reset all
+    // data), discard the stored DeletionEvents and start with an empty
+    // DeletionStore. Note that a DATA_LOSS status must not be propagated
+    // either, since callers treat DATA_LOSS as a successful initialization and
+    // would skip initializing the rest of Icing.
+    ICING_LOG(WARNING) << create_result_or.status().error_message()
+                       << "\nFailed to create DeletionStore, discarding all "
+                          "DeletionEvents and recreating it.";
+    if (!filesystem_->DeleteDirectoryRecursively(deletion_dir.c_str()) ||
+        !filesystem_->CreateDirectoryRecursively(deletion_dir.c_str())) {
+      return absl_ports::InternalError(
+          absl_ports::StrCat("Could not recreate directory: ", deletion_dir));
+    }
+    create_result_or = DeletionStore::Create(
+        filesystem_.get(), deletion_dir, options_.compression_level(),
+        options_.compression_threshold_bytes(),
+        options_.compression_mem_level());
+    if (!create_result_or.ok()) {
+      // Never propagate DATA_LOSS here, for the reason above.
+      return absl_ports::InternalError(absl_ports::StrCat(
+          "Failed to recreate DeletionStore: ",
+          create_result_or.status().error_message()));
+    }
+  }
+  DeletionStore::CreateResult create_result =
+      std::move(create_result_or).ValueOrDie();
+  if (create_result.data_loss != DataLoss::NONE) {
+    ICING_LOG(WARNING) << "DeletionStore had data loss on initialization.";
+  }
+  deletion_store_ = std::move(create_result.deletion_store);
+  return libtextclassifier3::Status::OK;
+}
+
+libtextclassifier3::Status IcingSearchEngine::OptimizeDeletionStore() {
+  if (deletion_store_ == nullptr) {
+    return libtextclassifier3::Status::OK;
+  }
+  int64_t cutoff_timestamp_ms =
+      clock_->GetSystemTimeMilliseconds() - kDeletionEventTimeToLiveMs;
+  libtextclassifier3::Status status =
+      deletion_store_->Optimize(cutoff_timestamp_ms);
+  if (status.ok()) {
+    return libtextclassifier3::Status::OK;
+  }
+  if (deletion_store_->is_initialized()) {
+    // deletion_store_ is still usable, so the rest of Icing is unaffected.
+    ICING_LOG(WARNING) << "Failed to optimize DeletionStore: "
+                       << status.error_message();
+    return libtextclassifier3::Status::OK;
+  }
+  // deletion_store_ can't be used, and it can't be reset here since
+  // document_store_ holds a raw pointer to it. Mark Icing as uninitialized, so
+  // that no requests are served until Initialize() recreates it.
+  ICING_LOG(ERROR) << "Failed to optimize DeletionStore, and it couldn't be "
+                      "re-initialized: "
+                   << status.error_message();
+  initialized_ = false;
+  return absl_ports::Annotate(
+      absl_ports::InternalError(
+          "Failed to optimize DeletionStore, and it couldn't be "
+          "re-initialized"),
+      status.error_message());
+}
+
 libtextclassifier3::StatusOr<bool> IcingSearchEngine::InitializeDocumentStore(
     bool force_recovery_and_revalidate_documents,
     InitializeStatsProto* initialize_stats) {
@@ -1340,7 +1466,8 @@ libtextclassifier3::StatusOr<bool> IcingSearchEngine::InitializeDocumentStore(
       &feature_flags_, force_recovery_and_revalidate_documents,
       /*pre_mapping_fbv=*/false, /*use_persistent_hash_map=*/true,
       options_.compression_level(), options_.compression_threshold_bytes(),
-      options_.compression_mem_level(), initialize_stats);
+      options_.compression_mem_level(), initialize_stats,
+      deletion_store_.get());
   if (!create_result_or.ok()) {
     initialize_stats->set_failure_stage(
         InitializeStatsProto::FailureStage::DOCUMENT_STORE_INSTANTIATION);
@@ -2461,6 +2588,74 @@ GetAllNamespacesResultProto IcingSearchEngine::GetAllNamespaces() {
   return result_proto;
 }
 
+DocumentChangeResponseProto IcingSearchEngine::GetDocumentChanges(
+    const std::unordered_set<std::string>& schemas,
+    const DocumentChangeResponseProto::PaginationToken& page_token) {
+  DocumentChangeResponseProto result_proto;
+
+  absl_ports::shared_lock l(&mutex_);
+  if (!initialized_) {
+    StatusProto* result_status = result_proto.mutable_status();
+    result_status->set_code(StatusProto::FAILED_PRECONDITION);
+    result_status->set_message("IcingSearchEngine has not been initialized!");
+    return result_proto;
+  }
+  if (!feature_flags_.enable_offline_observers()) {
+    StatusProto* result_status = result_proto.mutable_status();
+    result_status->set_code(StatusProto::FAILED_PRECONDITION);
+    result_status->set_message("Offline observers are not enabled.");
+    return result_proto;
+  }
+
+  int64_t timestamp_ms = page_token.last_sync_timestamp_ms();
+
+  // Each source of changes returns its own page of changes, which are then
+  // merged into a single page.
+  std::vector<DocumentChangeResult> results;
+  // Get added or updated documents.
+  libtextclassifier3::StatusOr<DocumentChangeResult> added_or_updated_or =
+      document_store_->GetAddedOrUpdatedDocuments(
+          timestamp_ms, schemas, kMaxDocumentChangesPerPage,
+          clock_->GetSystemTimeMilliseconds());
+  if (!added_or_updated_or.ok()) {
+    TransformStatus(added_or_updated_or.status(),
+                    result_proto.mutable_status());
+    return result_proto;
+  }
+  results.push_back(std::move(added_or_updated_or).ValueOrDie());
+
+  // Get deleted documents.
+  if (deletion_store_ == nullptr) {
+    // The DeletionStore is always created when offline observers are enabled.
+    StatusProto* result_status = result_proto.mutable_status();
+    result_status->set_code(StatusProto::INTERNAL);
+    result_status->set_message("DeletionStore is not initialized.");
+    return result_proto;
+  }
+  libtextclassifier3::StatusOr<DocumentChangeResult> deleted_or =
+      deletion_store_->GetDocumentChanges(timestamp_ms, schemas,
+                                          kMaxDocumentChangesPerPage);
+  if (!deleted_or.ok()) {
+    TransformStatus(deleted_or.status(), result_proto.mutable_status());
+    return result_proto;
+  }
+  results.push_back(std::move(deleted_or).ValueOrDie());
+  // Merge the results from the document store and deletion store so that only
+  // the first kMaxDocumentChangesPerPage changes by operation timestamp are
+  // returned.
+  libtextclassifier3::StatusOr<DocumentChangeResult> merged_or =
+      MergeDocumentChangeResults(std::move(results),
+                                 kMaxDocumentChangesPerPage);
+  if (!merged_or.ok()) {
+    TransformStatus(merged_or.status(), result_proto.mutable_status());
+    return result_proto;
+  }
+  result_proto =
+      BuildDocumentChangeResponse(merged_or.ValueOrDie(), timestamp_ms);
+  result_proto.mutable_status()->set_code(StatusProto::OK);
+  return result_proto;
+}
+
 DeleteResultProto IcingSearchEngine::Delete(const std::string_view name_space,
                                             const std::string_view uri) {
   ICING_VLOG(1) << "Deleting document from doc store";
@@ -3223,9 +3418,25 @@ OptimizeResultProto IcingSearchEngine::Optimize() {
     return result_proto;
   }
 
+  // Purge DeletionEvents that are past their time to live. This is independent
+  // of the document store and the indices, and DeletionStore::Optimize()
+  // persists its own data. It runs only after the indices have been updated to
+  // match the optimized document store and everything has been persisted, so
+  // that a failure here (which sets initialized_ to false) can't leave the
+  // indices out of sync with the document store on the next Initialize().
+  libtextclassifier3::Status deletion_store_optimize_status =
+      OptimizeDeletionStore();
+
   int64_t after_size = filesystem_->GetDiskUsage(options_.base_dir().c_str());
   optimize_stats->set_storage_size_after(
       Filesystem::SanitizeFileSize(after_size));
+
+  if (!deletion_store_optimize_status.ok()) {
+    TransformStatus(deletion_store_optimize_status, result_status);
+    result_proto.set_vm_binder_transaction_latency_start_time_ms(
+        clock_->GetSystemTimeMilliseconds());
+    return result_proto;
+  }
 
   TransformStatus(doc_store_optimize_result_status, result_status);
   result_proto.set_vm_binder_transaction_latency_start_time_ms(
@@ -3974,6 +4185,17 @@ OptimizeResultProto IcingSearchEngine::OptimizeSwapToDestDirectory(
     // 9. Delete marker file now that the engine is in a consistent state.
     marker_file.reset();
 
+    // Purge DeletionEvents that are past their time to live. The DeletionStore
+    // isn't part of the temp dir, so it is optimized in place here.
+    //
+    // TODO(b/568469091): Put DeletionEvents for the expired documents that
+    //   Stage 1 didn't copy. Stage 1 only holds a shared lock, so it can't put
+    //   them itself, and they would have to be carried over to Stage 2.
+    // If this fails, initialized_ is now false, and the error is returned below.
+    // The rest of the optimized data is still valid, so keep going.
+    libtextclassifier3::Status deletion_store_optimize_status =
+        OptimizeDeletionStore();
+
     // 10. Delete dead blob files or populate blob file names to remove.
     //
     // Skip it if any ground truth swap failed, since the dead blobs may still
@@ -3996,7 +4218,10 @@ OptimizeResultProto IcingSearchEngine::OptimizeSwapToDestDirectory(
           prepare_result.blob_file_names_to_remove();
     }
 
-    if (doc_swap_failed) {
+    if (!deletion_store_optimize_status.ok()) {
+      // Icing is uninitialized, which takes precedence over any data loss.
+      final_status = std::move(deletion_store_optimize_status);
+    } else if (doc_swap_failed) {
       final_status = absl_ports::DataLossError(
           "Failed to swap document directory, there might be data loss");
     } else if (blob_info_swap_failed) {
@@ -4213,6 +4438,12 @@ libtextclassifier3::Status IcingSearchEngine::PersistToDiskLocked(
       document_store_->PersistToDisk(persist_type, persist_stats));
   persist_stats->set_document_store_total_persist_latency_ms(
       overall_timer->GetElapsedMilliseconds());
+
+  if (deletion_store_ != nullptr) {
+    // The DeletionLog is ground truth, so persist it for all valid
+    // PersistTypes, like the document log.
+    ICING_RETURN_IF_ERROR(deletion_store_->PersistToDisk());
+  }
 
   switch (persist_type) {
     case PersistType::RECOVERY_PROOF:
@@ -5265,7 +5496,7 @@ IcingSearchEngine::OptimizeDocumentStore(
         /*pre_mapping_fbv=*/false, /*use_persistent_hash_map=*/true,
         options_.compression_level(), options_.compression_threshold_bytes(),
         options_.compression_mem_level(),
-        /*initialize_stats=*/nullptr);
+        /*initialize_stats=*/nullptr, deletion_store_.get());
     // TODO(b/144458732): Implement a more robust version of
     // TC_ASSIGN_OR_RETURN that can support error logging.
     if (!create_result_or.ok()) {
@@ -5295,7 +5526,7 @@ IcingSearchEngine::OptimizeDocumentStore(
       /*pre_mapping_fbv=*/false, /*use_persistent_hash_map=*/true,
       options_.compression_level(), options_.compression_threshold_bytes(),
       options_.compression_mem_level(),
-      /*initialize_stats=*/nullptr);
+      /*initialize_stats=*/nullptr, deletion_store_.get());
   if (!create_result_or.ok()) {
     // Unable to create DocumentStore from the new file. Mark as uninitialized
     // and return INTERNAL.
@@ -5307,6 +5538,17 @@ IcingSearchEngine::OptimizeDocumentStore(
   DocumentStore::CreateResult create_result =
       std::move(create_result_or).ValueOrDie();
   document_store_ = std::move(create_result.document_store);
+
+  // The expired documents that weren't copied are now deleted. This is done
+  // after switching to the new document store, so that they aren't reported
+  // as deleted if switching fails and they stay in the old one.
+  libtextclassifier3::Status put_deletion_events_status =
+      document_store_->PutExpiredDocumentDeletionEvents(
+          optimize_result.expired_document_deletion_events);
+  if (!put_deletion_events_status.ok()) {
+    ICING_LOG(ERROR) << "Failed to put DeletionEvents for expired documents: "
+                     << put_deletion_events_status.error_message();
+  }
 
   // Recreate the result state manager instance.
   if (!options_.enable_optimize_result_states()) {
