@@ -39,6 +39,7 @@
 #include "icing/portable/gzip_stream.h"
 #include "icing/portable/platform.h"
 #include "icing/proto/debug.pb.h"
+#include "icing/proto/deletion.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/document_wrapper.pb.h"
 #include "icing/proto/internal/scorable_property_set.pb.h"
@@ -51,6 +52,7 @@
 #include "icing/schema/schema-store.h"
 #include "icing/store/corpus-associated-scoring-data.h"
 #include "icing/store/corpus-id.h"
+#include "icing/store/deletion-store.h"
 #include "icing/store/document-associated-score-data.h"
 #include "icing/store/document-change.h"
 #include "icing/store/document-filter-data.h"
@@ -327,6 +329,45 @@ class DocumentStoreTest
             DocumentWrapper>::kDefaultCompressionThresholdBytes,
         protobuf_ports::kDefaultMemLevel,
         /*initialize_stats=*/nullptr);
+  }
+
+  libtextclassifier3::StatusOr<std::unique_ptr<DeletionStore>>
+  CreateDeletionStore() {
+    std::string deletion_store_dir = test_dir_ + "/deletion_store";
+    if (!filesystem_.CreateDirectoryRecursively(deletion_store_dir.c_str())) {
+      return absl_ports::InternalError("Failed to create deletion store dir.");
+    }
+    ICING_ASSIGN_OR_RETURN(
+        DeletionStore::CreateResult create_result,
+        DeletionStore::Create(
+            &filesystem_, deletion_store_dir,
+            PortableFileBackedProtoLog<DeletionEvent>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DeletionEvent>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel));
+    return std::move(create_result.deletion_store);
+  }
+
+  libtextclassifier3::StatusOr<DocumentStore::CreateResult>
+  CreateDocumentStoreWithDeletionStore(const std::string& base_dir,
+                                       DeletionStore* deletion_store,
+                                       const FeatureFlags* feature_flags) {
+    return DocumentStore::Create(
+        &filesystem_, base_dir, &fake_clock_, schema_store_.get(),
+        feature_flags,
+        /*force_recovery_and_revalidate_documents=*/false,
+        GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+        PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+        PortableFileBackedProtoLog<
+            DocumentWrapper>::kDefaultCompressionThresholdBytes,
+        protobuf_ports::kDefaultMemLevel,
+        /*initialize_stats=*/nullptr, deletion_store);
+  }
+
+  libtextclassifier3::StatusOr<DocumentStore::CreateResult>
+  CreateDocumentStoreWithDeletionStore(DeletionStore* deletion_store) {
+    return CreateDocumentStoreWithDeletionStore(
+        document_store_dir_, deletion_store, feature_flags_.get());
   }
 
   std::unique_ptr<FeatureFlags> feature_flags_;
@@ -4417,6 +4458,379 @@ TEST_P(DocumentStoreTest, OptimizeIntoKeepsDerivedTimestamps) {
       IsOkAndHolds(Property(
           &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
           Eq(1010))));
+}
+
+DeletionEvent CreateExpectedDeletionEvent(const std::string& name_space,
+                                          const std::string& uri,
+                                          int64_t deletion_timestamp_ms,
+                                          int64_t last_update_timestamp_ms) {
+  DeletionEvent deletion_event;
+  deletion_event.set_name_space(name_space);
+  deletion_event.set_uri(uri);
+  deletion_event.set_schema("email");
+  deletion_event.set_deletion_timestamp_ms(deletion_timestamp_ms);
+  deletion_event.set_last_update_timestamp_ms(last_update_timestamp_ms);
+  return deletion_event;
+}
+
+TEST_P(DocumentStoreTest, DeletePutsDeletionEvent) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(1000)
+                               .Build();
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->Delete("namespace", "1",
+                                    fake_clock_.GetSystemTimeMilliseconds()));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(EqualsProto(CreateExpectedDeletionEvent(
+                  "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                  /*last_update_timestamp_ms=*/1000)))));
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(5000));
+}
+
+TEST_P(DocumentStoreTest, DeleteByNamespacePutsDeletionEventsInOrder) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  for (const std::string& uri : {"1", "2"}) {
+    ICING_ASSERT_OK(
+        doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                                 .SetKey("namespace", uri)
+                                                 .SetSchema("email")
+                                                 .SetCreationTimestampMs(1)
+                                                 .SetLastUpdateTimestampMs(1000)
+                                                 .Build(),
+                                             /*num_string_tokens=*/1)));
+  }
+
+  // The clock doesn't advance between the deletions, so the second one is
+  // issued the next timestamp.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->DeleteByNamespace("namespace").status);
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                      /*last_update_timestamp_ms=*/1000)),
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace", "2", /*deletion_timestamp_ms=*/5001,
+                      /*last_update_timestamp_ms=*/1000)))));
+}
+
+TEST_P(DocumentStoreTest, DeleteBySchemaTypePutsDeletionEventsInOrder) {
+  // Add a second schema type, whose documents shouldn't be deleted.
+  ICING_ASSERT_OK_AND_ASSIGN(SchemaProto schema,
+                             schema_store_->GetFullSchemaProto());
+  *schema.add_types() = SchemaTypeConfigBuilder().SetType("message").Build();
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      schema, /*ignore_errors_and_delete_documents=*/false));
+
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  // Put the email documents in different namespaces, since DeleteBySchemaType
+  // deletes across namespaces. Put the message document between them, so that
+  // it's in the middle of the document ids that DeleteBySchemaType iterates
+  // over.
+  for (const auto& [name_space, schema_type] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"namespace1", "email"},
+           {"namespace1", "message"},
+           {"namespace2", "email"}}) {
+    ICING_ASSERT_OK(doc_store->Put(
+        CreateDocumentWrapper(DocumentBuilder()
+                                  .SetKey(name_space, schema_type)
+                                  .SetSchema(schema_type)
+                                  .SetCreationTimestampMs(1)
+                                  .SetLastUpdateTimestampMs(1000)
+                                  .Build(),
+                              /*num_string_tokens=*/1)));
+  }
+
+  // The clock doesn't advance between the deletions, so the second one is
+  // issued the next timestamp.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  DocumentStore::DeleteByGroupResult group_result =
+      doc_store->DeleteBySchemaType("email");
+  ICING_ASSERT_OK(group_result.status);
+  EXPECT_THAT(group_result.num_docs_deleted, Eq(2));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace1", "email", /*deletion_timestamp_ms=*/5000,
+                      /*last_update_timestamp_ms=*/1000)),
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace2", "email", /*deletion_timestamp_ms=*/5001,
+                      /*last_update_timestamp_ms=*/1000)))));
+  EXPECT_THAT(doc_store->Get("namespace1", "message"), IsOk());
+}
+
+TEST_P(DocumentStoreTest, ReplacingDocumentDoesNotPutDeletionEvent) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(1000)
+                               .Build();
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result,
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  ASSERT_TRUE(put_result.was_replacement);
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(IsEmpty()));
+}
+
+TEST_P(DocumentStoreTest, NoDeletionEventWhenOfflineObserversDisabled) {
+  auto feature_flags_disabled =
+      std::make_unique<FeatureFlags>(FeatureFlagsBuilder(GetTestFeatureFlags())
+                                         .set_enable_offline_observers(false)
+                                         .Build());
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::CreateResult create_result,
+                             CreateDocumentStoreWithDeletionStore(
+                                 document_store_dir_, deletion_store.get(),
+                                 feature_flags_disabled.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(1)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->Delete("namespace", "1",
+                                    fake_clock_.GetSystemTimeMilliseconds()));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/0, /*schemas=*/{}),
+              IsOkAndHolds(IsEmpty()));
+}
+
+TEST_P(DocumentStoreTest, PurgeExpiredDocumentsPutsDeletionEvent) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  fake_clock_.SetSystemTimeMilliseconds(100);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(100)
+                                               .SetLastUpdateTimestampMs(100)
+                                               .SetTtlMs(1000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->PurgeExpiredDocuments(
+      fake_clock_.GetSystemTimeMilliseconds()));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/100, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(EqualsProto(CreateExpectedDeletionEvent(
+                  "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                  /*last_update_timestamp_ms=*/100)))));
+}
+
+TEST_P(DocumentStoreTest,
+       PurgeExpiredDocumentsDoesNotPutDeletionEventForReplacedDocument) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  fake_clock_.SetSystemTimeMilliseconds(100);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(100)
+                                               .SetTtlMs(1000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  // Replace the document after it expired. The expired document isn't deleted
+  // by the Put, so it is purged afterwards, but its namespace and uri still
+  // exist.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(5000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+  ICING_ASSERT_OK_AND_ASSIGN(DocumentGroupInfo purged,
+                             doc_store->PurgeExpiredDocuments(
+                                 fake_clock_.GetSystemTimeMilliseconds()));
+  ASSERT_THAT(purged.GetTotalNumDocs(), Eq(1));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/0, /*schemas=*/{}),
+              IsOkAndHolds(IsEmpty()));
+}
+
+TEST_P(DocumentStoreTest, OptimizeIntoReturnsExpiredDocumentDeletionEvents) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+
+  std::vector<DeletionEvent> expired_document_deletion_events;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    fake_clock_.SetSystemTimeMilliseconds(100);
+    // Expires.
+    ICING_ASSERT_OK(
+        doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                                 .SetKey("namespace", "1")
+                                                 .SetSchema("email")
+                                                 .SetCreationTimestampMs(100)
+                                                 .SetLastUpdateTimestampMs(100)
+                                                 .SetTtlMs(1000)
+                                                 .Build(),
+                                             /*num_string_tokens=*/1)));
+    // Doesn't expire.
+    ICING_ASSERT_OK(
+        doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                                 .SetKey("namespace", "2")
+                                                 .SetSchema("email")
+                                                 .SetCreationTimestampMs(100)
+                                                 .SetLastUpdateTimestampMs(200)
+                                                 .Build(),
+                                             /*num_string_tokens=*/1)));
+
+    fake_clock_.SetSystemTimeMilliseconds(5000);
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::OptimizeResult optimize_result,
+        doc_store->OptimizeInto(optimized_dir, lang_segmenter_.get(),
+                                /*potentially_optimizable_blob_handles=*/
+                                std::unordered_set<std::string>()));
+
+    // The deletion timestamp is only issued once the caller switches to the
+    // new document store.
+    DeletionEvent expected_deletion_event;
+    expected_deletion_event.set_name_space("namespace");
+    expected_deletion_event.set_uri("1");
+    expected_deletion_event.set_schema("email");
+    expected_deletion_event.set_last_update_timestamp_ms(100);
+    EXPECT_THAT(optimize_result.expired_document_deletion_events,
+                ElementsAre(EqualsProto(expected_deletion_event)));
+    EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/100, /*schemas=*/{}),
+                IsOkAndHolds(IsEmpty()));
+    expired_document_deletion_events =
+        std::move(optimize_result.expired_document_deletion_events);
+  }
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(optimized_dir, deletion_store.get(),
+                                           feature_flags_.get()));
+  ICING_ASSERT_OK(
+      create_result.document_store->PutExpiredDocumentDeletionEvents(
+          std::move(expired_document_deletion_events)));
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/100, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(EqualsProto(CreateExpectedDeletionEvent(
+                  "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                  /*last_update_timestamp_ms=*/100)))));
+}
+
+TEST_P(DocumentStoreTest,
+       OptimizeIntoDoesNotReturnDeletionEventForReplacedExpiredDocument) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+
+  fake_clock_.SetSystemTimeMilliseconds(100);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(100)
+                                               .SetTtlMs(1000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  // Replace the document after it expired. The expired document isn't deleted
+  // by the Put, so OptimizeInto drops it, but its namespace and uri still
+  // exist.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(5000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::OptimizeResult optimize_result,
+      doc_store->OptimizeInto(optimized_dir, lang_segmenter_.get(),
+                              /*potentially_optimizable_blob_handles=*/
+                              std::unordered_set<std::string>()));
+  EXPECT_THAT(optimize_result.document_id_old_to_new,
+              ElementsAre(kInvalidDocumentId, 0));
+  EXPECT_THAT(optimize_result.expired_document_deletion_events, IsEmpty());
 }
 
 TEST_P(DocumentStoreTest, NonexistentDocumentFilterDataNotFound) {
@@ -9545,12 +9959,8 @@ TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_persistsAcrossReopen) {
               ElementsAre(MakeDocumentChange("ns", "email", "uri2", 20)));
 }
 
-// TODO(b/568469091): Enable once RegenerateDerivedFiles keeps the score cache
-// ordered by effective last update timestamp. Today it writes 0 for erased
-// documents, so the binary search in GetAddedOrUpdatedDocuments can skip live
-// documents after a regeneration.
 TEST_P(DocumentStoreTest,
-       DISABLED_GetAddedOrUpdatedDocuments_afterRegenerateDerivedFiles) {
+       GetAddedOrUpdatedDocuments_afterRegenerateDerivedFiles) {
   {
     ICING_ASSERT_OK_AND_ASSIGN(
         DocumentStore::CreateResult create_result,

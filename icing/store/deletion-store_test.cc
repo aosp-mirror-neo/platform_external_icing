@@ -36,6 +36,7 @@
 #include "icing/proto/deletion.pb.h"
 #include "icing/store/deletion-index-entry.h"
 #include "icing/store/deletion-log-creator.h"
+#include "icing/store/document-change.h"
 #include "icing/testing/common-matchers.h"
 #include "icing/testing/tmp-directory.h"
 #include "icing/util/data-loss.h"
@@ -54,6 +55,7 @@ using ::testing::IsEmpty;
 using ::testing::IsFalse;
 using ::testing::IsTrue;
 using ::testing::NotNull;
+using ::testing::Optional;
 using ::testing::Return;
 using ::testing::StrEq;
 
@@ -754,7 +756,7 @@ TEST_F(DeletionStoreTest, GetFiltersOutEventsWithinSameMinute) {
       IsOkAndHolds(ElementsAre(EqualsProto(event2))));
 }
 
-TEST_F(DeletionStoreTest, GetFiltersOutDocumentsUpdatedAfterTimestamp) {
+TEST_F(DeletionStoreTest, GetIncludesDocumentsUpdatedAfterTimestamp) {
   // Updated before the timestamp.
   DeletionEvent event1 = CreateDeletionEvent(
       "uri1", "schema", /*deletion_timestamp_ms=*/5 * kMillisPerMinute,
@@ -779,10 +781,13 @@ TEST_F(DeletionStoreTest, GetFiltersOutDocumentsUpdatedAfterTimestamp) {
   ICING_ASSERT_OK(deletion_store->Put(event3));
   ICING_ASSERT_OK(deletion_store->Put(event4));
 
-  EXPECT_THAT(
-      deletion_store->Get(/*timestamp_ms=*/3 * kMillisPerMinute,
-                          /*schemas=*/{}),
-      IsOkAndHolds(ElementsAre(EqualsProto(event1), EqualsProto(event2))));
+  // The last update timestamp doesn't matter, since a document updated after
+  // the timestamp may have also existed before it.
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/3 * kMillisPerMinute,
+                                  /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(EqualsProto(event1), EqualsProto(event2),
+                                       EqualsProto(event3),
+                                       EqualsProto(event4))));
 }
 
 TEST_F(DeletionStoreTest, GetFiltersBySchema) {
@@ -830,6 +835,207 @@ TEST_F(DeletionStoreTest, GetAfterReinitialize) {
   EXPECT_THAT(create_result.deletion_store->Get(
                   /*timestamp_ms=*/3 * kMillisPerMinute, /*schemas=*/{}),
               IsOkAndHolds(ElementsAre(EqualsProto(event2))));
+}
+
+DocumentChange MakeDocumentChange(std::string uri, std::string schema,
+                                  int64_t operation_timestamp_ms) {
+  return DocumentChange{.name_space = "namespace",
+                        .schema = std::move(schema),
+                        .uri = std::move(uri),
+                        .operation_timestamp_ms = operation_timestamp_ms};
+}
+
+TEST_F(DeletionStoreTest, GetDocumentChangesFromEmptyStore) {
+  ICING_ASSERT_OK_AND_ASSIGN(DeletionStore::CreateResult create_result,
+                             CreateStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      create_result.deletion_store->GetDocumentChanges(
+          /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/10));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
+}
+
+TEST_F(DeletionStoreTest, GetDocumentChangesReturnsDeletionsAfterTimestamp) {
+  DeletionEvent event1 = CreateDeletionEvent(
+      "uri1", "schema", /*deletion_timestamp_ms=*/2 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  DeletionEvent event2 = CreateDeletionEvent(
+      "uri2", "schema", /*deletion_timestamp_ms=*/4 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  // Added after timestamp 3 minutes and then deleted.
+  DeletionEvent event3 = CreateDeletionEvent(
+      "uri3", "schema", /*deletion_timestamp_ms=*/5 * kMillisPerMinute,
+      /*update_timestamp_ms=*/3 * kMillisPerMinute + 1);
+  DeletionEvent event4 = CreateDeletionEvent(
+      "uri4", "schema", /*deletion_timestamp_ms=*/6 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  ICING_ASSERT_OK_AND_ASSIGN(DeletionStore::CreateResult create_result,
+                             CreateStore());
+  DeletionStore* deletion_store = create_result.deletion_store.get();
+  ICING_ASSERT_OK(deletion_store->Put(event1));
+  ICING_ASSERT_OK(deletion_store->Put(event2));
+  ICING_ASSERT_OK(deletion_store->Put(event3));
+  ICING_ASSERT_OK(deletion_store->Put(event4));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      deletion_store->GetDocumentChanges(
+          /*timestamp_ms=*/3 * kMillisPerMinute + 1, /*schemas=*/{},
+          /*max_changes=*/10));
+  EXPECT_THAT(
+      result.changes,
+      ElementsAre(MakeDocumentChange("uri2", "schema", 4 * kMillisPerMinute),
+                  MakeDocumentChange("uri3", "schema", 5 * kMillisPerMinute),
+                  MakeDocumentChange("uri4", "schema", 6 * kMillisPerMinute)));
+  EXPECT_FALSE(result.has_more_changes());
+
+  // uri3 was last updated after timestamp 3 minutes, but its deletion is still
+  // returned, e.g. in case it was re-put with the same uri after the caller
+  // saw an earlier version.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, deletion_store->GetDocumentChanges(
+                  /*timestamp_ms=*/3 * kMillisPerMinute, /*schemas=*/{},
+                  /*max_changes=*/10));
+  EXPECT_THAT(
+      result.changes,
+      ElementsAre(MakeDocumentChange("uri2", "schema", 4 * kMillisPerMinute),
+                  MakeDocumentChange("uri3", "schema", 5 * kMillisPerMinute),
+                  MakeDocumentChange("uri4", "schema", 6 * kMillisPerMinute)));
+  EXPECT_FALSE(result.has_more_changes());
+
+  // A deletion at exactly the timestamp is not returned.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, deletion_store->GetDocumentChanges(
+                  /*timestamp_ms=*/6 * kMillisPerMinute, /*schemas=*/{},
+                  /*max_changes=*/10));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
+}
+
+TEST_F(DeletionStoreTest, GetDocumentChangesFiltersBySchema) {
+  DeletionEvent event1 = CreateDeletionEvent(
+      "uri1", "schema1", /*deletion_timestamp_ms=*/2 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  DeletionEvent event2 = CreateDeletionEvent(
+      "uri2", "schema2", /*deletion_timestamp_ms=*/3 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  DeletionEvent event3 = CreateDeletionEvent(
+      "uri3", "schema3", /*deletion_timestamp_ms=*/4 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  ICING_ASSERT_OK_AND_ASSIGN(DeletionStore::CreateResult create_result,
+                             CreateStore());
+  DeletionStore* deletion_store = create_result.deletion_store.get();
+  ICING_ASSERT_OK(deletion_store->Put(event1));
+  ICING_ASSERT_OK(deletion_store->Put(event2));
+  ICING_ASSERT_OK(deletion_store->Put(event3));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      deletion_store->GetDocumentChanges(
+          /*timestamp_ms=*/1 * kMillisPerMinute,
+          /*schemas=*/{"schema1", "schema3"}, /*max_changes=*/10));
+  EXPECT_THAT(
+      result.changes,
+      ElementsAre(MakeDocumentChange("uri1", "schema1", 2 * kMillisPerMinute),
+                  MakeDocumentChange("uri3", "schema3", 4 * kMillisPerMinute)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, deletion_store->GetDocumentChanges(
+                  /*timestamp_ms=*/1 * kMillisPerMinute,
+                  /*schemas=*/{"nonexistent"}, /*max_changes=*/10));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
+}
+
+TEST_F(DeletionStoreTest, GetDocumentChangesPagination) {
+  DeletionEvent event1 = CreateDeletionEvent(
+      "uri1", "schema", /*deletion_timestamp_ms=*/2 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  DeletionEvent event2 = CreateDeletionEvent(
+      "uri2", "schema", /*deletion_timestamp_ms=*/3 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  DeletionEvent event3 = CreateDeletionEvent(
+      "uri3", "schema", /*deletion_timestamp_ms=*/3 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  DeletionEvent event4 = CreateDeletionEvent(
+      "uri4", "schema", /*deletion_timestamp_ms=*/4 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  // Filtered out by schema, so it doesn't count as a remaining change.
+  DeletionEvent event5 = CreateDeletionEvent(
+      "uri5", "other", /*deletion_timestamp_ms=*/5 * kMillisPerMinute,
+      /*update_timestamp_ms=*/1 * kMillisPerMinute);
+  ICING_ASSERT_OK_AND_ASSIGN(DeletionStore::CreateResult create_result,
+                             CreateStore());
+  DeletionStore* deletion_store = create_result.deletion_store.get();
+  ICING_ASSERT_OK(deletion_store->Put(event1));
+  ICING_ASSERT_OK(deletion_store->Put(event2));
+  ICING_ASSERT_OK(deletion_store->Put(event3));
+  ICING_ASSERT_OK(deletion_store->Put(event4));
+  ICING_ASSERT_OK(deletion_store->Put(event5));
+
+  // The page size is strictly respected, so the first page ends at uri2 even
+  // though uri3 shares its timestamp.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      deletion_store->GetDocumentChanges(
+          /*timestamp_ms=*/1 * kMillisPerMinute, /*schemas=*/{"schema"},
+          /*max_changes=*/2));
+  EXPECT_THAT(
+      result.changes,
+      ElementsAre(MakeDocumentChange("uri1", "schema", 2 * kMillisPerMinute),
+                  MakeDocumentChange("uri2", "schema", 3 * kMillisPerMinute)));
+  EXPECT_THAT(result.next_change_timestamp_ms, Optional(3 * kMillisPerMinute));
+
+  ICING_ASSERT_OK_AND_ASSIGN(result,
+                             deletion_store->GetDocumentChanges(
+                                 /*timestamp_ms=*/3 * kMillisPerMinute - 1,
+                                 /*schemas=*/{"schema"}, /*max_changes=*/2));
+  EXPECT_THAT(
+      result.changes,
+      ElementsAre(MakeDocumentChange("uri2", "schema", 3 * kMillisPerMinute),
+                  MakeDocumentChange("uri3", "schema", 3 * kMillisPerMinute)));
+  EXPECT_THAT(result.next_change_timestamp_ms, Optional(4 * kMillisPerMinute));
+
+  ICING_ASSERT_OK_AND_ASSIGN(result,
+                             deletion_store->GetDocumentChanges(
+                                 /*timestamp_ms=*/3 * kMillisPerMinute,
+                                 /*schemas=*/{"schema"}, /*max_changes=*/2));
+  EXPECT_THAT(result.changes, ElementsAre(MakeDocumentChange(
+                                  "uri4", "schema", 4 * kMillisPerMinute)));
+  EXPECT_FALSE(result.has_more_changes());
+}
+
+TEST_F(DeletionStoreTest, GetDocumentChangesZeroMaxChanges) {
+  ICING_ASSERT_OK_AND_ASSIGN(DeletionStore::CreateResult create_result,
+                             CreateStore());
+  DeletionStore* deletion_store = create_result.deletion_store.get();
+
+  // No changes at all.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      deletion_store->GetDocumentChanges(
+          /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/0));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
+
+  // No changes are returned, but there are more changes.
+  ICING_ASSERT_OK(deletion_store->Put(CreateDeletionEvent(
+      "uri1", "schema", /*deletion_timestamp_ms=*/2 * kMillisPerMinute,
+      /*update_timestamp_ms=*/0)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, deletion_store->GetDocumentChanges(
+                  /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/0));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_THAT(result.next_change_timestamp_ms, Optional(2 * kMillisPerMinute));
+}
+
+TEST_F(DeletionStoreTest, GetDocumentChangesNegativeMaxChanges) {
+  ICING_ASSERT_OK_AND_ASSIGN(DeletionStore::CreateResult create_result,
+                             CreateStore());
+  EXPECT_THAT(create_result.deletion_store->GetDocumentChanges(
+                  /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/-1),
+              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
 TEST_F(DeletionStoreTest, OptimizeEmptyStore) {
@@ -997,11 +1203,16 @@ TEST_F(DeletionStoreTest, CallsAfterFailedOptimizeReturnFailedPrecondition) {
       .WillOnce(Return(false));
   EXPECT_THAT(deletion_store->Optimize(/*timestamp_ms=*/3 * kMillisPerMinute),
               StatusIs(libtextclassifier3::StatusCode::INTERNAL));
+  EXPECT_THAT(deletion_store->is_initialized(), IsFalse());
 
   EXPECT_THAT(deletion_store->Put(event2),
               StatusIs(libtextclassifier3::StatusCode::FAILED_PRECONDITION));
   EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/0, /*schemas=*/{}),
               StatusIs(libtextclassifier3::StatusCode::FAILED_PRECONDITION));
+  EXPECT_THAT(
+      deletion_store->GetDocumentChanges(/*timestamp_ms=*/0, /*schemas=*/{},
+                                         /*max_changes=*/10),
+      StatusIs(libtextclassifier3::StatusCode::FAILED_PRECONDITION));
   EXPECT_THAT(deletion_store->PersistToDisk(),
               StatusIs(libtextclassifier3::StatusCode::FAILED_PRECONDITION));
   EXPECT_THAT(deletion_store->Optimize(/*timestamp_ms=*/3 * kMillisPerMinute),
@@ -1030,6 +1241,7 @@ TEST_F(DeletionStoreTest, OptimizeSwapFailureKeepsOldDeletionLog) {
   EXPECT_CALL(mock_filesystem, SwapFiles).WillOnce(PartialSwapAction());
   EXPECT_THAT(deletion_store->Optimize(/*timestamp_ms=*/3 * kMillisPerMinute),
               StatusIs(libtextclassifier3::StatusCode::INTERNAL));
+  EXPECT_THAT(deletion_store->is_initialized(), IsTrue());
 
   // Nothing was purged.
   EXPECT_THAT(

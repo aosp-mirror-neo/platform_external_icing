@@ -150,6 +150,12 @@ public class IcingSearchEngineImpl implements Closeable {
   }
 
   @Nullable
+  public byte[] getDocumentChanges(@NonNull byte[] getDocumentChangesRequestBytes) {
+    throwIfClosed();
+    return nativeGetDocumentChanges(this, getDocumentChangesRequestBytes);
+  }
+
+  @Nullable
   public byte[] search(
       @NonNull byte[] searchSpecBytes,
       @NonNull byte[] scoringSpecBytes,
@@ -396,6 +402,9 @@ public class IcingSearchEngineImpl implements Closeable {
       IcingSearchEngineImpl instance, byte[] usageReportBytes);
 
   private static native byte[] nativeGetAllNamespaces(IcingSearchEngineImpl instance);
+
+  private static native byte[] nativeGetDocumentChanges(
+      IcingSearchEngineImpl instance, byte[] getDocumentChangesRequestBytes);
 
   private static native byte[] nativeSearch(
       IcingSearchEngineImpl instance,

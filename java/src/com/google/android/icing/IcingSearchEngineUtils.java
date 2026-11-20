@@ -25,6 +25,7 @@ import com.google.android.icing.proto.DeleteByNamespaceResultProto;
 import com.google.android.icing.proto.DeleteByQueryResultProto;
 import com.google.android.icing.proto.DeleteBySchemaTypeResultProto;
 import com.google.android.icing.proto.DeleteResultProto;
+import com.google.android.icing.proto.DocumentChangeResponseProto;
 import com.google.android.icing.proto.GetAllNamespacesResultProto;
 import com.google.android.icing.proto.GetOptimizeInfoResultProto;
 import com.google.android.icing.proto.GetResultProto;
@@ -208,6 +209,16 @@ public final class IcingSearchEngineUtils {
       builder.setResponseBytes(getAllNamespacesResultBytes.length);
     }
     return builder.build();
+  }
+
+  @NonNull
+  public static DocumentChangeResponseProto byteArrayToDocumentChangeResponseProto(
+      @Nullable byte[] documentChangeResponseBytes) {
+    return getResponseProtoBuilderFromRawData(
+            documentChangeResponseBytes,
+            DocumentChangeResponseProto.newBuilder(),
+            status -> DocumentChangeResponseProto.newBuilder().setStatus(status))
+        .build();
   }
 
   @NonNull

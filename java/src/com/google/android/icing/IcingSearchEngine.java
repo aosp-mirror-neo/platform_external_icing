@@ -24,8 +24,10 @@ import com.google.android.icing.proto.DeleteByNamespaceResultProto;
 import com.google.android.icing.proto.DeleteByQueryResultProto;
 import com.google.android.icing.proto.DeleteBySchemaTypeResultProto;
 import com.google.android.icing.proto.DeleteResultProto;
+import com.google.android.icing.proto.DocumentChangeResponseProto;
 import com.google.android.icing.proto.DocumentProto;
 import com.google.android.icing.proto.GetAllNamespacesResultProto;
+import com.google.android.icing.proto.GetDocumentChangesRequestProto;
 import com.google.android.icing.proto.GetNextPageRequestProto;
 import com.google.android.icing.proto.GetOptimizeInfoResultProto;
 import com.google.android.icing.proto.GetResultProto;
@@ -177,6 +179,13 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   public @NonNull GetAllNamespacesResultProto getAllNamespaces() {
     return IcingSearchEngineUtils.byteArrayToGetAllNamespacesResultProto(
         icingSearchEngineImpl.getAllNamespaces());
+  }
+
+  @Override
+  public @NonNull DocumentChangeResponseProto getDocumentChanges(
+      @NonNull GetDocumentChangesRequestProto getDocumentChangesRequest) {
+    return IcingSearchEngineUtils.byteArrayToDocumentChangeResponseProto(
+        icingSearchEngineImpl.getDocumentChanges(getDocumentChangesRequest.toByteArray()));
   }
 
   @Override
