@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <string_view>
@@ -37,6 +38,7 @@
 #include "icing/proto/term.pb.h"
 #include "icing/schema/joinable-property.h"
 #include "icing/schema/section.h"
+#include "icing/util/logging.h"
 
 namespace icing {
 namespace lib {
@@ -94,7 +96,8 @@ bool IsJoinableProperty(const PropertyConfigProto& property) {
 
 void SetStringIndexingConfig(MonkeyTestRandomEngine* random,
                              PropertyConfigProto& property, bool indexable,
-                             bool joinable) {
+                             bool joinable,
+                             bool enable_join_delete_propagation) {
   property.clear_string_indexing_config();
   property.clear_joinable_config();
   if (indexable) {
@@ -110,6 +113,13 @@ void SetStringIndexingConfig(MonkeyTestRandomEngine* random,
   if (joinable) {
     JoinableConfig* joinable_config = property.mutable_joinable_config();
     joinable_config->set_value_type(JoinableConfig::ValueType::QUALIFIED_ID);
+
+    if (enable_join_delete_propagation && GetRandomBoolean(random)) {
+      // If delete propagation feature is enabled, then 50% chance of getting a
+      // joinable property with delete propagation.
+      joinable_config->set_delete_propagation_type(
+          JoinableConfig::DeletePropagationType::PROPAGATE_FROM);
+    }
   }
 }
 
@@ -117,8 +127,13 @@ void SetEmbeddingIndexingConfig(MonkeyTestRandomEngine* random,
                                 PropertyConfigProto& property, bool indexable) {
   property.clear_embedding_indexing_config();
   if (indexable) {
+    EmbeddingIndexingConfig::EmbeddingIndexingType::Code type =
+        GetRandomBoolean(random)
+            ? EmbeddingIndexingConfig::EmbeddingIndexingType::LINEAR_SEARCH
+            : EmbeddingIndexingConfig::EmbeddingIndexingType::
+                  APPROXIMATE_NEAREST_NEIGHBOR;
     property.mutable_embedding_indexing_config()->set_embedding_indexing_type(
-        EmbeddingIndexingConfig::EmbeddingIndexingType::LINEAR_SEARCH);
+        type);
   }
   if (GetRandomBoolean(random)) {
     property.mutable_embedding_indexing_config()->set_quantization_type(
@@ -174,8 +189,7 @@ MonkeySchemaGenerator::UpdateSchemaResult MonkeySchemaGenerator::UpdateSchema(
 
   // Updating about 1/3 of existing types.
   for (int i = 0; i < new_schema.types_size(); ++i) {
-    std::uniform_int_distribution<> dist(0, 2);
-    if (dist(*random_) == 0) {
+    if (GetRandomBooleanWithProbability(random_, 0.3333333333f)) {
       UpdateType(*new_schema.mutable_types(i), result);
     }
   }
@@ -232,14 +246,16 @@ PropertyConfigProto MonkeySchemaGenerator::GenerateProperty(
   //   joinable, then it has to be a string property.
   if (joinable) {
     prop.set_data_type(PropertyConfigProto::DataType::STRING);
-    SetStringIndexingConfig(random_, prop, indexable, joinable);
+    SetStringIndexingConfig(random_, prop, indexable, joinable,
+                            config_->enable_join_delete_propagation);
   } else {
     // 0=STRING, 1=VECTOR, 2=INT64
     std::uniform_int_distribution<> dist(0, 2);
     int data_type_choice = dist(*random_);
     if (data_type_choice == 0) {
       prop.set_data_type(PropertyConfigProto::DataType::STRING);
-      SetStringIndexingConfig(random_, prop, indexable, joinable);
+      SetStringIndexingConfig(random_, prop, indexable, joinable,
+                              config_->enable_join_delete_propagation);
     } else if (data_type_choice == 1) {
       prop.set_data_type(PropertyConfigProto::DataType::VECTOR);
       SetEmbeddingIndexingConfig(random_, prop, indexable);
@@ -279,43 +295,57 @@ void MonkeySchemaGenerator::UpdateProperty(
 
   bool old_indexable = IsIndexableProperty(property);
   bool new_indexable = GetRandomBoolean(random_);
-  bool old_joinable = IsJoinableProperty(property);
-  // 20% chance to flip joinable. Only works for string properties.
-  bool new_joinable = old_joinable;
-  if (config_->IsJoinEnabled() &&
-      GetRandomBooleanWithProbability(random_, 0.2f)) {
-    new_joinable = !old_joinable;
-  }
 
   bool index_incompatible = old_indexable != new_indexable;
-  bool join_incompatible = old_joinable != new_joinable;
+  bool join_incompatible = false;
 
   if (property.data_type() == PropertyConfigProto::DataType::STRING) {
     TermMatchType::Code old_term_match_type =
         property.string_indexing_config().term_match_type();
     JoinableConfig::ValueType::Code old_joinable_value_type =
         property.joinable_config().value_type();
+    JoinableConfig::DeletePropagationType::Code old_delete_propagation_type =
+        property.joinable_config().delete_propagation_type();
 
-    SetStringIndexingConfig(random_, property, new_indexable, new_joinable);
+    bool old_joinable = IsJoinableProperty(property);
+    // 20% chance to flip joinable. Only works for string properties.
+    bool new_joinable = old_joinable;
+    if (config_->IsJoinEnabled() &&
+        GetRandomBooleanWithProbability(random_, 0.2f)) {
+      new_joinable = !old_joinable;
+    }
+
+    SetStringIndexingConfig(random_, property, new_indexable, new_joinable,
+                            config_->enable_join_delete_propagation);
 
     TermMatchType::Code new_term_match_type =
         property.string_indexing_config().term_match_type();
     JoinableConfig::ValueType::Code new_joinable_value_type =
         property.joinable_config().value_type();
+    JoinableConfig::DeletePropagationType::Code new_delete_propagation_type =
+        property.joinable_config().delete_propagation_type();
 
     if (old_term_match_type != new_term_match_type) {
       index_incompatible = true;
     }
-    if (old_joinable_value_type != new_joinable_value_type) {
+    if (old_joinable_value_type != new_joinable_value_type ||
+        old_delete_propagation_type != new_delete_propagation_type) {
       join_incompatible = true;
     }
   } else if (property.data_type() == PropertyConfigProto::DataType::VECTOR) {
     EmbeddingIndexingConfig::QuantizationType::Code old_quantization_type =
         property.embedding_indexing_config().quantization_type();
+    EmbeddingIndexingConfig::EmbeddingIndexingType::Code
+        old_embedding_indexing_type =
+            property.embedding_indexing_config().embedding_indexing_type();
     SetEmbeddingIndexingConfig(random_, property, new_indexable);
     EmbeddingIndexingConfig::QuantizationType::Code new_quantization_type =
         property.embedding_indexing_config().quantization_type();
-    if (old_quantization_type != new_quantization_type) {
+    EmbeddingIndexingConfig::EmbeddingIndexingType::Code
+        new_embedding_indexing_type =
+            property.embedding_indexing_config().embedding_indexing_type();
+    if (old_quantization_type != new_quantization_type ||
+        old_embedding_indexing_type != new_embedding_indexing_type) {
       index_incompatible = true;
     }
   } else if (property.data_type() == PropertyConfigProto::DataType::INT64) {
@@ -389,6 +419,8 @@ void MonkeySchemaGenerator::AddDuplicateType(SchemaProto& schema) {
   SchemaTypeConfigProto new_dupe_type = base_type;
   new_dupe_type.set_schema_type(std::string(kSchemaTypeNamePrefix) +
                                 std::to_string(num_types_generated_++));
+  ICING_LOG(INFO) << "Adding duplicate type: " << new_dupe_type.schema_type()
+                  << "; base type: " << base_type.schema_type();
   int max_property_id = 0;
   for (const PropertyConfigProto& property : new_dupe_type.properties()) {
     max_property_id =
@@ -509,6 +541,12 @@ std::string MonkeyDocumentGenerator::GetUri() const {
 std::string MonkeyDocumentGenerator::GetUriWithRange(int l, int r) const {
   std::uniform_int_distribution<> dist(l, r - 1);
   return absl_ports::StrCat(kDocumentUriPrefix, std::to_string(dist(*random_)));
+}
+
+int32_t MonkeyDocumentGenerator::GetRandomInt32Value() const {
+  // Scores are integers ranging from 0 to the max int32 value (2,147,483,647).
+  std::uniform_int_distribution<> dist(0, std::numeric_limits<int32_t>::max());
+  return dist(*random_);
 }
 
 int MonkeyDocumentGenerator::GetNumTokens() const {
@@ -641,6 +679,12 @@ MonkeyDocumentGenerator::GetVectorPropertyContent(
   return content;
 }
 
+int64_t MonkeyDocumentGenerator::GetRandomInt64Value() const {
+  std::uniform_int_distribution<int64_t> dist(
+      config_->int64_value_range.first, config_->int64_value_range.second);
+  return dist(*random_);
+}
+
 std::vector<int64_t> MonkeyDocumentGenerator::GetInt64PropertyContent(
     PropertyConfigProto::Cardinality::Code cardinality) const {
   int num_values = GetNumInt64(cardinality);
@@ -649,10 +693,8 @@ std::vector<int64_t> MonkeyDocumentGenerator::GetInt64PropertyContent(
     return content;
   }
   content.reserve(num_values);
-  std::uniform_int_distribution<int64_t> value_dist(
-      config_->int64_value_range.first, config_->int64_value_range.second);
   for (int i = 0; i < num_values; ++i) {
-    content.push_back(value_dist(*random_));
+    content.push_back(GetRandomInt64Value());
   }
   return content;
 }
@@ -666,7 +708,8 @@ MonkeyTokenizedDocument MonkeyDocumentGenerator::GenerateDocument() {
           .SetNamespace(name_space)
           .SetSchema(type_config.schema_type())
           .SetUri(GetUri())
-          .SetCreationTimestampMs(clock_.GetSystemTimeMilliseconds());
+          .SetCreationTimestampMs(GetRandomInt32Value())
+          .SetScore(GetRandomInt32Value());
   for (const PropertyConfigProto& prop : type_config.properties()) {
     if (prop.data_type() == PropertyConfigProto::DataType::STRING) {
       // Generate string contents.
@@ -687,7 +730,19 @@ MonkeyTokenizedDocument MonkeyDocumentGenerator::GenerateDocument() {
                                   JoinableConfig::ValueType::QUALIFIED_ID) ||
                                  GetRandomBooleanWithProbability(random_, 0.3f);
       }
+
       if (generate_qualified_ids) {
+        // Note: GetQualifiedIds may return some non-existing qualified ids.
+        // - If delete propagation is enabled, these non-existing qualified ids
+        //   will be treated as unsatisfied dependencies and will cause
+        //   PutDocument to fail.
+        // - However, for testing purpose, we still need to generate some
+        //   non-existing qualified ids to test the dependency validation and
+        //   fail PutDocument correctly.
+        // - Therefore, we still call GetQualifiedIds to cover both existing and
+        //   non-existing qualified ids. But tuning the random space for
+        //   qualified id (document namespace and uri) is essential to control
+        //   delete propagation tests.
         prop_content = GetQualifiedIds(prop.cardinality());
       } else {
         prop_content = GetStringPropertyContent();

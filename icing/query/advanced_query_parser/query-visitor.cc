@@ -352,8 +352,8 @@ libtextclassifier3::StatusOr<PendingValue> QueryVisitor::SearchFunction(
         &index_, &numeric_index_, &embedding_index_, &document_store_,
         &schema_store_, &normalizer_, &tokenizer_, join_children_fetcher_,
         search_spec_, filter_predicate_, needs_term_frequency_info_,
-        get_embedding_match_info_, &feature_flags_, pending_property_restricts_,
-        processing_not_, current_time_ms_);
+        get_embedding_match_info_, &feature_flags_, &embedding_query_results_,
+        pending_property_restricts_, processing_not_, current_time_ms_);
     tree_root->Accept(&query_visitor);
     ICING_ASSIGN_OR_RETURN(query_result,
                            std::move(query_visitor).ConsumeResults());
@@ -474,11 +474,8 @@ libtextclassifier3::StatusOr<PendingValue> QueryVisitor::SemanticSearchFunction(
   if (nprobe > 0) {
     // Positive nprobe value indicates that IVF search should be performed.
     ICING_ASSIGN_OR_RETURN(
-        EmbeddingIndex::IvfContextManager ivf_context_manager,
-        EmbeddingIndex::IvfContextManager::Create(query_vector));
-    ICING_ASSIGN_OR_RETURN(cluster_ids,
-                           ivf_context_manager.GetClosestClusterIdsByDistance(
-                               &embedding_index_, query_vector, nprobe));
+        cluster_ids,
+        embedding_index_.GetClosestClusterIdsByDistance(query_vector, nprobe));
     cluster_ids.push_back(embedding_util::kIvfDeltaStoreClusterId);
   }
   cluster_ids.push_back(embedding_util::kLinearSearchClusterId);
@@ -615,7 +612,8 @@ QueryVisitor::ProduceTextTokenIterators(QueryTerm text_value) {
       ICING_ASSIGN_OR_RETURN(
           raw_token, string_util::FindEscapedToken(raw_text, token.text));
     }
-    normalized_term = normalizer_.NormalizeTerm(token.text);
+    normalized_term =
+        normalizer_.NormalizeTerm(token.text, /*is_query_term=*/true);
     bool should_prefix_match = reached_final_token && text_value.is_prefix_val;
     QueryTerm term_value{std::move(normalized_term.text), raw_token,
                          should_prefix_match};
@@ -1159,7 +1157,7 @@ libtextclassifier3::StatusOr<QueryResults> QueryVisitor::ConsumeResults() && {
   results.root_iterator = std::move(iterator_or).ValueOrDie();
   results.query_term_iterators = std::move(query_term_iterators_);
   results.query_terms = std::move(property_query_terms_map_);
-  results.embedding_query_results = std::move(embedding_query_results_);
+  results.embedding_query_results = std::move(owned_embedding_query_results_);
   results.features_in_use = std::move(features_);
   return results;
 }

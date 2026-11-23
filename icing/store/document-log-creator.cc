@@ -97,6 +97,9 @@ DocumentLogCreator::Create(const Filesystem* filesystem,
     new_file = true;
   }
 
+  bool enable_compression_mem_level =
+      feature_flags != nullptr &&
+      feature_flags->enable_proto_log_compression_mem_level();
   ICING_ASSIGN_OR_RETURN(
       PortableFileBackedProtoLog<DocumentWrapper>::CreateResult
           log_create_result,
@@ -105,8 +108,7 @@ DocumentLogCreator::Create(const Filesystem* filesystem,
           PortableFileBackedProtoLog<DocumentWrapper>::Options(
               /*compress_in=*/true, constants::kMaxProtoSize, compression_level,
               compression_threshold_bytes, compression_mem_level,
-              feature_flags->enable_proto_log_new_header_format(),
-              feature_flags->enable_reusable_decompression_buffer())));
+              enable_compression_mem_level)));
 
   CreateResult create_result = {std::move(log_create_result),
                                 preexisting_file_version, new_file};
@@ -136,6 +138,9 @@ libtextclassifier3::Status DocumentLogCreator::MigrateFromV0ToV1(
       std::move(v0_create_result.proto_log);
 
   // Create a v1 portable proto log that we will write our protos to.
+  bool enable_compression_mem_level =
+      feature_flags != nullptr &&
+      feature_flags->enable_proto_log_compression_mem_level();
   auto v1_create_result_or =
       PortableFileBackedProtoLog<DocumentWrapper>::Create(
           filesystem, MakeDocumentLogFilenameV1(base_dir),
@@ -143,8 +148,7 @@ libtextclassifier3::Status DocumentLogCreator::MigrateFromV0ToV1(
               /*compress_in=*/true,
               /*max_proto_size_in=*/constants::kMaxProtoSize, compression_level,
               compression_threshold_bytes, compression_mem_level,
-              feature_flags->enable_proto_log_new_header_format(),
-              feature_flags->enable_reusable_decompression_buffer()));
+              enable_compression_mem_level));
   if (!v1_create_result_or.ok()) {
     return absl_ports::Annotate(
         v1_create_result_or.status(),

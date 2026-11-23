@@ -27,8 +27,10 @@
 #include "icing/index/embed/embedding-scorer.h"
 #include "icing/index/embed/quantizer.h"
 #include "icing/monkey_test/monkey-tokenized-document.h"
+#include "icing/proto/ann.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/schema.pb.h"
+#include "icing/schema/section.h"
 #include "icing/util/embedding-util.h"
 #include "icing/util/status-macros.h"
 
@@ -68,7 +70,17 @@ struct IcingMonkeyTestRunnerConfiguration {
   // list, instead of picking it from a range. For example, a vector of
   // [1, 2, 3, 4] means each generated types have a 25% chance of getting 1
   // property, 2 properties, 3 properties and 4 properties.
-  std::vector<int> possible_num_properties;
+  // Optional.
+  std::vector<int> possible_num_properties = {0,
+                                              1,
+                                              2,
+                                              4,
+                                              8,
+                                              16,
+                                              kTotalNumSections / 2,
+                                              kTotalNumSections,
+                                              kTotalNumSections + 1,
+                                              kTotalNumSections * 2};
 
   // The possible number of tokens that may appear in a string property of
   // generated documents, with a noise factor from 0.5 to 1 applied.
@@ -80,21 +92,50 @@ struct IcingMonkeyTestRunnerConfiguration {
   // - Also if the cardinality of the joinable property is optional or required,
   //   then only 1 qualified id will be generated. In this case,
   //   possible_num_tokens is ignored.
+  // Required.
   std::vector<int> possible_num_tokens;
 
   // The possible number of embedding vectors that may appear in a repeated
   // vector property of generated documents.
+  // Required.
   std::vector<int> possible_num_vectors;
 
   // The possible dimensions for the randomly generated embedding vectors.
+  // Required.
   std::vector<int> possible_vector_dimensions;
+
+  // The possible number of shards that may be used for embedding indexing.
+  std::vector<int> possible_num_shards = {1, 2, 4, 8, 16, 32};
+
+  // The options for ANN index maintenance.
+  MaintainAnnIndexOptions maintain_ann_index_options = [] {
+    MaintainAnnIndexOptions options;
+    options.mutable_mini_batch_k_means_options()->set_target_cluster_size(50);
+    options.set_min_size_for_ivf(1000);
+    options.set_rebuild_threshold(0.2);
+    return options;
+  }();
 
   // The possible number of int64 values that may appear in a repeated
   // int64 property of generated documents.
+  // Optional.
   std::vector<int> possible_num_int64s = {5, 10, 25};
 
   // The range [min, max] of values for randomly generated int64 properties.
-  std::pair<int64_t, int64_t> int64_value_range = {-1000, 1000};
+  // Optional.
+  std::pair<int64_t, int64_t> int64_value_range = {-100, 100};
+
+  // An array of pairs of possible query tree depths and their frequencies.
+  // If f_sum is the sum of all the frequencies, an operation with frequency f
+  // means for every f_sum iterations, the operation is expected to run f times.
+  // Optional.
+  std::vector<std::pair<int, int>> possible_query_tree_depths = {
+      {1, 90}, {2, 5}, {3, 5}};
+
+  // The possible number of children that an n-ary node in the query tree may
+  // have.
+  // Optional.
+  std::vector<int> possible_num_children_per_nary_node = {2, 3, 5, 8};
 
   // The possible random spaces for generating qualified ids for join
   // properties. When generating a qualified id:
@@ -111,12 +152,18 @@ struct IcingMonkeyTestRunnerConfiguration {
     int uri_l;
     int uri_r;
   };
+  // Optional. If empty, join property generation is disabled.
   std::vector<QualifiedIdRandomSpace> possible_ref_qualified_id_random_spaces;
+
+  // Whether to enable join delete propagation. If true, then the generator will
+  // generate joinable properties with delete propagation in the schema.
+  bool enable_join_delete_propagation = false;
 
   // An array of pairs of monkey test APIs with frequencies.
   // If f_sum is the sum of all the frequencies, an operation with frequency f
   // means for every f_sum iterations, the operation is expected to run f times.
-  std::vector<std::pair<std::function<void(IcingMonkeyTestRunner*)>, uint32_t>>
+  // Required.
+  std::vector<std::pair<std::function<void(IcingMonkeyTestRunner*)>, int>>
       monkey_api_schedules;
 
   bool IsJoinEnabled() const {
@@ -173,12 +220,12 @@ inline libtextclassifier3::StatusOr<bool> DoesVectorsMatch(
     Quantizer quantizer(candidate.quantized_values().data());
     const uint8_t* quantized_data = reinterpret_cast<const uint8_t*>(
         candidate.quantized_values().data() + sizeof(Quantizer));
-    score = embedding_scorer->EigenScore(dimension, query_values_ptr,
-                                         quantized_data, quantizer);
+    score = embedding_scorer->Score(dimension, query_values_ptr, quantized_data,
+                                    quantizer);
   } else if (quantization_type ==
              EmbeddingIndexingConfig::QuantizationType::NONE) {
-    score = embedding_scorer->EigenScore(dimension, query_values_ptr,
-                                         candidate.values().data());
+    score = embedding_scorer->Score(dimension, query_values_ptr,
+                                    candidate.values().data());
   } else {
     // Quantize the candidate vector.
     // The candidate vector should never be empty, so dereferencing should be
@@ -193,12 +240,11 @@ inline libtextclassifier3::StatusOr<bool> DoesVectorsMatch(
       quantized_candidate.push_back(quantizer.Quantize(value));
     }
     // Score the quantized candidate against the original query.
-    score = embedding_scorer->EigenScore(dimension, query_values_ptr,
-                                         quantized_candidate.data(), quantizer);
+    score = embedding_scorer->Score(dimension, query_values_ptr,
+                                    quantized_candidate.data(), quantizer);
   }
   return min_score <= score && score <= max_score;
 }
-
 inline bool DoesSchemaTypeMatch(
     const MonkeyTokenizedDocument& document,
     const std::vector<std::string>& schema_type_filters) {

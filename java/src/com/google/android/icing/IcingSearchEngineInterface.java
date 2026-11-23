@@ -2,6 +2,7 @@ package com.google.android.icing;
 
 import com.google.android.icing.proto.BatchGetResultProto;
 import com.google.android.icing.proto.BatchPutResultProto;
+import com.google.android.icing.proto.BlobKeyProto;
 import com.google.android.icing.proto.BlobProto;
 import com.google.android.icing.proto.DebugInfoResultProto;
 import com.google.android.icing.proto.DebugInfoVerbosity;
@@ -9,8 +10,10 @@ import com.google.android.icing.proto.DeleteByNamespaceResultProto;
 import com.google.android.icing.proto.DeleteByQueryResultProto;
 import com.google.android.icing.proto.DeleteBySchemaTypeResultProto;
 import com.google.android.icing.proto.DeleteResultProto;
+import com.google.android.icing.proto.DocumentChangeResponseProto;
 import com.google.android.icing.proto.DocumentProto;
 import com.google.android.icing.proto.GetAllNamespacesResultProto;
+import com.google.android.icing.proto.GetDocumentChangesRequestProto;
 import com.google.android.icing.proto.GetNextPageRequestProto;
 import com.google.android.icing.proto.GetOptimizeInfoResultProto;
 import com.google.android.icing.proto.GetResultProto;
@@ -21,6 +24,7 @@ import com.google.android.icing.proto.HandleExpiredDocumentsResultProto;
 import com.google.android.icing.proto.InitializeResultProto;
 import com.google.android.icing.proto.MaintainAnnIndexOptions;
 import com.google.android.icing.proto.MaintainAnnIndexResultProto;
+import com.google.android.icing.proto.OptimizePrepareResultProto;
 import com.google.android.icing.proto.OptimizeResultProto;
 import com.google.android.icing.proto.PersistToDiskResultProto;
 import com.google.android.icing.proto.PersistType;
@@ -124,6 +128,18 @@ public interface IcingSearchEngineInterface extends Closeable {
   GetAllNamespacesResultProto getAllNamespaces();
 
   /**
+   * Gets the documents that were added, updated or deleted after the timestamp in the request's
+   * page token, grouped by namespace and schema type.
+   *
+   * <p>Results are paginated. If {@code has_more_changes} is true in the response, call this
+   * again with the response's {@code next_page_token} to get the next page.
+   */
+  default DocumentChangeResponseProto getDocumentChanges(
+      GetDocumentChangesRequestProto getDocumentChangesRequest) {
+    throw new UnsupportedOperationException("getDocumentChanges is not supported.");
+  }
+
+  /**
    * Searches over the documents.
    *
    * <p>Documents need to be retrieved on the following {@link #getNextPage} calls on the returned
@@ -187,6 +203,35 @@ public interface IcingSearchEngineInterface extends Closeable {
   /** Marks the blob is committed. */
   BlobProto commitBlob(PropertyProto.BlobHandleProto blobHandle);
 
+  /**
+   * Marks the blob is committed along with its blob key. The blob key is persisted as-is, so the
+   * caller must not pass plaintext key material.
+   */
+  default BlobProto commitEncryptedBlob(
+      PropertyProto.BlobHandleProto blobHandle, BlobKeyProto blobKey) {
+    throw new UnsupportedOperationException("commitEncryptedBlob is not supported.");
+  }
+
+  /**
+   * Gets the blob key of a committed blob. The returned blob_key is set only if the blob was
+   * committed with a blob key.
+   */
+  default BlobProto getBlobKey(PropertyProto.BlobHandleProto blobHandle) {
+    throw new UnsupportedOperationException("getBlobKey is not supported.");
+  }
+
+  /**
+   * Re-wraps the encryption key of a committed blob to the given server public key after verifying
+   * the server attestation. Only implementations that can verify the attestation, such as the
+   * isolated storage pVM, support this.
+   */
+  default BlobProto rewrapBlobKey(
+      PropertyProto.BlobHandleProto blobHandle,
+      byte[] serverPublicKey,
+      byte[] serverAttestation) {
+    throw new UnsupportedOperationException("rewrapBlobKey is not supported.");
+  }
+
   /** Gets all the blob info from the blob store. */
   BlobProto getAllBlobInfos();
 
@@ -227,6 +272,30 @@ public interface IcingSearchEngineInterface extends Closeable {
 
   /** Makes the icing instance run tasks that are too expensive to be run in real-time. */
   OptimizeResultProto optimize();
+
+  /**
+   * Stage 1 of the 2-stage optimization: compacts the document store and indexes into a temporary
+   * directory without swapping them in.
+   *
+   * <p>Read operations can run concurrently with this call, while write operations are blocked. The
+   * caller MUST call {@link #persistToDisk} with {@link PersistType.Code#FULL} immediately before
+   * calling this method.
+   *
+   * <p>The returned {@link OptimizePrepareResultProto} should be passed to {@link
+   * #optimizeSwapToDestDirectory(OptimizePrepareResultProto)} to finish the optimization.
+   */
+  OptimizePrepareResultProto optimizePrepareDestDirectory();
+
+  /**
+   * Stage 2 of the 2-stage optimization: swaps the directories prepared by {@link
+   * #optimizePrepareDestDirectory()} into place and re-initializes the icing instance.
+   *
+   * <p>Returns ABORTED if any write happened after {@link #optimizePrepareDestDirectory()}, in
+   * which case the active storage is left untouched and the caller may retry from Stage 1.
+   *
+   * @param optimizePrepareResult the result returned by {@link #optimizePrepareDestDirectory()}.
+   */
+  OptimizeResultProto optimizeSwapToDestDirectory(OptimizePrepareResultProto optimizePrepareResult);
 
   /** Gets information about the optimization. */
   GetOptimizeInfoResultProto getOptimizeInfo();

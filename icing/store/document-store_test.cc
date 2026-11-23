@@ -14,6 +14,7 @@
 
 #include "icing/store/document-store.h"
 
+#include <cctype>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -38,6 +39,7 @@
 #include "icing/portable/gzip_stream.h"
 #include "icing/portable/platform.h"
 #include "icing/proto/debug.pb.h"
+#include "icing/proto/deletion.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/document_wrapper.pb.h"
 #include "icing/proto/internal/scorable_property_set.pb.h"
@@ -50,7 +52,9 @@
 #include "icing/schema/schema-store.h"
 #include "icing/store/corpus-associated-scoring-data.h"
 #include "icing/store/corpus-id.h"
+#include "icing/store/deletion-store.h"
 #include "icing/store/document-associated-score-data.h"
+#include "icing/store/document-change.h"
 #include "icing/store/document-filter-data.h"
 #include "icing/store/document-group-info.h"
 #include "icing/store/document-id.h"
@@ -71,6 +75,7 @@
 #include "icing/util/icu-data-file-helper.h"
 #include "icing/util/logging.h"
 #include "icing/util/scorable_property_set.h"
+#include "icing/util/status-macros.h"
 #include "unicode/uloc.h"
 
 namespace icing {
@@ -80,6 +85,7 @@ namespace {
 
 using ::icing::lib::portable_equals_proto::EqualsProto;
 using ::testing::_;
+using ::testing::Contains;
 using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::Ge;
@@ -93,17 +99,10 @@ using ::testing::Not;
 using ::testing::Optional;
 using ::testing::Pair;
 using ::testing::Pointee;
+using ::testing::Property;
 using ::testing::Return;
+using ::testing::SizeIs;
 using ::testing::UnorderedElementsAre;
-
-using ResultSpecProto::ResultGroupingType::
-    ResultSpecProto_ResultGroupingType_NAMESPACE;
-using ResultSpecProto::ResultGroupingType::
-    ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE;
-using ResultSpecProto::ResultGroupingType::
-    ResultSpecProto_ResultGroupingType_NONE;
-using ResultSpecProto::ResultGroupingType::
-    ResultSpecProto_ResultGroupingType_SCHEMA_TYPE;
 
 const NamespaceStorageInfoProto& GetNamespaceStorageInfo(
     const DocumentStorageInfoProto& storage_info,
@@ -289,6 +288,35 @@ class DocumentStoreTest
     filesystem_.Write(header_file.c_str(), &header, sizeof(header));
   }
 
+  // Opens the document log in dir directly. The document store on dir must
+  // not be open.
+  libtextclassifier3::StatusOr<DocumentLogCreator::CreateResult>
+  OpenDocumentLog(const std::string& dir) {
+    return DocumentLogCreator::Create(
+        &filesystem_, dir, feature_flags_.get(),
+        PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+        PortableFileBackedProtoLog<
+            DocumentWrapper>::kDefaultCompressionThresholdBytes,
+        protobuf_ports::kDefaultMemLevel);
+  }
+
+  libtextclassifier3::Status SetDocumentLogLastIssuedTimestamp(
+      const std::string& dir, int64_t last_issued_timestamp_ms) {
+    ICING_ASSIGN_OR_RETURN(DocumentLogCreator::CreateResult create_result,
+                           OpenDocumentLog(dir));
+    create_result.log_create_result.proto_log->SetLastIssuedTimestampMs(
+        last_issued_timestamp_ms);
+    return create_result.log_create_result.proto_log->PersistToDisk();
+  }
+
+  libtextclassifier3::StatusOr<int64_t> GetDocumentLogLastIssuedTimestamp(
+      const std::string& dir) {
+    ICING_ASSIGN_OR_RETURN(DocumentLogCreator::CreateResult create_result,
+                           OpenDocumentLog(dir));
+    return create_result.log_create_result.proto_log
+        ->GetLastIssuedTimestampMs();
+  }
+
   libtextclassifier3::StatusOr<DocumentStore::CreateResult> CreateDocumentStore(
       const Filesystem* filesystem, const std::string& base_dir,
       const Clock* clock, const SchemaStore* schema_store) {
@@ -301,6 +329,45 @@ class DocumentStoreTest
             DocumentWrapper>::kDefaultCompressionThresholdBytes,
         protobuf_ports::kDefaultMemLevel,
         /*initialize_stats=*/nullptr);
+  }
+
+  libtextclassifier3::StatusOr<std::unique_ptr<DeletionStore>>
+  CreateDeletionStore() {
+    std::string deletion_store_dir = test_dir_ + "/deletion_store";
+    if (!filesystem_.CreateDirectoryRecursively(deletion_store_dir.c_str())) {
+      return absl_ports::InternalError("Failed to create deletion store dir.");
+    }
+    ICING_ASSIGN_OR_RETURN(
+        DeletionStore::CreateResult create_result,
+        DeletionStore::Create(
+            &filesystem_, deletion_store_dir,
+            PortableFileBackedProtoLog<DeletionEvent>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DeletionEvent>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel));
+    return std::move(create_result.deletion_store);
+  }
+
+  libtextclassifier3::StatusOr<DocumentStore::CreateResult>
+  CreateDocumentStoreWithDeletionStore(const std::string& base_dir,
+                                       DeletionStore* deletion_store,
+                                       const FeatureFlags* feature_flags) {
+    return DocumentStore::Create(
+        &filesystem_, base_dir, &fake_clock_, schema_store_.get(),
+        feature_flags,
+        /*force_recovery_and_revalidate_documents=*/false,
+        GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+        PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+        PortableFileBackedProtoLog<
+            DocumentWrapper>::kDefaultCompressionThresholdBytes,
+        protobuf_ports::kDefaultMemLevel,
+        /*initialize_stats=*/nullptr, deletion_store);
+  }
+
+  libtextclassifier3::StatusOr<DocumentStore::CreateResult>
+  CreateDocumentStoreWithDeletionStore(DeletionStore* deletion_store) {
+    return CreateDocumentStoreWithDeletionStore(
+        document_store_dir_, deletion_store, feature_flags_.get());
   }
 
   std::unique_ptr<FeatureFlags> feature_flags_;
@@ -1502,18 +1569,10 @@ TEST_P(DocumentStoreTest, PurgeExpiredDocuments_shouldSkipDeletedDocuments) {
 TEST_P(DocumentStoreTest,
        PurgeExpiredDocuments_shouldPurgeDocumentsThatExpireWithinThreshold) {
   auto custom_feature_flags = std::make_unique<FeatureFlags>(
-      /*enable_circular_schema_definitions=*/true,
-      /*enable_repeated_field_joins=*/true,
-      /*enable_embedding_backup_generation=*/true,
-      /*enable_proto_log_new_header_format=*/true,
-      /*enable_reusable_decompression_buffer=*/true,
-      /*enable_schema_type_id_optimization=*/true,
-      /*enable_optimize_improvements=*/true,
-      /*expired_document_purge_threshold_ms=*/1000,  // 1 second
-      /*enable_non_existent_qualified_id_join=*/true,
-      /*enable_skip_set_schema_type_equality_check=*/true,
-      /*enable_schema_definition_deduping=*/true,
-      /*enable_delete_propagation_from=*/true);
+      FeatureFlagsBuilder(GetTestFeatureFlags())
+          .set_expired_document_purge_threshold_ms(1000)  // 1 second
+          .Build());
+
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::CreateResult create_result,
       DocumentStore::Create(
@@ -2222,7 +2281,6 @@ TEST_P(DocumentStoreTest, ShouldRecoverFromDataLoss) {
           document_id2, fake_clock_.GetSystemTimeMilliseconds()));
   EXPECT_THAT(doc_filter_data,
               Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                    document2_expiration_timestamp_,
                                     document2_expiration_timestamp_)));
 
   // Checks derived score cache
@@ -2357,7 +2415,6 @@ TEST_P(DocumentStoreTest, ShouldRecoverFromCorruptDerivedFile) {
           document_id2, fake_clock_.GetSystemTimeMilliseconds()));
   EXPECT_THAT(doc_filter_data,
               Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                    document2_expiration_timestamp_,
                                     document2_expiration_timestamp_)));
 
   // Checks derived score cache
@@ -2490,7 +2547,6 @@ TEST_P(DocumentStoreTest, ShouldRecoverFromDiscardDerivedFiles) {
           document_id2, fake_clock_.GetSystemTimeMilliseconds()));
   EXPECT_THAT(doc_filter_data,
               Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                    document2_expiration_timestamp_,
                                     document2_expiration_timestamp_)));
 
   // Checks derived score cache.
@@ -2614,7 +2670,6 @@ TEST_P(DocumentStoreTest, ShouldRecoverFromBadChecksum) {
           document_id2, fake_clock_.GetSystemTimeMilliseconds()));
   EXPECT_THAT(doc_filter_data,
               Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                    document2_expiration_timestamp_,
                                     document2_expiration_timestamp_)));
   // Checks derived score cache
   EXPECT_THAT(
@@ -3064,6 +3119,1720 @@ TEST_P(DocumentStoreTest, NonexistentDocumentAssociatedScoreDataNotFound) {
               StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
 }
 
+TEST_P(DocumentStoreTest,
+       DocumentAssociatedScoreDataHoldsEffectiveLastUpdateTimestamp) {
+  constexpr int64_t kLastUpdateTimestampMs1 = 1234;
+  constexpr int64_t kLastUpdateTimestampMs2 = 5678;
+
+  DocumentProto document1 =
+      DocumentBuilder()
+          .SetKey("namespace", "1")
+          .SetSchema("email")
+          .SetScore(document1_score_)
+          .SetCreationTimestampMs(document1_creation_timestamp_)
+          .SetLastUpdateTimestampMs(kLastUpdateTimestampMs1)
+          .Build();
+  DocumentProto document2 =
+      DocumentBuilder()
+          .SetKey("namespace", "2")
+          .SetSchema("email")
+          .SetScore(document2_score_)
+          .SetCreationTimestampMs(document2_creation_timestamp_)
+          .SetLastUpdateTimestampMs(kLastUpdateTimestampMs2)
+          .Build();
+  // A document without the field should get 0 in the cache.
+  DocumentProto document3 =
+      DocumentBuilder()
+          .SetKey("namespace", "3")
+          .SetSchema("email")
+          .SetScore(document1_score_)
+          .SetCreationTimestampMs(document1_creation_timestamp_)
+          .Build();
+
+  DocumentId document_id1, document_id2, document_id3;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result1,
+                               doc_store->Put(CreateDocumentWrapper(
+                                   document1, /*num_string_tokens=*/5)));
+    document_id1 = put_result1.new_document_id;
+    ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result2,
+                               doc_store->Put(CreateDocumentWrapper(
+                                   document2, /*num_string_tokens=*/7)));
+    document_id2 = put_result2.new_document_id;
+    ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result3,
+                               doc_store->Put(CreateDocumentWrapper(
+                                   document3, /*num_string_tokens=*/3)));
+    document_id3 = put_result3.new_document_id;
+
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_id1),
+        IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+            /*corpus_id=*/0, document1_score_, document1_creation_timestamp_,
+            /*length_in_tokens=*/5,
+            /*has_valid_scorable_property_cache_index=*/true,
+            /*effective_last_update_timestamp_ms=*/kLastUpdateTimestampMs1)));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_id2),
+        IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+            /*corpus_id=*/0, document2_score_, document2_creation_timestamp_,
+            /*length_in_tokens=*/7,
+            /*has_valid_scorable_property_cache_index=*/true,
+            /*effective_last_update_timestamp_ms=*/kLastUpdateTimestampMs2)));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_id3),
+        IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+            /*corpus_id=*/0, document1_score_, document1_creation_timestamp_,
+            /*length_in_tokens=*/3,
+            /*has_valid_scorable_property_cache_index=*/true,
+            /*effective_last_update_timestamp_ms=*/0)));
+
+    // Deleting a document resets its score cache entry but keeps the last
+    // update timestamp, so the cache stays ordered by timestamp.
+    ICING_ASSERT_OK(doc_store->Delete("namespace", "2",
+                                      fake_clock_.GetSystemTimeMilliseconds()));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_id2),
+        IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+            kInvalidCorpusId, /*document_score=*/-1,
+            /*creation_timestamp_ms=*/-1, /*length_in_tokens=*/0,
+            /*has_valid_scorable_property_cache_index=*/false,
+            /*effective_last_update_timestamp_ms=*/kLastUpdateTimestampMs2)));
+
+    ICING_ASSERT_OK(doc_store->PersistToDisk(PersistType::FULL));
+  }
+
+  // Force derived files to be regenerated from the document log and verify the
+  // cache is rebuilt with the same values.
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        DocumentStore::Create(
+            &filesystem_, document_store_dir_, &fake_clock_,
+            schema_store_.get(), feature_flags_.get(),
+            /*force_recovery_and_revalidate_documents=*/true,
+            /*pre_mapping_fbv=*/false, /*use_persistent_hash_map=*/true,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_id1),
+        IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+            /*corpus_id=*/0, document1_score_, document1_creation_timestamp_,
+            /*length_in_tokens=*/5,
+            /*has_valid_scorable_property_cache_index=*/true,
+            /*effective_last_update_timestamp_ms=*/kLastUpdateTimestampMs1)));
+    // The deleted document's proto was erased from the log, and document3 has
+    // no timestamp. Both are trailing entries, so they are filled with one
+    // more than the largest timestamp.
+    EXPECT_THAT(doc_store->GetDocumentAssociatedScoreData(document_id2),
+                IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+                    kInvalidCorpusId, /*document_score=*/-1,
+                    /*creation_timestamp_ms=*/-1, /*length_in_tokens=*/0,
+                    /*has_valid_scorable_property_cache_index=*/false,
+                    /*effective_last_update_timestamp_ms=*/
+                    kLastUpdateTimestampMs1 + 1)));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_id3),
+        IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+            /*corpus_id=*/0, document1_score_, document1_creation_timestamp_,
+            /*length_in_tokens=*/3,
+            /*has_valid_scorable_property_cache_index=*/true,
+            /*effective_last_update_timestamp_ms=*/kLastUpdateTimestampMs1 +
+                1)));
+  }
+}
+
+TEST_P(DocumentStoreTest, IssueTimestampStartsFromZero) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(0));
+}
+
+TEST_P(DocumentStoreTest, IssueTimestampFollowsAdvancingClock) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  fake_clock_.SetSystemTimeMilliseconds(1000);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(1000));
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(1000));
+
+  fake_clock_.SetSystemTimeMilliseconds(2000);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(2000));
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(2000));
+}
+
+TEST_P(DocumentStoreTest, IssueTimestampIncrementsWhenClockStalls) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  // Several events within the same millisecond get distinct timestamps, one
+  // apart.
+  fake_clock_.SetSystemTimeMilliseconds(1000);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(1000));
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(1001));
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(1002));
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(1002));
+}
+
+TEST_P(DocumentStoreTest, IssueTimestampIncrementsWhenClockMovesBackwards) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(5000));
+
+  // The clock moves backwards; issued timestamps keep advancing from the last
+  // issued value instead of following the clock.
+  fake_clock_.SetSystemTimeMilliseconds(3000);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(5001));
+  fake_clock_.SetSystemTimeMilliseconds(3001);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(5002));
+
+  // Once the clock passes the last issued value, it is followed again.
+  fake_clock_.SetSystemTimeMilliseconds(9000);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(9000));
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(9000));
+}
+
+TEST_P(DocumentStoreTest, LastIssuedTimestampIsRestoredFromDocumentLogHeader) {
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/5000));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(5000));
+
+  // The clock is behind the restored value, so issuing continues from it.
+  fake_clock_.SetSystemTimeMilliseconds(1000);
+  EXPECT_THAT(doc_store->IssueTimestampMs(), Eq(5001));
+}
+
+TEST_P(DocumentStoreTest,
+       LastIssuedTimestampIsRestoredFromScoreCacheWhenAheadOfHeader) {
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(5678)
+                               .Build();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    ICING_ASSERT_OK(create_result.document_store->Put(
+        CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  }
+  // E.g. the header was reset, or written by an older version.
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/3000));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+              Eq(5678));
+}
+
+TEST_P(DocumentStoreTest,
+       LastIssuedTimestampIsRestoredFromHeaderWhenAheadOfScoreCache) {
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(1234)
+                               .Build();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    ICING_ASSERT_OK(create_result.document_store->Put(
+        CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  }
+  // E.g. the largest timestamp was issued to a document that is now gone.
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/9000));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+              Eq(9000));
+}
+
+TEST_P(DocumentStoreTest, LastIssuedTimestampSkipsTrailingZeros) {
+  DocumentProto document1 = DocumentBuilder()
+                                .SetKey("namespace", "1")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .SetLastUpdateTimestampMs(1234)
+                                .Build();
+  DocumentProto document2 = DocumentBuilder()
+                                .SetKey("namespace", "2")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .SetLastUpdateTimestampMs(5678)
+                                .Build();
+  // A trailing document without last_update_timestamp_ms, e.g. put by an
+  // older version.
+  DocumentProto document3 = DocumentBuilder()
+                                .SetKey("namespace", "3")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .Build();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (const DocumentProto& document : {document1, document2, document3}) {
+      ICING_ASSERT_OK(create_result.document_store->Put(
+          CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+    }
+    ICING_ASSERT_OK(create_result.document_store->PersistToDisk(
+        PersistType::FULL));
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/3000));
+
+  // The last non-zero entry (5678) is larger than the header value.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+              Eq(5678));
+}
+
+TEST_P(DocumentStoreTest,
+       LastIssuedTimestampIsRestoredFromScoreCacheWhenHeaderIsReset) {
+  DocumentProto document1 = DocumentBuilder()
+                                .SetKey("namespace", "1")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .SetLastUpdateTimestampMs(1234)
+                                .Build();
+  DocumentProto document2 = DocumentBuilder()
+                                .SetKey("namespace", "2")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .SetLastUpdateTimestampMs(5678)
+                                .Build();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (const DocumentProto& document : {document1, document2}) {
+      ICING_ASSERT_OK(create_result.document_store->Put(
+          CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+    }
+    ICING_ASSERT_OK(create_result.document_store->PersistToDisk(
+        PersistType::FULL));
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/9000));
+
+  // Corrupt the document log's header checksum. Everything is persisted, so
+  // there is no unsynced tail to discard: the log resets the last issued
+  // timestamp to 0 without reporting data loss, and the derived files are not
+  // regenerated.
+  using Header = PortableFileBackedProtoLog<DocumentWrapper>::Header;
+  const std::string log_file = absl_ports::StrCat(
+      document_store_dir_, "/", DocumentLogCreator::GetDocumentLogFilename());
+  Header header;
+  ASSERT_TRUE(filesystem_.PRead(log_file.c_str(), &header, sizeof(Header),
+                                /*offset=*/0));
+  header.SetHeaderChecksum(header.GetHeaderChecksum() + 12345);
+  ASSERT_TRUE(filesystem_.PWrite(log_file.c_str(), /*offset=*/0, &header,
+                                 sizeof(Header)));
+
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    EXPECT_THAT(create_result.data_loss, Eq(DataLoss::NONE));
+    EXPECT_FALSE(create_result.derived_files_regenerated);
+    // The header value (9000) is gone; the value comes from the last entry.
+    EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+                Eq(5678));
+  }
+  // The header was reset.
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(document_store_dir_),
+              IsOkAndHolds(0));
+}
+
+TEST_P(DocumentStoreTest,
+       LastIssuedTimestampSkipsTrailingZerosWhenHeaderIsReset) {
+  DocumentProto document1 = DocumentBuilder()
+                                .SetKey("namespace", "1")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .SetLastUpdateTimestampMs(1234)
+                                .Build();
+  DocumentProto document2 = DocumentBuilder()
+                                .SetKey("namespace", "2")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .SetLastUpdateTimestampMs(5678)
+                                .Build();
+  // A trailing document without last_update_timestamp_ms, e.g. put by an
+  // older version.
+  DocumentProto document3 = DocumentBuilder()
+                                .SetKey("namespace", "3")
+                                .SetSchema("email")
+                                .SetCreationTimestampMs(1)
+                                .Build();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (const DocumentProto& document : {document1, document2, document3}) {
+      ICING_ASSERT_OK(create_result.document_store->Put(
+          CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+    }
+    ICING_ASSERT_OK(create_result.document_store->PersistToDisk(
+        PersistType::FULL));
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/9000));
+
+  // Corrupt the document log's header checksum. Everything is persisted, so
+  // there is no unsynced tail to discard: the log resets the last issued
+  // timestamp to 0 without reporting data loss, and the derived files are not
+  // regenerated.
+  using Header = PortableFileBackedProtoLog<DocumentWrapper>::Header;
+  const std::string log_file = absl_ports::StrCat(
+      document_store_dir_, "/", DocumentLogCreator::GetDocumentLogFilename());
+  Header header;
+  ASSERT_TRUE(filesystem_.PRead(log_file.c_str(), &header, sizeof(Header),
+                                /*offset=*/0));
+  header.SetHeaderChecksum(header.GetHeaderChecksum() + 12345);
+  ASSERT_TRUE(filesystem_.PWrite(log_file.c_str(), /*offset=*/0, &header,
+                                 sizeof(Header)));
+
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    EXPECT_THAT(create_result.data_loss, Eq(DataLoss::NONE));
+    EXPECT_FALSE(create_result.derived_files_regenerated);
+    // The header value (9000) is gone. The value comes from the last non-zero
+    // entry of the score cache, skipping the trailing 0.
+    EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+                Eq(5678));
+  }
+  // The header was reset.
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(document_store_dir_),
+              IsOkAndHolds(0));
+}
+
+TEST_P(DocumentStoreTest,
+       LastIssuedTimestampIsNotRestoredWhenOfflineObserversDisabled) {
+  auto feature_flags_disabled =
+      std::make_unique<FeatureFlags>(FeatureFlagsBuilder(GetTestFeatureFlags())
+                                         .set_enable_offline_observers(false)
+                                         .Build());
+  auto create_document_store = [&](const std::string& dir,
+                                   const FeatureFlags* feature_flags) {
+    return DocumentStore::Create(
+        &filesystem_, dir, &fake_clock_, schema_store_.get(), feature_flags,
+        /*force_recovery_and_revalidate_documents=*/false,
+        GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+        PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+        PortableFileBackedProtoLog<
+            DocumentWrapper>::kDefaultCompressionThresholdBytes,
+        protobuf_ports::kDefaultMemLevel,
+        /*initialize_stats=*/nullptr);
+  };
+
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(1234)
+                               .Build();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        create_document_store(document_store_dir_,
+                              feature_flags_disabled.get()));
+    ICING_ASSERT_OK(create_result.document_store->Put(
+        CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/9000));
+
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        create_document_store(document_store_dir_,
+                              feature_flags_disabled.get()));
+    // The counter is not restored while offline observers are disabled.
+    EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+                Eq(0));
+
+    ICING_ASSERT_OK(create_result.document_store->OptimizeInto(
+        optimized_dir, lang_segmenter_.get(),
+        /*potentially_optimizable_blob_handles=*/
+        std::unordered_set<std::string>()));
+  }
+
+  // OptimizeInto still carries over the value in the document log header, so
+  // it is restored once offline observers are enabled.
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(optimized_dir),
+              IsOkAndHolds(9000));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      create_document_store(optimized_dir, feature_flags_.get()));
+  EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+              Eq(9000));
+}
+
+TEST_P(DocumentStoreTest, OptimizeIntoCarriesOverLastIssuedTimestamp) {
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(1234)
+                               .Build();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    ICING_ASSERT_OK(create_result.document_store->Put(
+        CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/9000));
+
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    ICING_ASSERT_OK(create_result.document_store->OptimizeInto(
+        optimized_dir, lang_segmenter_.get(),
+        /*potentially_optimizable_blob_handles=*/
+        std::unordered_set<std::string>()));
+  }
+
+  // The kept document only has 1234, so the value must come from the header.
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(optimized_dir),
+              IsOkAndHolds(9000));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, optimized_dir, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_THAT(create_result.document_store->last_issued_timestamp_ms(),
+              Eq(9000));
+}
+
+TEST_P(DocumentStoreTest, SetDocumentOperationTimestampsForNewDocument) {
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    DocumentProto document =
+        DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+    fake_clock_.SetSystemTimeMilliseconds(1000);
+    ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document));
+    EXPECT_THAT(document.last_update_timestamp_ms(), Eq(1000));
+    EXPECT_THAT(document.original_creation_timestamp_ms(), Eq(1000));
+
+    ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result,
+                               doc_store->Put(CreateDocumentWrapper(
+                                   document, /*num_string_tokens=*/1)));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentAssociatedScoreData score_data,
+        doc_store->GetDocumentAssociatedScoreData(put_result.new_document_id));
+    EXPECT_THAT(score_data.effective_last_update_timestamp_ms(), Eq(1000));
+  }
+
+  // The issued timestamp was persisted in the document log header with the
+  // document.
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(document_store_dir_),
+              IsOkAndHolds(1000));
+}
+
+TEST_P(DocumentStoreTest,
+       SetDocumentOperationTimestampsKeepsOriginalCreationOnUpdate) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(1000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document));
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+
+  DocumentProto updated_document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(2000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&updated_document));
+  EXPECT_THAT(updated_document.last_update_timestamp_ms(), Eq(2000));
+  EXPECT_THAT(updated_document.original_creation_timestamp_ms(), Eq(1000));
+}
+
+TEST_P(
+    DocumentStoreTest,
+    SetDocumentOperationTimestampsKeepsUnsetOriginalCreationOfExistingDocument) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  // A document written without timestamps, e.g. by an older version.
+  DocumentProto document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+
+  DocumentProto updated_document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(2000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&updated_document));
+  EXPECT_THAT(updated_document.last_update_timestamp_ms(), Eq(2000));
+  EXPECT_THAT(updated_document.original_creation_timestamp_ms(), Eq(0));
+}
+
+TEST_P(DocumentStoreTest,
+       SetDocumentOperationTimestampsTreatsDeletedDocumentAsNew) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(1000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document));
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  ICING_ASSERT_OK(doc_store->Delete("namespace", "1",
+                                    fake_clock_.GetSystemTimeMilliseconds()));
+
+  DocumentProto new_document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(2000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&new_document));
+  EXPECT_THAT(new_document.last_update_timestamp_ms(), Eq(2000));
+  EXPECT_THAT(new_document.original_creation_timestamp_ms(), Eq(2000));
+}
+
+TEST_P(DocumentStoreTest,
+       SetDocumentOperationTimestampsTreatsExpiredDocumentAsNew) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  // Expires at 1500.
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1000)
+                               .SetTtlMs(500)
+                               .Build();
+  fake_clock_.SetSystemTimeMilliseconds(1000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document));
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+
+  DocumentProto new_document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(2000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&new_document));
+  EXPECT_THAT(new_document.last_update_timestamp_ms(), Eq(2000));
+  EXPECT_THAT(new_document.original_creation_timestamp_ms(), Eq(2000));
+}
+
+TEST_P(DocumentStoreTest,
+       SetDocumentOperationTimestampsOverwritesIncomingValues) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetLastUpdateTimestampMs(99999)
+                               .SetOriginalCreationTimestampMs(88888)
+                               .Build();
+  fake_clock_.SetSystemTimeMilliseconds(1000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document));
+  EXPECT_THAT(document.last_update_timestamp_ms(), Eq(1000));
+  EXPECT_THAT(document.original_creation_timestamp_ms(), Eq(1000));
+}
+
+TEST_P(DocumentStoreTest,
+       SetDocumentOperationTimestampsIncreasesWhenClockMovesBackwards) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document1 =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document1));
+  ICING_ASSERT_OK(doc_store->Put(
+      CreateDocumentWrapper(document1, /*num_string_tokens=*/1)));
+
+  DocumentProto document2 =
+      DocumentBuilder().SetKey("namespace", "2").SetSchema("email").Build();
+  fake_clock_.SetSystemTimeMilliseconds(3000);
+  ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document2));
+  EXPECT_THAT(document2.last_update_timestamp_ms(), Eq(5001));
+  EXPECT_THAT(document2.original_creation_timestamp_ms(), Eq(5001));
+}
+
+TEST_P(DocumentStoreTest, OptimizeIntoKeepsDocumentTimestamps) {
+  DocumentProto document =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+    fake_clock_.SetSystemTimeMilliseconds(1000);
+    ICING_ASSERT_OK(doc_store->SetDocumentOperationTimestamps(&document));
+    // Leave length_in_tokens unset so that OptimizeInto also takes the path
+    // that tokenizes the document again.
+    ICING_ASSERT_OK(
+        doc_store->Put(document_util::CreateDocumentWrapper(document)));
+
+    fake_clock_.SetSystemTimeMilliseconds(2000);
+    ICING_ASSERT_OK(
+        doc_store->OptimizeInto(optimized_dir, lang_segmenter_.get(),
+                                /*potentially_optimizable_blob_handles=*/
+                                std::unordered_set<std::string>()));
+  }
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, optimized_dir, &fake_clock_,
+                          schema_store_.get()));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentProto optimized_document,
+      create_result.document_store->Get("namespace", "1"));
+  EXPECT_THAT(optimized_document.last_update_timestamp_ms(), Eq(1000));
+  EXPECT_THAT(optimized_document.original_creation_timestamp_ms(), Eq(1000));
+}
+
+TEST_P(DocumentStoreTest, BackfillFillsZerosWithTheNextTimestamp) {
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (int64_t last_update_timestamp_ms : {1000, 0, 0, 1010}) {
+      DocumentBuilder builder;
+      builder.SetKey("namespace", std::to_string(document_ids.size()))
+          .SetSchema("email");
+      if (last_update_timestamp_ms != 0) {
+        builder.SetLastUpdateTimestampMs(last_update_timestamp_ms);
+      }
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(builder.Build(), /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+  }
+
+  // Force the derived files to be regenerated from the document log.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      DocumentStore::Create(
+          &filesystem_, document_store_dir_, &fake_clock_, schema_store_.get(),
+          feature_flags_.get(),
+          /*force_recovery_and_revalidate_documents=*/true,
+          GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+          PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+          PortableFileBackedProtoLog<
+              DocumentWrapper>::kDefaultCompressionThresholdBytes,
+          protobuf_ports::kDefaultMemLevel,
+          /*initialize_stats=*/nullptr));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[0]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1000))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[1]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[2]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[3]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+}
+
+TEST_P(DocumentStoreTest, BackfillKeepsZerosWhenNoTimestampHasBeenIssued) {
+  // E.g. offline observers are enabled for the first time: the document log
+  // header value is 0 and no document has a timestamp.
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (int i = 0; i < 2; ++i) {
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(DocumentBuilder()
+                                        .SetKey("namespace", std::to_string(i))
+                                        .SetSchema("email")
+                                        .Build(),
+                                    /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+  }
+  fake_clock_.SetSystemTimeMilliseconds(3000);
+
+  // Force the derived files to be regenerated from the document log.
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        DocumentStore::Create(
+            &filesystem_, document_store_dir_, &fake_clock_,
+            schema_store_.get(), feature_flags_.get(),
+            /*force_recovery_and_revalidate_documents=*/true,
+            GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[0]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(0))));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[1]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(0))));
+    EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(0));
+  }
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(document_store_dir_),
+              IsOkAndHolds(0));
+}
+
+TEST_P(DocumentStoreTest, BackfillFillsLeadingZerosWhenTimestampHasBeenIssued) {
+  // Once a timestamp has been issued, entries before the first non-zero entry
+  // are filled too, since they can be documents put while offline observers
+  // were disabled.
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (int64_t last_update_timestamp_ms : {0, 0, 1000}) {
+      DocumentBuilder builder;
+      builder.SetKey("namespace", std::to_string(document_ids.size()))
+          .SetSchema("email");
+      if (last_update_timestamp_ms != 0) {
+        builder.SetLastUpdateTimestampMs(last_update_timestamp_ms);
+      }
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(builder.Build(), /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+  }
+
+  // Force the derived files to be regenerated from the document log.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      DocumentStore::Create(
+          &filesystem_, document_store_dir_, &fake_clock_, schema_store_.get(),
+          feature_flags_.get(),
+          /*force_recovery_and_revalidate_documents=*/true,
+          GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+          PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+          PortableFileBackedProtoLog<
+              DocumentWrapper>::kDefaultCompressionThresholdBytes,
+          protobuf_ports::kDefaultMemLevel,
+          /*initialize_stats=*/nullptr));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[0]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1000))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[1]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1000))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[2]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1000))));
+}
+
+TEST_P(DocumentStoreTest, BackfillFillsAllZerosAboveDocumentLogHeaderValue) {
+  // A document is put with a timestamp, and then replaced without one, e.g.
+  // while offline observers were disabled. The replaced document is erased
+  // from the log, so no entry has a timestamp, but the document log header
+  // still has the issued one.
+  DocumentProto document_with_timestamp = DocumentBuilder()
+                                              .SetKey("namespace", "1")
+                                              .SetSchema("email")
+                                              .SetLastUpdateTimestampMs(1000)
+                                              .Build();
+  DocumentProto document_without_timestamp =
+      DocumentBuilder().SetKey("namespace", "1").SetSchema("email").Build();
+  DocumentId old_document_id;
+  DocumentId new_document_id;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put_result1,
+        create_result.document_store->Put(CreateDocumentWrapper(
+            document_with_timestamp, /*num_string_tokens=*/1)));
+    old_document_id = put_result1.new_document_id;
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put_result2,
+        create_result.document_store->Put(CreateDocumentWrapper(
+            document_without_timestamp, /*num_string_tokens=*/1)));
+    new_document_id = put_result2.new_document_id;
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/1000));
+
+  // Force the derived files to be regenerated from the document log.
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        DocumentStore::Create(
+            &filesystem_, document_store_dir_, &fake_clock_,
+            schema_store_.get(), feature_flags_.get(),
+            /*force_recovery_and_revalidate_documents=*/true,
+            GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+    // Both entries are filled with a value above the header value, so the
+    // replacement is reported to a client that synced at 1000.
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(old_document_id),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(1001))));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(new_document_id),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(1001))));
+    EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(1001));
+  }
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(document_store_dir_),
+              IsOkAndHolds(1001));
+}
+
+TEST_P(DocumentStoreTest, BackfillFillsTrailingZerosAboveLargestTimestamp) {
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (int64_t last_update_timestamp_ms : {1000, 0, 0}) {
+      DocumentBuilder builder;
+      builder.SetKey("namespace", std::to_string(document_ids.size()))
+          .SetSchema("email");
+      if (last_update_timestamp_ms != 0) {
+        builder.SetLastUpdateTimestampMs(last_update_timestamp_ms);
+      }
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(builder.Build(), /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+  }
+  ICING_ASSERT_OK(SetDocumentLogLastIssuedTimestamp(
+      document_store_dir_, /*last_issued_timestamp_ms=*/1500));
+
+  // Force the derived files to be regenerated from the document log.
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        DocumentStore::Create(
+            &filesystem_, document_store_dir_, &fake_clock_,
+            schema_store_.get(), feature_flags_.get(),
+            /*force_recovery_and_revalidate_documents=*/true,
+            GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[0]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(1000))));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[1]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(1501))));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[2]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(1501))));
+    // The restored last issued timestamp covers the filled values, and the
+    // value is persisted in the document log header.
+    EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(1501));
+  }
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(document_store_dir_),
+              IsOkAndHolds(1501));
+}
+
+TEST_P(DocumentStoreTest,
+       BackfillFillsTrailingZerosWithClockWhenAheadOfLargestTimestamp) {
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (int64_t last_update_timestamp_ms : {1000, 0, 0}) {
+      DocumentBuilder builder;
+      builder.SetKey("namespace", std::to_string(document_ids.size()))
+          .SetSchema("email");
+      if (last_update_timestamp_ms != 0) {
+        builder.SetLastUpdateTimestampMs(last_update_timestamp_ms);
+      }
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(builder.Build(), /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+  }
+  fake_clock_.SetSystemTimeMilliseconds(3000);
+
+  // Force the derived files to be regenerated from the document log.
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        DocumentStore::Create(
+            &filesystem_, document_store_dir_, &fake_clock_,
+            schema_store_.get(), feature_flags_.get(),
+            /*force_recovery_and_revalidate_documents=*/true,
+            GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[0]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(1000))));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[1]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(3000))));
+    EXPECT_THAT(
+        doc_store->GetDocumentAssociatedScoreData(document_ids[2]),
+        IsOkAndHolds(Property(
+            &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+            Eq(3000))));
+    EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(3000));
+  }
+  EXPECT_THAT(GetDocumentLogLastIssuedTimestamp(document_store_dir_),
+              IsOkAndHolds(3000));
+}
+
+TEST_P(DocumentStoreTest, BackfillFillsErasedDocuments) {
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (int64_t last_update_timestamp_ms : {1000, 1005, 1010}) {
+      DocumentBuilder builder;
+      builder.SetKey("namespace", std::to_string(document_ids.size()))
+          .SetSchema("email");
+      if (last_update_timestamp_ms != 0) {
+        builder.SetLastUpdateTimestampMs(last_update_timestamp_ms);
+      }
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(builder.Build(), /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+    // The deleted document's proto is erased from the log, so its timestamp
+    // is not available when the derived files are regenerated.
+    ICING_ASSERT_OK(create_result.document_store->Delete(
+        "namespace", "1", fake_clock_.GetSystemTimeMilliseconds()));
+  }
+
+  // Force the derived files to be regenerated from the document log.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      DocumentStore::Create(
+          &filesystem_, document_store_dir_, &fake_clock_, schema_store_.get(),
+          feature_flags_.get(),
+          /*force_recovery_and_revalidate_documents=*/true,
+          GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+          PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+          PortableFileBackedProtoLog<
+              DocumentWrapper>::kDefaultCompressionThresholdBytes,
+          protobuf_ports::kDefaultMemLevel,
+          /*initialize_stats=*/nullptr));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[0]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1000))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[1]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[2]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+}
+
+TEST_P(DocumentStoreTest, BackfillIsSkippedWhenOfflineObserversDisabled) {
+  auto feature_flags_disabled =
+      std::make_unique<FeatureFlags>(FeatureFlagsBuilder(GetTestFeatureFlags())
+                                         .set_enable_offline_observers(false)
+                                         .Build());
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        DocumentStore::Create(
+            &filesystem_, document_store_dir_, &fake_clock_,
+            schema_store_.get(), feature_flags_disabled.get(),
+            /*force_recovery_and_revalidate_documents=*/false,
+            GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
+    for (int64_t last_update_timestamp_ms : {1000, 0, 1010}) {
+      DocumentBuilder builder;
+      builder.SetKey("namespace", std::to_string(document_ids.size()))
+          .SetSchema("email");
+      if (last_update_timestamp_ms != 0) {
+        builder.SetLastUpdateTimestampMs(last_update_timestamp_ms);
+      }
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(builder.Build(), /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+  }
+
+  // Force the derived files to be regenerated from the document log.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      DocumentStore::Create(
+          &filesystem_, document_store_dir_, &fake_clock_, schema_store_.get(),
+          feature_flags_disabled.get(),
+          /*force_recovery_and_revalidate_documents=*/true,
+          GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+          PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+          PortableFileBackedProtoLog<
+              DocumentWrapper>::kDefaultCompressionThresholdBytes,
+          protobuf_ports::kDefaultMemLevel,
+          /*initialize_stats=*/nullptr));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[0]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1000))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[1]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(0))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_ids[2]),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+}
+
+TEST_P(DocumentStoreTest, OptimizeIntoKeepsDerivedTimestamps) {
+  std::vector<DocumentId> document_ids;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    for (int64_t last_update_timestamp_ms : {1000, 0, 1010}) {
+      DocumentBuilder builder;
+      builder.SetKey("namespace", std::to_string(document_ids.size()))
+          .SetSchema("email");
+      if (last_update_timestamp_ms != 0) {
+        builder.SetLastUpdateTimestampMs(last_update_timestamp_ms);
+      }
+      ICING_ASSERT_OK_AND_ASSIGN(
+          DocumentStore::PutResult put_result,
+          create_result.document_store->Put(
+              CreateDocumentWrapper(builder.Build(), /*num_string_tokens=*/1)));
+      document_ids.push_back(put_result.new_document_id);
+    }
+  }
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+  {
+    // Regenerating the derived files fills the 0 entry with 1010.
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        DocumentStore::Create(
+            &filesystem_, document_store_dir_, &fake_clock_,
+            schema_store_.get(), feature_flags_.get(),
+            /*force_recovery_and_revalidate_documents=*/true,
+            GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
+    ICING_ASSERT_OK(create_result.document_store->OptimizeInto(
+        optimized_dir, lang_segmenter_.get(),
+        /*potentially_optimizable_blob_handles=*/
+        std::unordered_set<std::string>()));
+  }
+
+  // The optimized store keeps the derived timestamp, although the document
+  // itself still has none.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, optimized_dir, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_FALSE(create_result.derived_files_regenerated);
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(0),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1000))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(1),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(2),
+      IsOkAndHolds(Property(
+          &DocumentAssociatedScoreData::effective_last_update_timestamp_ms,
+          Eq(1010))));
+}
+
+DeletionEvent CreateExpectedDeletionEvent(const std::string& name_space,
+                                          const std::string& uri,
+                                          int64_t deletion_timestamp_ms,
+                                          int64_t last_update_timestamp_ms) {
+  DeletionEvent deletion_event;
+  deletion_event.set_name_space(name_space);
+  deletion_event.set_uri(uri);
+  deletion_event.set_schema("email");
+  deletion_event.set_deletion_timestamp_ms(deletion_timestamp_ms);
+  deletion_event.set_last_update_timestamp_ms(last_update_timestamp_ms);
+  return deletion_event;
+}
+
+TEST_P(DocumentStoreTest, DeletePutsDeletionEvent) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(1000)
+                               .Build();
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->Delete("namespace", "1",
+                                    fake_clock_.GetSystemTimeMilliseconds()));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(EqualsProto(CreateExpectedDeletionEvent(
+                  "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                  /*last_update_timestamp_ms=*/1000)))));
+  EXPECT_THAT(doc_store->last_issued_timestamp_ms(), Eq(5000));
+}
+
+TEST_P(DocumentStoreTest, DeleteByNamespacePutsDeletionEventsInOrder) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  for (const std::string& uri : {"1", "2"}) {
+    ICING_ASSERT_OK(
+        doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                                 .SetKey("namespace", uri)
+                                                 .SetSchema("email")
+                                                 .SetCreationTimestampMs(1)
+                                                 .SetLastUpdateTimestampMs(1000)
+                                                 .Build(),
+                                             /*num_string_tokens=*/1)));
+  }
+
+  // The clock doesn't advance between the deletions, so the second one is
+  // issued the next timestamp.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->DeleteByNamespace("namespace").status);
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                      /*last_update_timestamp_ms=*/1000)),
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace", "2", /*deletion_timestamp_ms=*/5001,
+                      /*last_update_timestamp_ms=*/1000)))));
+}
+
+TEST_P(DocumentStoreTest, DeleteBySchemaTypePutsDeletionEventsInOrder) {
+  // Add a second schema type, whose documents shouldn't be deleted.
+  ICING_ASSERT_OK_AND_ASSIGN(SchemaProto schema,
+                             schema_store_->GetFullSchemaProto());
+  *schema.add_types() = SchemaTypeConfigBuilder().SetType("message").Build();
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      schema, /*ignore_errors_and_delete_documents=*/false));
+
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  // Put the email documents in different namespaces, since DeleteBySchemaType
+  // deletes across namespaces. Put the message document between them, so that
+  // it's in the middle of the document ids that DeleteBySchemaType iterates
+  // over.
+  for (const auto& [name_space, schema_type] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"namespace1", "email"},
+           {"namespace1", "message"},
+           {"namespace2", "email"}}) {
+    ICING_ASSERT_OK(doc_store->Put(
+        CreateDocumentWrapper(DocumentBuilder()
+                                  .SetKey(name_space, schema_type)
+                                  .SetSchema(schema_type)
+                                  .SetCreationTimestampMs(1)
+                                  .SetLastUpdateTimestampMs(1000)
+                                  .Build(),
+                              /*num_string_tokens=*/1)));
+  }
+
+  // The clock doesn't advance between the deletions, so the second one is
+  // issued the next timestamp.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  DocumentStore::DeleteByGroupResult group_result =
+      doc_store->DeleteBySchemaType("email");
+  ICING_ASSERT_OK(group_result.status);
+  EXPECT_THAT(group_result.num_docs_deleted, Eq(2));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace1", "email", /*deletion_timestamp_ms=*/5000,
+                      /*last_update_timestamp_ms=*/1000)),
+                  EqualsProto(CreateExpectedDeletionEvent(
+                      "namespace2", "email", /*deletion_timestamp_ms=*/5001,
+                      /*last_update_timestamp_ms=*/1000)))));
+  EXPECT_THAT(doc_store->Get("namespace1", "message"), IsOk());
+}
+
+TEST_P(DocumentStoreTest, ReplacingDocumentDoesNotPutDeletionEvent) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "1")
+                               .SetSchema("email")
+                               .SetCreationTimestampMs(1)
+                               .SetLastUpdateTimestampMs(1000)
+                               .Build();
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result,
+      doc_store->Put(CreateDocumentWrapper(document, /*num_string_tokens=*/1)));
+  ASSERT_TRUE(put_result.was_replacement);
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/1000, /*schemas=*/{}),
+              IsOkAndHolds(IsEmpty()));
+}
+
+TEST_P(DocumentStoreTest, NoDeletionEventWhenOfflineObserversDisabled) {
+  auto feature_flags_disabled =
+      std::make_unique<FeatureFlags>(FeatureFlagsBuilder(GetTestFeatureFlags())
+                                         .set_enable_offline_observers(false)
+                                         .Build());
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::CreateResult create_result,
+                             CreateDocumentStoreWithDeletionStore(
+                                 document_store_dir_, deletion_store.get(),
+                                 feature_flags_disabled.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(1)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->Delete("namespace", "1",
+                                    fake_clock_.GetSystemTimeMilliseconds()));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/0, /*schemas=*/{}),
+              IsOkAndHolds(IsEmpty()));
+}
+
+TEST_P(DocumentStoreTest, PurgeExpiredDocumentsPutsDeletionEvent) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  fake_clock_.SetSystemTimeMilliseconds(100);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(100)
+                                               .SetLastUpdateTimestampMs(100)
+                                               .SetTtlMs(1000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(doc_store->PurgeExpiredDocuments(
+      fake_clock_.GetSystemTimeMilliseconds()));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/100, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(EqualsProto(CreateExpectedDeletionEvent(
+                  "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                  /*last_update_timestamp_ms=*/100)))));
+}
+
+TEST_P(DocumentStoreTest,
+       PurgeExpiredDocumentsDoesNotPutDeletionEventForReplacedDocument) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  fake_clock_.SetSystemTimeMilliseconds(100);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(100)
+                                               .SetTtlMs(1000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  // Replace the document after it expired. The expired document isn't deleted
+  // by the Put, so it is purged afterwards, but its namespace and uri still
+  // exist.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(5000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+  ICING_ASSERT_OK_AND_ASSIGN(DocumentGroupInfo purged,
+                             doc_store->PurgeExpiredDocuments(
+                                 fake_clock_.GetSystemTimeMilliseconds()));
+  ASSERT_THAT(purged.GetTotalNumDocs(), Eq(1));
+
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/0, /*schemas=*/{}),
+              IsOkAndHolds(IsEmpty()));
+}
+
+TEST_P(DocumentStoreTest, OptimizeIntoReturnsExpiredDocumentDeletionEvents) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+
+  std::vector<DeletionEvent> expired_document_deletion_events;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    fake_clock_.SetSystemTimeMilliseconds(100);
+    // Expires.
+    ICING_ASSERT_OK(
+        doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                                 .SetKey("namespace", "1")
+                                                 .SetSchema("email")
+                                                 .SetCreationTimestampMs(100)
+                                                 .SetLastUpdateTimestampMs(100)
+                                                 .SetTtlMs(1000)
+                                                 .Build(),
+                                             /*num_string_tokens=*/1)));
+    // Doesn't expire.
+    ICING_ASSERT_OK(
+        doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                                 .SetKey("namespace", "2")
+                                                 .SetSchema("email")
+                                                 .SetCreationTimestampMs(100)
+                                                 .SetLastUpdateTimestampMs(200)
+                                                 .Build(),
+                                             /*num_string_tokens=*/1)));
+
+    fake_clock_.SetSystemTimeMilliseconds(5000);
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::OptimizeResult optimize_result,
+        doc_store->OptimizeInto(optimized_dir, lang_segmenter_.get(),
+                                /*potentially_optimizable_blob_handles=*/
+                                std::unordered_set<std::string>()));
+
+    // The deletion timestamp is only issued once the caller switches to the
+    // new document store.
+    DeletionEvent expected_deletion_event;
+    expected_deletion_event.set_name_space("namespace");
+    expected_deletion_event.set_uri("1");
+    expected_deletion_event.set_schema("email");
+    expected_deletion_event.set_last_update_timestamp_ms(100);
+    EXPECT_THAT(optimize_result.expired_document_deletion_events,
+                ElementsAre(EqualsProto(expected_deletion_event)));
+    EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/100, /*schemas=*/{}),
+                IsOkAndHolds(IsEmpty()));
+    expired_document_deletion_events =
+        std::move(optimize_result.expired_document_deletion_events);
+  }
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(optimized_dir, deletion_store.get(),
+                                           feature_flags_.get()));
+  ICING_ASSERT_OK(
+      create_result.document_store->PutExpiredDocumentDeletionEvents(
+          std::move(expired_document_deletion_events)));
+  EXPECT_THAT(deletion_store->Get(/*timestamp_ms=*/100, /*schemas=*/{}),
+              IsOkAndHolds(ElementsAre(EqualsProto(CreateExpectedDeletionEvent(
+                  "namespace", "1", /*deletion_timestamp_ms=*/5000,
+                  /*last_update_timestamp_ms=*/100)))));
+}
+
+TEST_P(DocumentStoreTest,
+       OptimizeIntoDoesNotReturnDeletionEventForReplacedExpiredDocument) {
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             CreateDeletionStore());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStoreWithDeletionStore(deletion_store.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+  ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+
+  fake_clock_.SetSystemTimeMilliseconds(100);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(100)
+                                               .SetTtlMs(1000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  // Replace the document after it expired. The expired document isn't deleted
+  // by the Put, so OptimizeInto drops it, but its namespace and uri still
+  // exist.
+  fake_clock_.SetSystemTimeMilliseconds(5000);
+  ICING_ASSERT_OK(
+      doc_store->Put(CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("namespace", "1")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(5000)
+                                               .Build(),
+                                           /*num_string_tokens=*/1)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::OptimizeResult optimize_result,
+      doc_store->OptimizeInto(optimized_dir, lang_segmenter_.get(),
+                              /*potentially_optimizable_blob_handles=*/
+                              std::unordered_set<std::string>()));
+  EXPECT_THAT(optimize_result.document_id_old_to_new,
+              ElementsAre(kInvalidDocumentId, 0));
+  EXPECT_THAT(optimize_result.expired_document_deletion_events, IsEmpty());
+}
+
 TEST_P(DocumentStoreTest, NonexistentDocumentFilterDataNotFound) {
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::CreateResult create_result,
@@ -3097,7 +4866,6 @@ TEST_P(DocumentStoreTest, DeleteClearsFilterCache) {
           document_id, fake_clock_.GetSystemTimeMilliseconds()));
   EXPECT_THAT(doc_filter_data,
               Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                    document1_expiration_timestamp_,
                                     document1_expiration_timestamp_)));
 
   ICING_ASSERT_OK(doc_store->Delete("icing", "email/1",
@@ -3476,37 +5244,24 @@ TEST_P(DocumentStoreTest,
   EXPECT_FALSE(put_result.was_replacement);
   DocumentId document_id = put_result.new_document_id;
 
-  // The raw expiration timestamp is 1100. Now, set the expiration timestamp to
-  // 500.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/500));
-  EXPECT_THAT(update_result.final_expiration_timestamp_ms, Eq(500));
-  EXPECT_THAT(update_result.was_updated, IsTrue());
-
+  // The expiration timestamp is 1100.
   // Case 1: call GetAliveDocumentFilterData with a current ts before the
   //         expiration timestamp.
   EXPECT_THAT(
       doc_store->GetAliveDocumentFilterData(document_id,
-                                            /*current_time_ms=*/300),
+                                            /*current_time_ms=*/1000),
       Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
+                                     /*expiration_timestamp_ms=*/1100))));
 
   // Case 2: call GetAliveDocumentFilterData with a current ts at the
-  //         expiration timestamp.
-  // This should fail even though the current ts is smaller than the raw
-  // expiration timestamp.
+  //         expiration timestamp. Should fail.
   EXPECT_FALSE(doc_store->GetAliveDocumentFilterData(document_id,
-                                                     /*current_time_ms=*/500));
+                                                     /*current_time_ms=*/1100));
 
   // Case 3: call GetAliveDocumentFilterData with a current ts after the
   //         expiration timestamp.
-  // This should fail even though the current ts is smaller than the raw
-  // expiration timestamp.
   EXPECT_FALSE(doc_store->GetAliveDocumentFilterData(document_id,
-                                                     /*current_time_ms=*/700));
+                                                     /*current_time_ms=*/1101));
 }
 
 TEST_P(DocumentStoreTest,
@@ -3537,8 +5292,7 @@ TEST_P(DocumentStoreTest,
           document_id, fake_clock_.GetSystemTimeMilliseconds()));
   EXPECT_THAT(doc_filter_data, Eq(DocumentFilterData(
                                    /*namespace_id=*/0, /*schema_type_id=*/0,
-                                   /*expiration_timestamp_ms=*/1100,
-                                   /*raw_expiration_timestamp_ms=*/1100)));
+                                   /*expiration_timestamp_ms=*/1100)));
 }
 
 TEST_P(DocumentStoreTest, ExpirationTimestampIsInt64MaxIfTtlIsZero) {
@@ -3572,9 +5326,7 @@ TEST_P(DocumentStoreTest, ExpirationTimestampIsInt64MaxIfTtlIsZero) {
       doc_filter_data,
       Eq(DocumentFilterData(
           /*namespace_id=*/0, /*schema_type_id=*/0,
-          /*expiration_timestamp_ms=*/std::numeric_limits<int64_t>::max(),
-          /*raw_expiration_timestamp_ms=*/
-          std::numeric_limits<int64_t>::max())));
+          /*expiration_timestamp_ms=*/std::numeric_limits<int64_t>::max())));
 }
 
 TEST_P(DocumentStoreTest, ExpirationTimestampIsInt64MaxOnOverflow) {
@@ -3609,497 +5361,7 @@ TEST_P(DocumentStoreTest, ExpirationTimestampIsInt64MaxOnOverflow) {
       doc_filter_data,
       Eq(DocumentFilterData(
           /*namespace_id=*/0, /*schema_type_id=*/0,
-          /*expiration_timestamp_ms=*/std::numeric_limits<int64_t>::max(),
-          /*raw_expiration_timestamp_ms=*/
-          std::numeric_limits<int64_t>::max())));
-}
-
-TEST_P(DocumentStoreTest, UpdateDocumentExpirationTimestamp) {
-  DocumentProto document = DocumentBuilder()
-                               .SetKey("namespace1", "1")
-                               .SetSchema("email")
-                               .SetCreationTimestampMs(100)
-                               .SetTtlMs(1000)
-                               .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result,
-      doc_store->Put(document_util::CreateDocumentWrapper(document)));
-  EXPECT_THAT(put_result.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result.was_replacement);
-  DocumentId document_id = put_result.new_document_id;
-
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/1100,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-
-  // Set the expiration timestamp to 700.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result1,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/700));
-  EXPECT_THAT(update_result1.final_expiration_timestamp_ms, Eq(700));
-  EXPECT_THAT(update_result1.was_updated, IsTrue());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/700,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-
-  // Set the expiration timestamp to 500.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result2,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/500));
-  EXPECT_THAT(update_result2.final_expiration_timestamp_ms, Eq(500));
-  EXPECT_THAT(update_result2.was_updated, IsTrue());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-}
-
-TEST_P(DocumentStoreTest, UpdateDocumentExpirationTimestamp_invalidDocumentId) {
-  DocumentProto document = DocumentBuilder()
-                               .SetKey("namespace1", "1")
-                               .SetSchema("email")
-                               .SetCreationTimestampMs(100)
-                               .SetTtlMs(1000)
-                               .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result,
-      doc_store->Put(document_util::CreateDocumentWrapper(document)));
-  ASSERT_THAT(put_result.old_document_id, Eq(kInvalidDocumentId));
-  ASSERT_FALSE(put_result.was_replacement);
-
-  EXPECT_THAT(doc_store->UpdateDocumentExpirationTimestamp(
-                  /*document_id=*/-1, /*expiration_timestamp_ms=*/700),
-              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
-  EXPECT_THAT(doc_store->UpdateDocumentExpirationTimestamp(
-                  doc_store->last_added_document_id() + 1,
-                  /*expiration_timestamp_ms=*/700),
-              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
-  EXPECT_THAT(doc_store->UpdateDocumentExpirationTimestamp(
-                  kInvalidDocumentId, /*expiration_timestamp_ms=*/700),
-              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
-}
-
-TEST_P(DocumentStoreTest,
-       UpdateDocumentExpirationTimestamp_shouldOnlyDecrease) {
-  DocumentProto document = DocumentBuilder()
-                               .SetKey("namespace1", "1")
-                               .SetSchema("email")
-                               .SetCreationTimestampMs(100)
-                               .SetTtlMs(1000)
-                               .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result,
-      doc_store->Put(document_util::CreateDocumentWrapper(document)));
-  EXPECT_THAT(put_result.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result.was_replacement);
-  DocumentId document_id = put_result.new_document_id;
-
-  // The raw expiration timestamp and the expiration timestamp are 1100.
-  // Setting the expiration timestamp to 1500 should be no-op.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result1,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/1500));
-  EXPECT_THAT(update_result1.final_expiration_timestamp_ms, Eq(1100));
-  EXPECT_THAT(update_result1.was_updated, IsFalse());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/1100,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-
-  // Set the expiration timestamp to 500. This should change the expiration
-  // timestamp to 500.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result2,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/500));
-  EXPECT_THAT(update_result2.final_expiration_timestamp_ms, Eq(500));
-  EXPECT_THAT(update_result2.was_updated, IsTrue());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-
-  // Setting the expiration timestamp to 700 should be no-op.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result3,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/700));
-  EXPECT_THAT(update_result3.final_expiration_timestamp_ms, Eq(500));
-  EXPECT_THAT(update_result3.was_updated, IsFalse());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-}
-
-TEST_P(DocumentStoreTest,
-       UpdateDocumentExpirationTimestamp_canUpdateExpiredDocument) {
-  DocumentProto document = DocumentBuilder()
-                               .SetKey("namespace1", "1")
-                               .SetSchema("email")
-                               .SetCreationTimestampMs(100)
-                               .SetTtlMs(1000)
-                               .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result,
-      doc_store->Put(document_util::CreateDocumentWrapper(document)));
-  EXPECT_THAT(put_result.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result.was_replacement);
-  DocumentId document_id = put_result.new_document_id;
-
-  // Set the expiration timestamp to 500.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result1,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/500));
-  ASSERT_THAT(update_result1.final_expiration_timestamp_ms, Eq(500));
-  ASSERT_THAT(update_result1.was_updated, IsTrue());
-  // Sanity check.
-  ASSERT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-
-  // Adjust the current time to 500. The document is expired.
-  fake_clock_.SetSystemTimeMilliseconds(500);
-  ASSERT_THAT(doc_store->IsDocumentAlive(
-                  /*document_id=*/0,
-                  /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()),
-              IsFalse());
-
-  // Updating an expired document is allowed, but since we only allow to
-  // decrease the expiration timestamp, it is a no-op.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result2,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/800));
-  EXPECT_THAT(update_result2.final_expiration_timestamp_ms, Eq(500));
-  EXPECT_THAT(update_result2.was_updated, IsFalse());
-  EXPECT_THAT(
-      doc_store->GetNonDeletedDocumentFilterData(document_id),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-
-  // Updating an expired document is allowed, and it only takes effect if the
-  // new expiration timestamp is smaller than the current one, so the document
-  // remains expired.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result3,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/400));
-  EXPECT_THAT(update_result3.final_expiration_timestamp_ms, Eq(400));
-  EXPECT_THAT(update_result3.was_updated, IsTrue());
-  EXPECT_THAT(
-      doc_store->GetNonDeletedDocumentFilterData(document_id),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/400,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-}
-
-TEST_P(DocumentStoreTest,
-       UpdateDocumentExpirationTimestamp_shouldFailForDeletedDocument) {
-  DocumentProto document = DocumentBuilder()
-                               .SetKey("namespace1", "1")
-                               .SetSchema("email")
-                               .SetCreationTimestampMs(100)
-                               .SetTtlMs(1000)
-                               .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result,
-      doc_store->Put(document_util::CreateDocumentWrapper(document)));
-  EXPECT_THAT(put_result.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result.was_replacement);
-  DocumentId document_id = put_result.new_document_id;
-
-  // Delete the document.
-  ICING_ASSERT_OK(doc_store->Delete(
-      document_id,
-      /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()));
-
-  EXPECT_THAT(doc_store->UpdateDocumentExpirationTimestamp(
-                  document_id, /*expiration_timestamp_ms=*/500),
-              StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
-}
-
-TEST_P(DocumentStoreTest,
-       UpdateDocumentExpirationTimestamp_canUpdateToAnExpiredTimestamp) {
-  DocumentProto document = DocumentBuilder()
-                               .SetKey("namespace1", "1")
-                               .SetSchema("email")
-                               .SetCreationTimestampMs(100)
-                               .SetTtlMs(1000)
-                               .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result,
-      doc_store->Put(document_util::CreateDocumentWrapper(document)));
-  EXPECT_THAT(put_result.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result.was_replacement);
-  DocumentId document_id = put_result.new_document_id;
-
-  // Adjust the current time to 500. The document is still alive.
-  fake_clock_.SetSystemTimeMilliseconds(500);
-  ASSERT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/1100,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-
-  // Set the expiration timestamp to 400. It is allowed to set the expiration
-  // timestamp to a smaller value than the current timestamp, and the document
-  // will be treated as expired.
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::UpdateDocumentExpirationTimestampResult update_result,
-      doc_store->UpdateDocumentExpirationTimestamp(
-          document_id, /*expiration_timestamp_ms=*/400));
-  EXPECT_THAT(update_result.final_expiration_timestamp_ms, Eq(400));
-  EXPECT_THAT(update_result.was_updated, IsTrue());
-  EXPECT_THAT(doc_store->IsDocumentAlive(
-                  document_id,
-                  /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()),
-              IsFalse());
-}
-
-TEST_P(DocumentStoreTest, ResetAllAliveExpirationTimestampsToRaw) {
-  DocumentProto document1 = DocumentBuilder()
-                                .SetKey("namespace1", "1")
-                                .SetSchema("email")
-                                .SetCreationTimestampMs(100)
-                                .SetTtlMs(1000)
-                                .Build();
-  DocumentProto document2 =
-      DocumentBuilder()
-          .SetKey("namespace1", "2")
-          .SetSchema("email")
-          .SetCreationTimestampMs(300)
-          .SetTtlMs(0)  // No TTL. The expiration timestamp will be INT64_MAX.
-          .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result1,
-      doc_store->Put(document_util::CreateDocumentWrapper(document1)));
-  EXPECT_THAT(put_result1.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result1.was_replacement);
-  DocumentId document_id1 = put_result1.new_document_id;
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result2,
-      doc_store->Put(document_util::CreateDocumentWrapper(document2)));
-  EXPECT_THAT(put_result2.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result2.was_replacement);
-  DocumentId document_id2 = put_result2.new_document_id;
-
-  // Update the expiration timestamp of document1 and document2.
-  ICING_ASSERT_OK(doc_store->UpdateDocumentExpirationTimestamp(
-      document_id1, /*expiration_timestamp_ms=*/500));
-  ICING_ASSERT_OK(doc_store->UpdateDocumentExpirationTimestamp(
-      document_id2, /*expiration_timestamp_ms=*/3000));
-  // Sanity check.
-  ASSERT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id1, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-  ASSERT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id2, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/3000,
-                                     /*raw_expiration_timestamp_ms=*/
-                                     std::numeric_limits<int64_t>::max()))));
-
-  // Reset.
-  EXPECT_THAT(doc_store->ResetAllAliveExpirationTimestampsToRaw(
-                  /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()),
-              IsOk());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id1, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/1100,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id2, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(
-          /*namespace_id=*/0, /*schema_type_id=*/0,
-          /*expiration_timestamp_ms=*/std::numeric_limits<int64_t>::max(),
-          /*raw_expiration_timestamp_ms=*/
-          std::numeric_limits<int64_t>::max()))));
-}
-
-TEST_P(DocumentStoreTest,
-       ResetAllAliveExpirationTimestampsToRaw_shouldSkipExpiredDocuments) {
-  DocumentProto document1 = DocumentBuilder()
-                                .SetKey("namespace1", "1")
-                                .SetSchema("email")
-                                .SetCreationTimestampMs(100)
-                                .SetTtlMs(1000)
-                                .Build();
-  DocumentProto document2 =
-      DocumentBuilder()
-          .SetKey("namespace1", "2")
-          .SetSchema("email")
-          .SetCreationTimestampMs(300)
-          .SetTtlMs(0)  // No TTL. The expiration timestamp will be INT64_MAX.
-          .Build();
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store_.get()));
-  std::unique_ptr<DocumentStore> doc_store =
-      std::move(create_result.document_store);
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result1,
-      doc_store->Put(document_util::CreateDocumentWrapper(document1)));
-  EXPECT_THAT(put_result1.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result1.was_replacement);
-  DocumentId document_id1 = put_result1.new_document_id;
-
-  ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::PutResult put_result2,
-      doc_store->Put(document_util::CreateDocumentWrapper(document2)));
-  EXPECT_THAT(put_result2.old_document_id, Eq(kInvalidDocumentId));
-  EXPECT_FALSE(put_result2.was_replacement);
-  DocumentId document_id2 = put_result2.new_document_id;
-
-  // Update the expiration timestamp of document1 and document2.
-  ICING_ASSERT_OK(doc_store->UpdateDocumentExpirationTimestamp(
-      document_id1, /*expiration_timestamp_ms=*/500));
-  ICING_ASSERT_OK(doc_store->UpdateDocumentExpirationTimestamp(
-      document_id2, /*expiration_timestamp_ms=*/3000));
-  // Sanity check.
-  ASSERT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id1, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-  ASSERT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id2, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/3000,
-                                     /*raw_expiration_timestamp_ms=*/
-                                     std::numeric_limits<int64_t>::max()))));
-
-  // Reset with current timestamp 500. Document1 should be skipped since it is
-  // expired (at t = 500).
-  EXPECT_THAT(doc_store->ResetAllAliveExpirationTimestampsToRaw(
-                  /*current_time_ms=*/500),
-              IsOk());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id1, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id2, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(
-          /*namespace_id=*/0, /*schema_type_id=*/0,
-          /*expiration_timestamp_ms=*/std::numeric_limits<int64_t>::max(),
-          /*raw_expiration_timestamp_ms=*/
-          std::numeric_limits<int64_t>::max()))));
-
-  // Reset with current timestamp 700. Document1 should be skipped since it is
-  // expired (at t = 500).
-  EXPECT_THAT(doc_store->ResetAllAliveExpirationTimestampsToRaw(
-                  /*current_time_ms=*/700),
-              IsOk());
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id1, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(/*namespace_id=*/0, /*schema_type_id=*/0,
-                                     /*expiration_timestamp_ms=*/500,
-                                     /*raw_expiration_timestamp_ms=*/1100))));
-  EXPECT_THAT(
-      doc_store->GetAliveDocumentFilterData(
-          document_id2, fake_clock_.GetSystemTimeMilliseconds()),
-      Optional(Eq(DocumentFilterData(
-          /*namespace_id=*/0, /*schema_type_id=*/0,
-          /*expiration_timestamp_ms=*/std::numeric_limits<int64_t>::max(),
-          /*raw_expiration_timestamp_ms=*/
-          std::numeric_limits<int64_t>::max()))));
+          /*expiration_timestamp_ms=*/std::numeric_limits<int64_t>::max())));
 }
 
 TEST_P(DocumentStoreTest, ShouldWriteAndReadScoresCorrectly) {
@@ -4261,6 +5523,62 @@ TEST_P(DocumentStoreTest, UpdateChecksumDoesntChangeOnNewUsage) {
   EXPECT_THAT(document_store->GetChecksum(), IsOkAndHolds(checksum));
 }
 
+TEST_P(DocumentStoreTest, StaleHeaderMagicRegeneratesDerivedFiles) {
+  constexpr int64_t kLastUpdateTimestampMs = 1234;
+  DocumentProto document =
+      DocumentBuilder()
+          .SetKey("namespace", "1")
+          .SetSchema("email")
+          .SetScore(document1_score_)
+          .SetCreationTimestampMs(document1_creation_timestamp_)
+          .SetLastUpdateTimestampMs(kLastUpdateTimestampMs)
+          .Build();
+
+  DocumentId document_id;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result,
+                               doc_store->Put(CreateDocumentWrapper(
+                                   document, /*num_string_tokens=*/4)));
+    document_id = put_result.new_document_id;
+    ICING_ASSERT_OK(doc_store->PersistToDisk(PersistType::FULL));
+  }
+
+  // Rewrite the header with a magic that this version does not recognize, as
+  // if the derived files had been written by a version with a different
+  // layout.
+  const std::string header_file =
+      absl_ports::StrCat(document_store_dir_, "/document_store_header");
+  DocumentStore::Header header;
+  ASSERT_THAT(filesystem_.Read(header_file.c_str(), &header, sizeof(header)),
+              Eq(sizeof(header)));
+  header.magic = 0x142f84cd;  // A previously used magic.
+  ASSERT_TRUE(filesystem_.Write(header_file.c_str(), &header, sizeof(header)));
+
+  // The derived files are regenerated from the document log and the data is
+  // intact.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_TRUE(create_result.derived_files_regenerated);
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  EXPECT_THAT(
+      doc_store->GetDocumentAssociatedScoreData(document_id),
+      IsOkAndHolds(EqualsDocumentAssociatedScoreData(
+          /*corpus_id=*/0, document1_score_, document1_creation_timestamp_,
+          /*length_in_tokens=*/4,
+          /*has_valid_scorable_property_cache_index=*/true,
+          /*effective_last_update_timestamp_ms=*/kLastUpdateTimestampMs)));
+}
+
 TEST_P(DocumentStoreTest, RegenerateDerivedFilesSkipsUnknownSchemaTypeIds) {
   const std::string schema_store_dir = schema_store_dir_ + "_custom";
 
@@ -4390,8 +5708,6 @@ TEST_P(DocumentStoreTest, RegenerateDerivedFilesSkipsUnknownSchemaTypeIds) {
   EXPECT_THAT(email_data.namespace_id(), Eq(email_namespace_id));
   EXPECT_THAT(email_data.expiration_timestamp_ms(),
               Eq(email_expiration_timestamp));
-  EXPECT_THAT(email_data.raw_expiration_timestamp_ms(),
-              Eq(email_expiration_timestamp));
 
   // "message" document has an invalid SchemaTypeId
   EXPECT_THAT(document_store->Get(message_document_id),
@@ -4404,8 +5720,6 @@ TEST_P(DocumentStoreTest, RegenerateDerivedFilesSkipsUnknownSchemaTypeIds) {
   // Make sure that all the other fields are still valid/the same
   EXPECT_THAT(message_data.namespace_id(), Eq(message_namespace_id));
   EXPECT_THAT(message_data.expiration_timestamp_ms(),
-              Eq(message_expiration_timestamp));
-  EXPECT_THAT(message_data.raw_expiration_timestamp_ms(),
               Eq(message_expiration_timestamp));
 }
 
@@ -5885,8 +7199,7 @@ TEST_P(DocumentStoreTest, DetectCompleteDataLoss) {
 
     // Set dirty bit to true to reflect that something changed in the log.
     header.SetDirtyFlag(true);
-    header.UpdateHeaderChecksums(
-        feature_flags_->enable_proto_log_new_header_format());
+    header.UpdateHeaderChecksums();
 
     WriteDocumentLogHeader(filesystem_, document_log_file, header);
   }
@@ -6038,6 +7351,7 @@ TEST_P(DocumentStoreTest, DocumentStoreStorageInfo) {
   EXPECT_THAT(storage_info.document_log_size(), Ge(0));
   EXPECT_THAT(storage_info.key_mapper_size(), Ge(0));
   EXPECT_THAT(storage_info.document_id_mapper_size(), Ge(0));
+  EXPECT_THAT(storage_info.document_id_to_uri_mapper_size(), Ge(0));
   EXPECT_THAT(storage_info.score_cache_size(), Ge(0));
   EXPECT_THAT(storage_info.filter_cache_size(), Ge(0));
   EXPECT_THAT(storage_info.corpus_mapper_size(), Ge(0));
@@ -7736,14 +9050,779 @@ TEST_P(DocumentStoreTest,
       Pointee(EqualsProto(BuildScorablePropertyProtoFromDouble({10, 20}))));
 }
 
-TEST_P(DocumentStoreTest, GetResultGroupingEntryId_getByFilterName) {
-  // Put 2 schema types into the schema store.
+DocumentProto CreateEmailDocument(std::string name_space, std::string uri) {
+  return DocumentBuilder()
+      .SetKey(std::move(name_space), std::move(uri))
+      .SetSchema("email")
+      .SetCreationTimestampMs(0)
+      .Build();
+}
+
+TEST_P(DocumentStoreTest, PutShouldNotWriteToDocumentLogIfNamespaceMapperFull) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  const std::string document_log_file = absl_ports::StrCat(
+      document_store_dir_, "/", DocumentLogCreator::GetDocumentLogFilename());
+
+  // ~1KB namespaces fill the namespace mapper after ~100 puts.
+  const std::string long_suffix(1000, 'a');
+  int num_successful_puts = 0;
+  int64_t document_log_size_before_put = 0;
+  libtextclassifier3::Status put_status;
+  for (int i = 0; i < 10000 && put_status.ok(); ++i) {
+    DocumentProto document = CreateEmailDocument(
+        absl_ports::StrCat(std::to_string(i), long_suffix), "uri");
+    document_log_size_before_put =
+        filesystem_.GetFileSize(document_log_file.c_str());
+    put_status =
+        doc_store->Put(document_util::CreateDocumentWrapper(document)).status();
+    if (put_status.ok()) {
+      ++num_successful_puts;
+    }
+  }
+  ASSERT_THAT(put_status,
+              StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED,
+                       HasSubstr("namespace mapper")));
+  ASSERT_THAT(num_successful_puts, Gt(0));
+  // The namespace mapper, not the corpus mapper, is full.
+  DocumentStorageInfoProto storage_info = doc_store->GetStorageInfo();
+  ASSERT_THAT(storage_info.num_namespaces(), Eq(num_successful_puts));
+
+  // The failed put should not have written the document to the log.
+  EXPECT_THAT(filesystem_.GetFileSize(document_log_file.c_str()),
+              Eq(document_log_size_before_put));
+
+  // Existing namespaces still work when the namespace mapper is full.
+  ICING_EXPECT_OK(doc_store->Put(document_util::CreateDocumentWrapper(
+      CreateEmailDocument(absl_ports::StrCat("0", long_suffix), "uri2"))));
+}
+
+TEST_P(DocumentStoreTest, PutShouldNotWriteToDocumentLogIfCorpusMapperFull) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  const std::string document_log_file = absl_ports::StrCat(
+      document_store_dir_, "/", DocumentLogCreator::GetDocumentLogFilename());
+
+  // Corpus keys are longer than these short namespaces, so the corpus mapper
+  // fills up first.
+  int num_successful_puts = 0;
+  int64_t document_log_size_before_put = 0;
+  libtextclassifier3::Status put_status;
+  for (int i = 0; i < 100000 && put_status.ok(); ++i) {
+    DocumentProto document = CreateEmailDocument(std::to_string(i), "uri");
+    document_log_size_before_put =
+        filesystem_.GetFileSize(document_log_file.c_str());
+    put_status =
+        doc_store->Put(document_util::CreateDocumentWrapper(document)).status();
+    if (put_status.ok()) {
+      ++num_successful_puts;
+    }
+  }
+  ASSERT_THAT(put_status,
+              StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED,
+                       HasSubstr("corpus mapper")));
+  ASSERT_THAT(num_successful_puts, Gt(0));
+
+  // The failed put added its namespace before the corpus mapper failed.
+  DocumentStorageInfoProto storage_info = doc_store->GetStorageInfo();
+  ASSERT_THAT(storage_info.num_namespaces(), Eq(num_successful_puts + 1));
+
+  // The failed put should not have written the document to the log.
+  EXPECT_THAT(filesystem_.GetFileSize(document_log_file.c_str()),
+              Eq(document_log_size_before_put));
+
+  // The unused namespace isn't returned.
+  std::vector<std::string> all_namespaces = doc_store->GetAllNamespaces();
+  EXPECT_THAT(all_namespaces,
+              Not(Contains(std::to_string(num_successful_puts))));
+  EXPECT_THAT(all_namespaces, SizeIs(num_successful_puts));
+}
+
+TEST_P(DocumentStoreTest,
+       RegenerateDerivedFilesSucceedsAfterNamespaceMapperFull) {
+  const std::string long_suffix(1000, 'a');
+  std::vector<DocumentProto> successful_documents;
+  std::vector<DocumentProto> failed_documents;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    // Fill the namespace mapper, then attempt a few more puts that should fail.
+    for (int i = 0; i < 10000 && failed_documents.size() < 3; ++i) {
+      DocumentProto document = CreateEmailDocument(
+          absl_ports::StrCat(std::to_string(i), long_suffix), "uri");
+      libtextclassifier3::Status put_status =
+          doc_store->Put(document_util::CreateDocumentWrapper(document))
+              .status();
+      if (put_status.ok()) {
+        successful_documents.push_back(std::move(document));
+      } else {
+        ASSERT_THAT(put_status,
+                    StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED,
+                             HasSubstr("namespace mapper")));
+        failed_documents.push_back(std::move(document));
+      }
+    }
+    ASSERT_THAT(successful_documents, Not(IsEmpty()));
+    ASSERT_THAT(failed_documents, SizeIs(3));
+  }
+
+  // Force derived files to be regenerated from the document log.
+  CorruptDocStoreHeaderChecksumFile();
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_TRUE(create_result.derived_files_regenerated);
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  for (const DocumentProto& document : successful_documents) {
+    EXPECT_THAT(doc_store->Get(document.namespace_(), document.uri()),
+                IsOkAndHolds(EqualsProto(document)));
+  }
+  for (const DocumentProto& document : failed_documents) {
+    EXPECT_THAT(doc_store->Get(document.namespace_(), document.uri()),
+                StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+  }
+}
+
+TEST_P(DocumentStoreTest, RecoveryWithZeroFilledMagicReturnsInternalError) {
+  DocumentProto doc1 =
+      DocumentBuilder().SetKey("namespace", "uri1").SetSchema("email").Build();
+  DocumentProto doc2 =
+      DocumentBuilder().SetKey("namespace", "uri2").SetSchema("email").Build();
+
+  std::string document_log_path = absl_ports::StrCat(
+      document_store_dir_, "/", DocumentLogCreator::GetDocumentLogFilename());
+  int64_t doc2_offset = -1;
+
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    ICING_ASSERT_OK(doc_store->Put(document_util::CreateDocumentWrapper(doc1)));
+    doc2_offset = filesystem_.GetFileSize(document_log_path.c_str());
+    ICING_ASSERT_OK(doc_store->Put(document_util::CreateDocumentWrapper(doc2)));
+  }
+
+  // Zero-fill the 4-byte metadata of doc2.
+  ScopedFd sfd(filesystem_.OpenForWrite(document_log_path.c_str()));
+  ASSERT_TRUE(sfd.is_valid());
+  uint32_t zero_metadata = 0;
+  filesystem_.PWrite(sfd.get(), doc2_offset, &zero_metadata,
+                     sizeof(zero_metadata));
+  sfd.reset();
+
+  // Corrupt header checksum to trigger RegenerateDerivedFiles recovery.
+  CorruptDocStoreHeaderChecksumFile();
+
+  // With flag disabled: should fail with INTERNAL error.
+  feature_flags_ = std::make_unique<FeatureFlags>(
+      FeatureFlagsBuilder(GetTestFeatureFlags())
+          .set_enable_handle_zero_filled_magic_recovery(false)
+          .Build());
+  EXPECT_THAT(CreateDocumentStore(&filesystem_, document_store_dir_,
+                                  &fake_clock_, schema_store_.get()),
+              StatusIs(libtextclassifier3::StatusCode::INTERNAL));
+}
+
+TEST_P(DocumentStoreTest, RecoveryWithZeroFilledMagicTruncatesWhenEnabled) {
+  DocumentProto doc1 =
+      DocumentBuilder().SetKey("namespace", "uri1").SetSchema("email").Build();
+  DocumentProto doc2 =
+      DocumentBuilder().SetKey("namespace", "uri2").SetSchema("email").Build();
+
+  std::string document_log_path = absl_ports::StrCat(
+      document_store_dir_, "/", DocumentLogCreator::GetDocumentLogFilename());
+  int64_t doc2_offset = -1;
+
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    ICING_ASSERT_OK(doc_store->Put(document_util::CreateDocumentWrapper(doc1)));
+    doc2_offset = filesystem_.GetFileSize(document_log_path.c_str());
+    ICING_ASSERT_OK(doc_store->Put(document_util::CreateDocumentWrapper(doc2)));
+  }
+
+  // Zero-fill the 4-byte metadata of doc2.
+  ScopedFd sfd(filesystem_.OpenForWrite(document_log_path.c_str()));
+  ASSERT_TRUE(sfd.is_valid());
+  uint32_t zero_metadata = 0;
+  filesystem_.PWrite(sfd.get(), doc2_offset, &zero_metadata,
+                     sizeof(zero_metadata));
+  sfd.reset();
+
+  // Corrupt header checksum to trigger RegenerateDerivedFiles recovery.
+  CorruptDocStoreHeaderChecksumFile();
+
+  // With flag enabled: should recover with PARTIAL data loss and truncate log.
+  feature_flags_ = std::make_unique<FeatureFlags>(
+      FeatureFlagsBuilder(GetTestFeatureFlags())
+          .set_enable_handle_zero_filled_magic_recovery(true)
+          .Build());
+  InitializeStatsProto initialize_stats;
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      DocumentStore::Create(
+          &filesystem_, document_store_dir_, &fake_clock_, schema_store_.get(),
+          feature_flags_.get(),
+          /*force_recovery_and_revalidate_documents=*/false,
+          GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+          PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+          PortableFileBackedProtoLog<
+              DocumentWrapper>::kDefaultCompressionThresholdBytes,
+          protobuf_ports::kDefaultMemLevel, &initialize_stats));
+
+  EXPECT_THAT(create_result.data_loss, Eq(DataLoss::PARTIAL));
+  EXPECT_TRUE(create_result.derived_files_regenerated);
+  EXPECT_THAT(initialize_stats.document_store_data_status(),
+              Eq(InitializeStatsProto::PARTIAL_LOSS));
+
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  // doc1 is preserved.
+  EXPECT_THAT(doc_store->Get(doc1.namespace_(), doc1.uri()),
+              IsOkAndHolds(EqualsProto(doc1)));
+  // doc2 was truncated away.
+  EXPECT_THAT(doc_store->Get(doc2.namespace_(), doc2.uri()),
+              StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+
+  // File was truncated to doc2_offset.
+  EXPECT_THAT(filesystem_.GetFileSize(document_log_path.c_str()),
+              Eq(doc2_offset));
+
+  // New Put operations work normally.
+  DocumentProto doc3 =
+      DocumentBuilder().SetKey("namespace", "uri3").SetSchema("email").Build();
+  ICING_EXPECT_OK(doc_store->Put(document_util::CreateDocumentWrapper(doc3)));
+  EXPECT_THAT(doc_store->Get(doc3.namespace_(), doc3.uri()),
+              IsOkAndHolds(EqualsProto(doc3)));
+
+  // Re-initialization after clean shutdown should succeed with NONE data loss.
+  doc_store.reset();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult reinit_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    EXPECT_THAT(reinit_result.data_loss, Eq(DataLoss::NONE));
+    EXPECT_FALSE(reinit_result.derived_files_regenerated);
+    std::unique_ptr<DocumentStore> reinit_doc_store =
+        std::move(reinit_result.document_store);
+    EXPECT_THAT(reinit_doc_store->Get(doc1.namespace_(), doc1.uri()),
+                IsOkAndHolds(EqualsProto(doc1)));
+  }
+}
+
+TEST_P(DocumentStoreTest, GetUri_putUpdateAndDelete) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  EXPECT_THAT(doc_store->GetUri(kInvalidDocumentId),
+              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
+  EXPECT_THAT(doc_store->GetUri(-1),
+              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
+  // kMaxDocumentId is a valid id that was never put, so the mapper returns
+  // NOT_FOUND (annotated by GetUri).
+  EXPECT_THAT(
+      doc_store->GetUri(kMaxDocumentId),
+      StatusIs(libtextclassifier3::StatusCode::NOT_FOUND,
+               HasSubstr("Failed to get URI for document id: " +
+                         std::to_string(kMaxDocumentId))));
+  EXPECT_THAT(doc_store->GetUri(0),
+              StatusIs(libtextclassifier3::StatusCode::NOT_FOUND,
+                       HasSubstr("Failed to get URI for document id: 0")));
+
+  DocumentProto doc1 = CreateEmailDocument("namespace", "uri1");
+  DocumentProto doc2 = CreateEmailDocument("namespace", "uri2");
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result1,
+      doc_store->Put(document_util::CreateDocumentWrapper(doc1)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result2,
+      doc_store->Put(document_util::CreateDocumentWrapper(doc2)));
+
+  EXPECT_THAT(doc_store->GetUri(put_result1.new_document_id),
+              IsOkAndHolds("uri1"));
+  EXPECT_THAT(doc_store->GetUri(put_result2.new_document_id),
+              IsOkAndHolds("uri2"));
+
+  // Replace doc1 with a new version; old_document_id should return NOT_FOUND
+  // and new_document_id should return "uri1".
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult replace_result1,
+      doc_store->Put(document_util::CreateDocumentWrapper(doc1)));
+  EXPECT_TRUE(replace_result1.was_replacement);
+  EXPECT_THAT(doc_store->GetUri(put_result1.new_document_id),
+              StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+  EXPECT_THAT(doc_store->GetUri(replace_result1.new_document_id),
+              IsOkAndHolds("uri1"));
+
+  // Delete doc2; its DocumentId should now return NOT_FOUND.
+  ICING_ASSERT_OK(doc_store->Delete(
+      put_result2.new_document_id,
+      /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()));
+  EXPECT_THAT(doc_store->GetUri(put_result2.new_document_id),
+              StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+}
+
+TEST_P(DocumentStoreTest, GetUri_expiredDocument) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  fake_clock_.SetSystemTimeMilliseconds(0);
+  DocumentProto foo_document = DocumentBuilder()
+                                   .SetKey("namespace", "uri")
+                                   .SetSchema("email")
+                                   .SetCreationTimestampMs(0)
+                                   .SetTtlMs(1000)
+                                   .Build();
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result,
+      doc_store->Put(document_util::CreateDocumentWrapper(foo_document)));
+  DocumentId document_id = put_result.new_document_id;
+
+  // Advance clock past expiration; GetUri should still return the URI because
+  // it only checks whether the document is deleted, not expired.
+  fake_clock_.SetSystemTimeMilliseconds(2000);
+  EXPECT_THAT(doc_store->GetUri(document_id), IsOkAndHolds("uri"));
+}
+
+TEST_P(DocumentStoreTest, GetUri_returnedUriOutlivesMutationsAndDestruction) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result1,
+      doc_store->Put(document_util::CreateDocumentWrapper(
+          CreateEmailDocument("namespace", "uri1"))));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result2,
+      doc_store->Put(document_util::CreateDocumentWrapper(
+          CreateEmailDocument("namespace", "uri2"))));
+
+  // Collect the URIs up front, before any further mutations.
+  ICING_ASSERT_OK_AND_ASSIGN(std::string uri1,
+                             doc_store->GetUri(put_result1.new_document_id));
+  ICING_ASSERT_OK_AND_ASSIGN(std::string uri2,
+                             doc_store->GetUri(put_result2.new_document_id));
+  ASSERT_THAT(uri1, Eq("uri1"));
+  ASSERT_THAT(uri2, Eq("uri2"));
+
+  // Put many more documents, which may grow (and remap) the mapper's mmapped
+  // storage. The previously returned URIs must be unaffected.
+  for (int i = 0; i < 1000; ++i) {
+    ICING_ASSERT_OK(doc_store->Put(document_util::CreateDocumentWrapper(
+        CreateEmailDocument("namespace", "new_uri" + std::to_string(i)))));
+  }
+  EXPECT_THAT(uri1, Eq("uri1"));
+  EXPECT_THAT(uri2, Eq("uri2"));
+
+  // Replace doc1 and delete doc2, which remove their entries from the mapper.
+  // The previously returned URIs must be unaffected.
+  ICING_ASSERT_OK(doc_store->Put(document_util::CreateDocumentWrapper(
+      CreateEmailDocument("namespace", "uri1"))));
+  ICING_ASSERT_OK(doc_store->Delete(
+      put_result2.new_document_id,
+      /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()));
+  EXPECT_THAT(doc_store->GetUri(put_result1.new_document_id),
+              StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+  EXPECT_THAT(doc_store->GetUri(put_result2.new_document_id),
+              StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+  EXPECT_THAT(uri1, Eq("uri1"));
+  EXPECT_THAT(uri2, Eq("uri2"));
+
+  // Destroy the DocumentStore, which unmaps the mapper's storage. The
+  // previously returned URIs must still be unaffected.
+  doc_store.reset();
+  EXPECT_THAT(uri1, Eq("uri1"));
+  EXPECT_THAT(uri2, Eq("uri2"));
+}
+
+TEST_P(DocumentStoreTest, GetUri_persistenceAndRegeneration) {
+  DocumentId doc1_id;
+  DocumentId doc2_id;
+  DocumentId doc3_id;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put1,
+        doc_store->Put(document_util::CreateDocumentWrapper(
+            CreateEmailDocument("namespace", "uri1"))));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put2,
+        doc_store->Put(document_util::CreateDocumentWrapper(
+            CreateEmailDocument("namespace", "uri2"))));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put3,
+        doc_store->Put(document_util::CreateDocumentWrapper(
+            CreateEmailDocument("namespace", "uri3"))));
+    doc1_id = put1.new_document_id;
+    doc2_id = put2.new_document_id;
+    doc3_id = put3.new_document_id;
+
+    ICING_ASSERT_OK(doc_store->Delete(
+        doc2_id, /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()));
+    ICING_ASSERT_OK(doc_store->PersistToDisk(PersistType::FULL));
+  }
+
+  // Re-initialize from persisted files without regenerating derived files.
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    EXPECT_FALSE(create_result.derived_files_regenerated);
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    EXPECT_THAT(doc_store->GetUri(doc1_id), IsOkAndHolds("uri1"));
+    EXPECT_THAT(doc_store->GetUri(doc2_id),
+                StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+    EXPECT_THAT(doc_store->GetUri(doc3_id), IsOkAndHolds("uri3"));
+  }
+
+  // Corrupt header checksum to force RegenerateDerivedFiles on startup, then
+  // verify GetUri still reflects alive and deleted documents.
+  CorruptDocStoreHeaderChecksumFile();
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    EXPECT_TRUE(create_result.derived_files_regenerated);
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    EXPECT_THAT(doc_store->GetUri(doc1_id), IsOkAndHolds("uri1"));
+    EXPECT_THAT(doc_store->GetUri(doc2_id),
+                StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+    EXPECT_THAT(doc_store->GetUri(doc3_id), IsOkAndHolds("uri3"));
+  }
+}
+
+TEST_P(DocumentStoreTest, GetUri_optimize) {
+  std::string optimized_dir = document_store_dir_ + "_optimize";
+  DocumentId optimized_doc1_id;
+  DocumentId optimized_doc3_id;
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put1,
+        doc_store->Put(document_util::CreateDocumentWrapper(
+            CreateEmailDocument("namespace", "uri1"))));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put2,
+        doc_store->Put(document_util::CreateDocumentWrapper(
+            CreateEmailDocument("namespace", "uri2"))));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put3,
+        doc_store->Put(document_util::CreateDocumentWrapper(
+            CreateEmailDocument("namespace", "uri3"))));
+    DocumentId doc1_id = put1.new_document_id;
+    DocumentId doc2_id = put2.new_document_id;
+    DocumentId doc3_id = put3.new_document_id;
+
+    ICING_ASSERT_OK(doc_store->Delete(
+        doc2_id, /*current_time_ms=*/fake_clock_.GetSystemTimeMilliseconds()));
+
+    // Optimize into a new directory. The deleted doc2 is dropped, so
+    // DocumentIds are compacted: doc1 -> 0, doc3 -> 1.
+    ASSERT_TRUE(filesystem_.DeleteDirectoryRecursively(optimized_dir.c_str()));
+    ASSERT_TRUE(filesystem_.CreateDirectoryRecursively(optimized_dir.c_str()));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::OptimizeResult optimize_result,
+        doc_store->OptimizeInto(
+            optimized_dir, lang_segmenter_.get(),
+            /*expired_blob_handles=*/std::unordered_set<std::string>()));
+    ASSERT_THAT(optimize_result.document_id_old_to_new,
+                ElementsAre(0, kInvalidDocumentId, 1));
+    optimized_doc1_id = optimize_result.document_id_old_to_new[doc1_id];
+    optimized_doc3_id = optimize_result.document_id_old_to_new[doc3_id];
+
+    // OptimizeInto must not modify the original store's mapper.
+    EXPECT_THAT(doc_store->GetUri(doc1_id), IsOkAndHolds("uri1"));
+    EXPECT_THAT(doc_store->GetUri(doc2_id),
+                StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+    EXPECT_THAT(doc_store->GetUri(doc3_id), IsOkAndHolds("uri3"));
+  }
+
+  // Open the optimized store and verify GetUri resolves the compacted
+  // DocumentIds to the original URIs.
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, optimized_dir, &fake_clock_,
+                            schema_store_.get()));
+    EXPECT_FALSE(create_result.derived_files_regenerated);
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+
+    EXPECT_THAT(doc_store->GetUri(optimized_doc1_id), IsOkAndHolds("uri1"));
+    EXPECT_THAT(doc_store->GetUri(optimized_doc3_id), IsOkAndHolds("uri3"));
+    // DocumentId 2 no longer exists after compaction.
+    EXPECT_THAT(doc_store->GetUri(2),
+                StatusIs(libtextclassifier3::StatusCode::NOT_FOUND));
+
+    // New documents put into the optimized store get the next DocumentId and
+    // are correctly mapped.
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::PutResult put4,
+        doc_store->Put(document_util::CreateDocumentWrapper(
+            CreateEmailDocument("namespace", "uri4"))));
+    EXPECT_THAT(put4.new_document_id, Eq(2));
+    EXPECT_THAT(doc_store->GetUri(put4.new_document_id), IsOkAndHolds("uri4"));
+  }
+}
+
+TEST_P(DocumentStoreTest, GetUri_offlineObserversDisabled) {
+  // Use a separate FeatureFlags instance rather than replacing feature_flags_,
+  // since schema_store_ holds a pointer to the fixture's instance.
+  FeatureFlags feature_flags = FeatureFlagsBuilder(*feature_flags_)
+                                   .set_enable_offline_observers(false)
+                                   .Build();
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      DocumentStore::Create(
+          &filesystem_, document_store_dir_, &fake_clock_, schema_store_.get(),
+          &feature_flags,
+          /*force_recovery_and_revalidate_documents=*/false,
+          GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+          PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+          PortableFileBackedProtoLog<
+              DocumentWrapper>::kDefaultCompressionThresholdBytes,
+          protobuf_ports::kDefaultMemLevel,
+          /*initialize_stats=*/nullptr));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result,
+      doc_store->Put(document_util::CreateDocumentWrapper(
+          CreateEmailDocument("namespace", "uri"))));
+
+  // Invalid ids are still rejected first.
+  EXPECT_THAT(doc_store->GetUri(kInvalidDocumentId),
+              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
+  // Valid ids, including ones that exist in the store, fail because the
+  // document id to uri mapper is not enabled.
+  EXPECT_THAT(doc_store->GetUri(put_result.new_document_id),
+              StatusIs(libtextclassifier3::StatusCode::INTERNAL,
+                       HasSubstr("not enabled or initialized")));
+  EXPECT_THAT(doc_store->GetUri(kMaxDocumentId),
+              StatusIs(libtextclassifier3::StatusCode::INTERNAL,
+                       HasSubstr("not enabled or initialized")));
+
+  // The mapper should not have been created on disk.
+  EXPECT_FALSE(filesystem_.DirectoryExists(
+      absl_ports::StrCat(document_store_dir_, "/document_id_to_uri_mapper")
+          .c_str()));
+}
+
+DocumentWrapper CreateDocumentWithLastUpdateTimestamp(
+    std::string name_space, std::string uri, std::string schema,
+    int64_t last_update_timestamp_ms) {
+  return document_util::CreateDocumentWrapper(
+      DocumentBuilder()
+          .SetKey(std::move(name_space), std::move(uri))
+          .SetSchema(std::move(schema))
+          .SetCreationTimestampMs(last_update_timestamp_ms)
+          .SetLastUpdateTimestampMs(last_update_timestamp_ms)
+          .Build());
+}
+
+DocumentChange MakeDocumentChange(std::string name_space, std::string schema,
+                                  std::string uri,
+                                  int64_t operation_timestamp_ms) {
+  return DocumentChange{.name_space = std::move(name_space),
+                        .schema = std::move(schema),
+                        .uri = std::move(uri),
+                        .operation_timestamp_ms = operation_timestamp_ms};
+}
+
+TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_afterTimestamp) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  // No documents.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/10,
+          /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
+
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns1", "uri1", "email", /*last_update_timestamp_ms=*/10)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns2", "uri2", "email", /*last_update_timestamp_ms=*/20)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns1", "uri3", "email", /*last_update_timestamp_ms=*/30)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/10,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns1", "email", "uri1", 10),
+                          MakeDocumentChange("ns2", "email", "uri2", 20),
+                          MakeDocumentChange("ns1", "email", "uri3", 30)));
+  EXPECT_FALSE(result.has_more_changes());
+
+  // timestamp_ms is exclusive.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/10, /*schemas=*/{}, /*max_changes=*/10,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns2", "email", "uri2", 20),
+                          MakeDocumentChange("ns1", "email", "uri3", 30)));
+  EXPECT_FALSE(result.has_more_changes());
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/25, /*schemas=*/{}, /*max_changes=*/10,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns1", "email", "uri3", 30)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/30, /*schemas=*/{}, /*max_changes=*/10,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
+}
+
+TEST_P(DocumentStoreTest,
+       GetAddedOrUpdatedDocuments_updatedDocumentReturnedOnceWithLatestTime) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri1", "email", /*last_update_timestamp_ms=*/10)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri2", "email", /*last_update_timestamp_ms=*/20)));
+  // Update uri1.
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri1", "email", /*last_update_timestamp_ms=*/30)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/10,
+          /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "uri2", 20),
+                          MakeDocumentChange("ns", "email", "uri1", 30)));
+}
+
+TEST_P(DocumentStoreTest,
+       GetAddedOrUpdatedDocuments_excludesDeletedAndExpiredDocuments) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "deleted", "email", /*last_update_timestamp_ms=*/10)));
+  ICING_ASSERT_OK(doc_store->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "expired")
+                                               .SetSchema("email")
+                                               .SetCreationTimestampMs(20)
+                                               .SetTtlMs(100)
+                                               .SetLastUpdateTimestampMs(20)
+                                               .Build())));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "alive", "email", /*last_update_timestamp_ms=*/30)));
+  ICING_ASSERT_OK(doc_store->Delete("ns", "deleted",
+                                    /*current_time_ms=*/50));
+
+  // At time 50, "expired" hasn't expired yet.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/10,
+          /*current_time_ms=*/50));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "expired", 20),
+                          MakeDocumentChange("ns", "email", "alive", 30)));
+
+  // At time 1000, "expired" has expired.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/10,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "alive", 30)));
+}
+
+TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_schemaFilter) {
   SchemaProto schema =
       SchemaBuilder()
-          .AddType(SchemaTypeConfigBuilder().SetType("Email"))
-          .AddType(SchemaTypeConfigBuilder().SetType("Message"))
+          .AddType(SchemaTypeConfigBuilder().SetType("email"))
+          .AddType(SchemaTypeConfigBuilder().SetType("message"))
           .Build();
-
   std::string schema_store_dir = schema_store_dir_ + "_custom";
   filesystem_.DeleteDirectoryRecursively(schema_store_dir.c_str());
   filesystem_.CreateDirectoryRecursively(schema_store_dir.c_str());
@@ -7751,428 +9830,243 @@ TEST_P(DocumentStoreTest, GetResultGroupingEntryId_getByFilterName) {
       std::unique_ptr<SchemaStore> schema_store,
       SchemaStore::Create(&filesystem_, schema_store_dir, &fake_clock_,
                           feature_flags_.get()));
-
   ICING_ASSERT_OK(schema_store->SetSchema(
-      std::move(schema), /*ignore_errors_and_delete_documents=*/false));
+      schema, /*ignore_errors_and_delete_documents=*/false));
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::CreateResult create_result,
       CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
                           schema_store.get()));
-  std::unique_ptr<DocumentStore> document_store =
+  std::unique_ptr<DocumentStore> doc_store =
       std::move(create_result.document_store);
 
-  // Put 3 documents into the document store to create 3 different namespaces.
-  DocumentProto document0 = DocumentBuilder()
-                                .SetKey("namespace0", "uri/0")
-                                .SetSchema("Email")
-                                .Build();
-  DocumentProto document1 = DocumentBuilder()
-                                .SetKey("namespace1", "uri/1")
-                                .SetSchema("Message")
-                                .Build();
-  DocumentProto document2 = DocumentBuilder()
-                                .SetKey("namespace2", "uri/2")
-                                .SetSchema("Message")
-                                .Build();
-  ICING_ASSERT_OK(document_store->Put(
-      document_util::CreateDocumentWrapper(std::move(document0))));
-  ICING_ASSERT_OK(document_store->Put(
-      document_util::CreateDocumentWrapper(std::move(document1))));
-  ICING_ASSERT_OK(document_store->Put(
-      document_util::CreateDocumentWrapper(std::move(document2))));
-
-  ASSERT_THAT(document_store->GetNamespaceId("namespace0"), IsOkAndHolds(0));
-  ASSERT_THAT(document_store->GetNamespaceId("namespace1"), IsOkAndHolds(1));
-  ASSERT_THAT(document_store->GetNamespaceId("namespace2"), IsOkAndHolds(2));
-
-  ASSERT_THAT(schema_store->GetSchemaTypeId("Email"), IsOkAndHolds(0));
-  ASSERT_THAT(schema_store->GetSchemaTypeId("Message"), IsOkAndHolds(1));
-
-  // NONE should always return std::nullopt.
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NONE, "namespace0", "Email"),
-      IsFalse());
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NONE, "namespace1", "Email"),
-      IsFalse());
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NONE, "namespace2", "Email"),
-      IsFalse());
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NONE, "namespace0", "Message"),
-      IsFalse());
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NONE, "namespace1", "Message"),
-      IsFalse());
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NONE, "namespace2", "Message"),
-      IsFalse());
-
-  // SCHEMA_TYPE should return id based on the schema type and ignore the
-  // namespace.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, "namespace0",
-                  "Email"),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, "namespace1",
-                  "Email"),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, "namespace2",
-                  "Email"),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, "namespace0",
-                  "Message"),
-              Optional(Eq(1)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, "namespace1",
-                  "Message"),
-              Optional(Eq(1)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, "namespace2",
-                  "Message"),
-              Optional(Eq(1)));
-
-  // NAMESPACE should return id based on the namespace and ignore the schema
-  // type.
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NAMESPACE, "namespace0", "Email"),
-      Optional(Eq(0)));
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NAMESPACE, "namespace1", "Email"),
-      Optional(Eq(1)));
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_NAMESPACE, "namespace2", "Email"),
-      Optional(Eq(2)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE, "namespace0",
-                  "Message"),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE, "namespace1",
-                  "Message"),
-              Optional(Eq(1)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE, "namespace2",
-                  "Message"),
-              Optional(Eq(2)));
-
-  // NAMESPACE_AND_SCHEMA_TYPE should return id based on both namespace and
-  // schema type.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "namespace0", "Email"),
-              Optional(Eq(0x00000000)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "namespace1", "Email"),
-              Optional(Eq(0x00010000)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "namespace2", "Email"),
-              Optional(Eq(0x00020000)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "namespace0", "Message"),
-              Optional(Eq(0x00000001)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "namespace1", "Message"),
-              Optional(Eq(0x00010001)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "namespace2", "Message"),
-              Optional(Eq(0x00020001)));
-}
-
-TEST_P(DocumentStoreTest, GetResultGroupingEntryId_getByNonExistingFilterName) {
-  // Put 1 schema type into the schema store.
-  SchemaProto schema = SchemaBuilder()
-                           .AddType(SchemaTypeConfigBuilder().SetType("Email"))
-                           .Build();
-
-  std::string schema_store_dir = schema_store_dir_ + "_custom";
-  filesystem_.DeleteDirectoryRecursively(schema_store_dir.c_str());
-  filesystem_.CreateDirectoryRecursively(schema_store_dir.c_str());
-  ICING_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<SchemaStore> schema_store,
-      SchemaStore::Create(&filesystem_, schema_store_dir, &fake_clock_,
-                          feature_flags_.get()));
-
-  ICING_ASSERT_OK(schema_store->SetSchema(
-      std::move(schema), /*ignore_errors_and_delete_documents=*/false));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "email1", "email", /*last_update_timestamp_ms=*/10)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "message1", "message", /*last_update_timestamp_ms=*/20)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "email2", "email", /*last_update_timestamp_ms=*/30)));
 
   ICING_ASSERT_OK_AND_ASSIGN(
-      DocumentStore::CreateResult create_result,
-      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
-                          schema_store.get()));
-  std::unique_ptr<DocumentStore> document_store =
-      std::move(create_result.document_store);
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/0, /*schemas=*/{"message"}, /*max_changes=*/10,
+          /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "message", "message1", 20)));
 
-  // Put 1 document into the document store to create 1 namespace.
-  DocumentProto document0 = DocumentBuilder()
-                                .SetKey("namespace0", "uri/0")
-                                .SetSchema("Email")
-                                .Build();
-  ICING_ASSERT_OK(document_store->Put(
-      document_util::CreateDocumentWrapper(std::move(document0))));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/0, /*schemas=*/{"email", "nonexistent"},
+                  /*max_changes=*/10, /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "email1", 10),
+                          MakeDocumentChange("ns", "email", "email2", 30)));
 
-  ASSERT_THAT(document_store->GetNamespaceId("namespace0"), IsOkAndHolds(0));
-  ASSERT_THAT(schema_store->GetSchemaTypeId("Email"), IsOkAndHolds(0));
-
-  // NONE should always return std::nullopt.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE,
-                  "nonExistingNamespace", "nonExistingSchemaType"),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE,
-                  "nonExistingNamespace", "Email"),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, "namespace0",
-                  "nonExistingSchemaType"),
-              IsFalse());
-
-  // SCHEMA_TYPE should return id based on the schema type and ignore the
-  // namespace. It is ok that the namespace does not exist.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE,
-                  "nonExistingNamespace", "nonExistingSchemaType"),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE,
-                  "nonExistingNamespace", "Email"),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, "namespace0",
-                  "nonExistingSchemaType"),
-              IsFalse());
-
-  // NAMESPACE should return id based on the namespace and ignore the schema
-  // type. It is ok that the schema type does not exist.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  "nonExistingNamespace", "nonExistingSchemaType"),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  "nonExistingNamespace", "Email"),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE, "namespace0",
-                  "nonExistingSchemaType"),
-              Optional(Eq(0)));
-
-  // NAMESPACE_AND_SCHEMA_TYPE should return id based on both namespace and
-  // schema type. Both namespace and schema type must exist.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "nonExistingNamespace", "nonExistingSchemaType"),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "nonExistingNamespace", "Email"),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  "namespace0", "nonExistingSchemaType"),
-              IsFalse());
+  // A filter of only nonexistent schema types matches nothing.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/0, /*schemas=*/{"nonexistent"},
+                  /*max_changes=*/10, /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
 }
 
-TEST_P(DocumentStoreTest, GetResultGroupingEntryId_getByIds) {
+TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_pagination) {
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::CreateResult create_result,
       CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
                           schema_store_.get()));
-  std::unique_ptr<DocumentStore> document_store =
+  std::unique_ptr<DocumentStore> doc_store =
       std::move(create_result.document_store);
 
-  // GetResultGroupingEntryId() by id only handles the encoding and won't check
-  // if the id exists (except kInvalidNamespaceId and kInvalidSchemaTypeId), so
-  // we don't need to set up schema types and namespaces here.
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri1", "email", /*last_update_timestamp_ms=*/10)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri2", "email", /*last_update_timestamp_ms=*/20)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri3", "email", /*last_update_timestamp_ms=*/20)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri4", "email", /*last_update_timestamp_ms=*/30)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri5", "email", /*last_update_timestamp_ms=*/40)));
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "deleted", "email", /*last_update_timestamp_ms=*/50)));
+  ICING_ASSERT_OK(doc_store->Delete("ns", "deleted",
+                                    /*current_time_ms=*/1000));
 
-  // NONE should always return std::nullopt.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, /*namespace_id=*/0,
-                  /*schema_type_id=*/0),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, /*namespace_id=*/0,
-                  /*schema_type_id=*/1),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, /*namespace_id=*/1,
-                  /*schema_type_id=*/0),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, /*namespace_id=*/1,
-                  /*schema_type_id=*/1),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE,
-                  /*namespace_id=*/std::numeric_limits<NamespaceId>::max(),
-                  /*schema_type_id=*/std::numeric_limits<SchemaTypeId>::max()),
-              IsFalse());
+  // The page size is strictly respected, so the first page ends at uri2 even
+  // though uri3 shares its timestamp.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/2,
+          /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "uri1", 10),
+                          MakeDocumentChange("ns", "email", "uri2", 20)));
+  EXPECT_THAT(result.next_change_timestamp_ms, Optional(20));
 
-  // SCHEMA_TYPE should return id based on the schema type id and ignore the
-  // namespace id.
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, /*namespace_id=*/0,
-          /*schema_type_id=*/0),
-      Optional(Eq(0)));
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, /*namespace_id=*/0,
-          /*schema_type_id=*/1),
-      Optional(Eq(1)));
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, /*namespace_id=*/1,
-          /*schema_type_id=*/0),
-      Optional(Eq(0)));
-  EXPECT_THAT(
-      document_store->GetResultGroupingEntryId(
-          ResultSpecProto_ResultGroupingType_SCHEMA_TYPE, /*namespace_id=*/1,
-          /*schema_type_id=*/1),
-      Optional(Eq(1)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE,
-                  /*namespace_id=*/std::numeric_limits<NamespaceId>::max(),
-                  /*schema_type_id=*/std::numeric_limits<SchemaTypeId>::max()),
-              Optional(Eq(std::numeric_limits<SchemaTypeId>::max())));
+  // Re-fetching timestamp 20 returns uri2 again along with uri3.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/19, /*schemas=*/{}, /*max_changes=*/2,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "uri2", 20),
+                          MakeDocumentChange("ns", "email", "uri3", 20)));
+  EXPECT_THAT(result.next_change_timestamp_ms, Optional(30));
 
-  // NAMESPACE should return id based on the namespace id and ignore the schema
-  // type id.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  /*namespace_id=*/0, /*schema_type_id=*/0),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  /*namespace_id=*/0, /*schema_type_id=*/1),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  /*namespace_id=*/1, /*schema_type_id=*/0),
-              Optional(Eq(1)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  /*namespace_id=*/1, /*schema_type_id=*/1),
-              Optional(Eq(1)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  /*namespace_id=*/std::numeric_limits<NamespaceId>::max(),
-                  /*schema_type_id=*/std::numeric_limits<SchemaTypeId>::max()),
-              Optional(Eq(std::numeric_limits<NamespaceId>::max())));
-
-  // NAMESPACE_AND_SCHEMA_TYPE should return id based on both namespace and
-  // schema type ids.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  /*namespace_id=*/0, /*schema_type_id=*/0),
-              Optional(Eq(0x00000000)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  /*namespace_id=*/0, /*schema_type_id=*/1),
-              Optional(Eq(0x00000001)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  /*namespace_id=*/1, /*schema_type_id=*/0),
-              Optional(Eq(0x00010000)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  /*namespace_id=*/1, /*schema_type_id=*/1),
-              Optional(Eq(0x00010001)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  /*namespace_id=*/std::numeric_limits<NamespaceId>::max(),
-                  /*schema_type_id=*/std::numeric_limits<SchemaTypeId>::max()),
-              Optional(Eq(0x7fff7fff)));
+  // The deleted document after uri5 doesn't count as a remaining change.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/20, /*schemas=*/{}, /*max_changes=*/2,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "uri4", 30),
+                          MakeDocumentChange("ns", "email", "uri5", 40)));
+  EXPECT_FALSE(result.has_more_changes());
 }
 
-TEST_P(DocumentStoreTest, GetResultGroupingEntryId_getByInvalidIds) {
+TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_persistsAcrossReopen) {
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+    ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+        "ns", "uri1", "email", /*last_update_timestamp_ms=*/10)));
+    ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+        "ns", "uri2", "email", /*last_update_timestamp_ms=*/20)));
+    ICING_ASSERT_OK(doc_store->PersistToDisk(PersistType::FULL));
+  }
+
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::CreateResult create_result,
       CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
                           schema_store_.get()));
-  std::unique_ptr<DocumentStore> document_store =
+  EXPECT_FALSE(create_result.derived_files_regenerated);
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/10, /*schemas=*/{}, /*max_changes=*/10,
+          /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "uri2", 20)));
+}
+
+TEST_P(DocumentStoreTest,
+       GetAddedOrUpdatedDocuments_afterRegenerateDerivedFiles) {
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        DocumentStore::CreateResult create_result,
+        CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                            schema_store_.get()));
+    std::unique_ptr<DocumentStore> doc_store =
+        std::move(create_result.document_store);
+    ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+        "ns", "uri1", "email", /*last_update_timestamp_ms=*/10)));
+    ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+        "ns", "uri2", "email", /*last_update_timestamp_ms=*/20)));
+    ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+        "ns", "uri3", "email", /*last_update_timestamp_ms=*/30)));
+    ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+        "ns", "uri4", "email", /*last_update_timestamp_ms=*/40)));
+    ICING_ASSERT_OK(doc_store->Delete("ns", "uri3",
+                                      /*current_time_ms=*/1000));
+    ICING_ASSERT_OK(doc_store->PersistToDisk(PersistType::FULL));
+  }
+
+  // Corrupt the header checksum to force RegenerateDerivedFiles on startup.
+  CorruptDocStoreHeaderChecksumFile();
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  EXPECT_TRUE(create_result.derived_files_regenerated);
+  std::unique_ptr<DocumentStore> doc_store =
       std::move(create_result.document_store);
 
-  // GetResultGroupingEntryId() by id only handles the encoding and won't check
-  // if the id exists (except kInvalidNamespaceId and kInvalidSchemaTypeId), so
-  // we don't need to set up schema types and namespaces here.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/15, /*schemas=*/{}, /*max_changes=*/10,
+          /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes,
+              ElementsAre(MakeDocumentChange("ns", "email", "uri2", 20),
+                          MakeDocumentChange("ns", "email", "uri4", 40)));
+  EXPECT_FALSE(result.has_more_changes());
+}
 
-  // NONE should always return std::nullopt.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, kInvalidNamespaceId,
-                  kInvalidSchemaTypeId),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, kInvalidNamespaceId,
-                  /*schema_type_id=*/0),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NONE, /*namespace_id=*/0,
-                  kInvalidSchemaTypeId),
-              IsFalse());
+TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_zeroMaxChanges) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
 
-  // SCHEMA_TYPE should return id based on the schema type id and ignore the
-  // namespace id. It is ok that the namespace id is invalid.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE,
-                  kInvalidNamespaceId, kInvalidSchemaTypeId),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE,
-                  kInvalidNamespaceId, /*schema_type_id=*/0),
-              Optional(Eq(0)));
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_SCHEMA_TYPE,
-                  /*namespace_id=*/0, kInvalidSchemaTypeId),
-              IsFalse());
+  // No changes at all.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentChangeResult result,
+      doc_store->GetAddedOrUpdatedDocuments(
+          /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/0,
+          /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_FALSE(result.has_more_changes());
 
-  // NAMESPACE should return id based on the namespace id and ignore the schema
-  // type id. It is ok that the schema type id is invalid.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  kInvalidNamespaceId, kInvalidSchemaTypeId),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  kInvalidNamespaceId, /*schema_type_id=*/0),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE,
-                  /*namespace_id=*/0, kInvalidSchemaTypeId),
-              Optional(Eq(0)));
-  // NAMESPACE_AND_SCHEMA_TYPE should return id based on both namespace and
-  // schema type ids. Both namespace and schema type ids must be valid.
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  kInvalidNamespaceId, kInvalidSchemaTypeId),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  kInvalidNamespaceId, /*schema_type_id=*/0),
-              IsFalse());
-  EXPECT_THAT(document_store->GetResultGroupingEntryId(
-                  ResultSpecProto_ResultGroupingType_NAMESPACE_AND_SCHEMA_TYPE,
-                  /*namespace_id=*/0, kInvalidSchemaTypeId),
-              IsFalse());
+  // No changes are returned, but there are more changes.
+  ICING_ASSERT_OK(doc_store->Put(CreateDocumentWithLastUpdateTimestamp(
+      "ns", "uri1", "email", /*last_update_timestamp_ms=*/10)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      result, doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/0,
+                  /*current_time_ms=*/1000));
+  EXPECT_THAT(result.changes, IsEmpty());
+  EXPECT_THAT(result.next_change_timestamp_ms, Optional(10));
+}
+
+TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_negativeMaxChanges) {
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      CreateDocumentStore(&filesystem_, document_store_dir_, &fake_clock_,
+                          schema_store_.get()));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  EXPECT_THAT(doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/-1,
+                  /*current_time_ms=*/1000),
+              StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
+}
+
+TEST_P(DocumentStoreTest, GetAddedOrUpdatedDocuments_offlineObserversDisabled) {
+  FeatureFlags feature_flags = FeatureFlagsBuilder(*feature_flags_)
+                                   .set_enable_offline_observers(false)
+                                   .Build();
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::CreateResult create_result,
+      DocumentStore::Create(
+          &filesystem_, document_store_dir_, &fake_clock_, schema_store_.get(),
+          &feature_flags,
+          /*force_recovery_and_revalidate_documents=*/false,
+          GetParam().pre_mapping_fbv, GetParam().use_persistent_hash_map,
+          PortableFileBackedProtoLog<DocumentWrapper>::kDefaultCompressionLevel,
+          PortableFileBackedProtoLog<
+              DocumentWrapper>::kDefaultCompressionThresholdBytes,
+          protobuf_ports::kDefaultMemLevel,
+          /*initialize_stats=*/nullptr));
+  std::unique_ptr<DocumentStore> doc_store =
+      std::move(create_result.document_store);
+
+  EXPECT_THAT(doc_store->GetAddedOrUpdatedDocuments(
+                  /*timestamp_ms=*/0, /*schemas=*/{}, /*max_changes=*/10,
+                  /*current_time_ms=*/1000),
+              StatusIs(libtextclassifier3::StatusCode::FAILED_PRECONDITION));
 }
 
 INSTANTIATE_TEST_SUITE_P(

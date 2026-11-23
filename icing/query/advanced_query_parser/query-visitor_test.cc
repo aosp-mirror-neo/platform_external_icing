@@ -213,19 +213,8 @@ class QueryVisitorTest
     : public ::testing::TestWithParam<QueryVisitorTestParams> {
  protected:
   void SetUp() override {
-    feature_flags_ = std::make_unique<FeatureFlags>(
-        FeatureFlags(/*enable_circular_schema_definitions=*/true,
-                     /*enable_repeated_field_joins=*/true,
-                     /*enable_embedding_backup_generation=*/true,
-                     /*enable_proto_log_new_header_format=*/true,
-                     /*enable_reusable_decompression_buffer=*/true,
-                     /*enable_schema_type_id_optimization=*/true,
-                     /*enable_optimize_improvements=*/true,
-                     /*expired_document_purge_threshold_ms=*/0,
-                     /*enable_non_existent_qualified_id_join=*/true,
-                     /*enable_skip_set_schema_type_equality_check=*/true,
-                     /*enable_schema_definition_deduping=*/true,
-                     /*enable_delete_propagation_from=*/true));
+    feature_flags_ = std::make_unique<FeatureFlags>(GetTestFeatureFlags());
+
     test_dir_ = GetTestTempDir() + "/icing";
     index_dir_ = test_dir_ + "/index";
     numeric_index_dir_ = test_dir_ + "/numeric_index";
@@ -3913,7 +3902,8 @@ TEST_P(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query index is invalid, since there are only 2 queries.
-  std::string query = "semanticSearch(getEmbeddingParameter(0, 1))";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0, 1))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3926,7 +3916,7 @@ TEST_P(QueryVisitorTest,
 TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithNoVectorParamsIndexReturnsOutOfRange) {
   // The embedding query index is invalid, since there are no query embeddings.
-  std::string query = "semanticSearch(getEmbeddingParameter(0))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec = CreateSearchSpec(query, TERM_MATCH_PREFIX);
@@ -3942,7 +3932,7 @@ TEST_P(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query index is invalid, since there are only 2 queries.
-  std::string query = "semanticSearch(getEmbeddingParameter(-1))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(-1))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3984,31 +3974,32 @@ TEST_P(QueryVisitorTest, SemanticSearchANNFunctionAllPhases) {
       CreateVector("model", {0.9, 0.1, 0})};
 
   // Phase 1: Test with Delta Store (No clusters built yet).
-  std::string query = "semanticSearch(getEmbeddingParameter(0))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec = CreateSearchSpec(
       query, TERM_MATCH_PREFIX, query_vectors, EMBEDDING_METRIC_DOT_PRODUCT);
   search_spec.set_embedding_query_nprobe(5);
 
-  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
-                             ProcessQuery(search_spec, root_node.get()));
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                               ProcessQuery(search_spec, root_node.get()));
 
-  DocHitInfoIterator* itr = query_results.root_iterator.get();
-  ICING_ASSERT_OK(itr->Advance());
-  EXPECT_THAT(
-      itr->doc_hit_info(),
-      EqualsDocHitInfo(kDocumentId1, std::vector<SectionId>{kSectionId0}));
-  ICING_ASSERT_OK(itr->Advance());
-  EXPECT_THAT(
-      itr->doc_hit_info(),
-      EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{kSectionId0}));
-  EXPECT_FALSE(itr->Advance().ok());
+    DocHitInfoIterator* itr = query_results.root_iterator.get();
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId1, std::vector<SectionId>{kSectionId0}));
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{kSectionId0}));
+    EXPECT_FALSE(itr->Advance().ok());
 
-  EXPECT_THAT(query_results.root_iterator->GetCallStats()
-                  .embedding_stats.num_ann_embeddings_scored,
-              testing::Eq(2));
-
+    EXPECT_THAT(query_results.root_iterator->GetCallStats()
+                    .embedding_stats.num_ann_embeddings_scored,
+                testing::Eq(2));
+  }
   // 2. Perform IVF clustering and testing with built clusters.
   MaintainAnnIndexOptions maintain_options;
   maintain_options.set_min_size_for_ivf(2);
@@ -4016,22 +4007,24 @@ TEST_P(QueryVisitorTest, SemanticSearchANNFunctionAllPhases) {
   ICING_ASSERT_OK(embedding_index_->MaintainAllIvf(
       *document_store_, *schema_store_, maintain_options));
 
-  ICING_ASSERT_OK_AND_ASSIGN(query_results,
-                             ProcessQuery(search_spec, root_node.get()));
-  itr = query_results.root_iterator.get();
-  ICING_ASSERT_OK(itr->Advance());
-  EXPECT_THAT(
-      itr->doc_hit_info(),
-      EqualsDocHitInfo(kDocumentId1, std::vector<SectionId>{kSectionId0}));
-  ICING_ASSERT_OK(itr->Advance());
-  EXPECT_THAT(
-      itr->doc_hit_info(),
-      EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{kSectionId0}));
-  EXPECT_FALSE(itr->Advance().ok());
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                               ProcessQuery(search_spec, root_node.get()));
+    DocHitInfoIterator* itr = query_results.root_iterator.get();
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId1, std::vector<SectionId>{kSectionId0}));
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{kSectionId0}));
+    EXPECT_FALSE(itr->Advance().ok());
 
-  EXPECT_THAT(query_results.root_iterator->GetCallStats()
-                  .embedding_stats.num_ann_embeddings_scored,
-              testing::Eq(2));
+    EXPECT_THAT(query_results.root_iterator->GetCallStats()
+                    .embedding_stats.num_ann_embeddings_scored,
+                testing::Eq(2));
+  }
 
   // 3. Stress test with multiple vectors.
   for (int i = 2; i < 100; ++i) {
@@ -4051,19 +4044,21 @@ TEST_P(QueryVisitorTest, SemanticSearchANNFunctionAllPhases) {
       *document_store_, *schema_store_, maintain_options));
 
   std::string StressQuery =
-      "semanticSearch(getEmbeddingParameter(0), -100, 1000)";
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, 1000)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> stress_node,
                              ParseQueryHelper(StressQuery));
   search_spec = CreateSearchSpec(StressQuery, TERM_MATCH_PREFIX, query_vectors,
                                  EMBEDDING_METRIC_DOT_PRODUCT);
   search_spec.set_embedding_query_nprobe(200);
-  ICING_ASSERT_OK_AND_ASSIGN(query_results,
-                             ProcessQuery(search_spec, stress_node.get()));
-  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), SizeIs(100));
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                               ProcessQuery(search_spec, stress_node.get()));
+    EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), SizeIs(100));
 
-  EXPECT_THAT(query_results.root_iterator->GetCallStats()
-                  .embedding_stats.num_ann_embeddings_scored,
-              testing::Eq(100));
+    EXPECT_THAT(query_results.root_iterator->GetCallStats()
+                    .embedding_stats.num_ann_embeddings_scored,
+                testing::Eq(100));
+  }
 }
 
 TEST_P(QueryVisitorTest,
@@ -4074,7 +4069,7 @@ TEST_P(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query index is invalid, since there are only 2 queries.
-  std::string query = "semanticSearch(getEmbeddingParameter(10))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(10))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4092,8 +4087,8 @@ TEST_P(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query metric is invalid.
-  std::string query =
-      "semanticSearch(getEmbeddingParameter(0), -10, 10, \"UNKNOWN\")";
+  std::string query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), -10, 10, \"UNKNOWN\")");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4104,7 +4099,7 @@ TEST_P(QueryVisitorTest,
 
   // Passing an unknown default metric type without overriding it in the query
   // expression is also considered invalid.
-  query = "semanticSearch(getEmbeddingParameter(0), -10, 10)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -10, 10)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   search_spec =
       CreateSearchSpec(query, TERM_MATCH_PREFIX, embedding_query_vectors,
@@ -4127,7 +4122,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionEmptyIndexReturnsEmpty) {
   std::vector<PropertyProto::VectorProto> query_vectors = {
       CreateVector("model", {0.9, 0.1, 0})};
 
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 1)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 1)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec = CreateSearchSpec(
@@ -4147,7 +4143,8 @@ TEST_P(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The expression is invalid, since low > high.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 10, -10)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 10, -10)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4157,13 +4154,13 @@ TEST_P(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 
   // Floating point values are also checked.
-  query = "semanticSearch(getEmbeddingParameter(0), 10.2, 10.1)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), 10.2, 10.1)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   EXPECT_THAT(ProcessQuery(search_spec, root_node.get()),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 
   // low == high is allowed.
-  query = "semanticSearch(getEmbeddingParameter(0), 10.1, 10.1)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), 10.1, 10.1)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   EXPECT_THAT(ProcessQuery(search_spec, root_node.get()), IsOk());
 }
@@ -4210,7 +4207,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
       CreateVector("my_model", {0.1, 0.2, 0.3})};
 
   // The query should match vector0 only.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 0.5)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 0.5)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4243,7 +4241,7 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
   }
 
   // The query should match both vector0 and vector1.
-  query = "semanticSearch(getEmbeddingParameter(0), -1.5)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -1.5)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4286,7 +4284,7 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
 
   // The query should match nothing, since there is no vector with a
   // score >= 1.01.
-  query = "semanticSearch(getEmbeddingParameter(0), 1.01)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), 1.01)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4295,6 +4293,20 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
   EXPECT_THAT(query_results.features_in_use,
               UnorderedElementsAre(kListFilterQueryLanguageFeature));
   EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), IsEmpty());
+
+  // Nested search() containing semanticSearch() at depth 2.
+  query =
+      "search(\"search(\\\"semanticSearch(getEmbeddingParameter(0), "
+      "0.5)\\\")\")";
+  ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
+  ICING_ASSERT_OK_AND_ASSIGN(query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId0));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0),
+      UnorderedElementsAre(DoubleNear(1, kEps)));
 }
 
 TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
@@ -4339,7 +4351,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
       CreateVector("my_model", {0.1, 0.2, 0.3})};
 
   // The query should match vector1 only.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), -100, 0.5)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, 0.5)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4372,7 +4385,7 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
   }
 
   // The query should match both vector0 and vector1.
-  query = "semanticSearch(getEmbeddingParameter(0), -100, 1.5)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, 1.5)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4416,7 +4429,7 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
 
   // The query should match nothing, since there is no vector with a
   // score <= -1.01.
-  query = "semanticSearch(getEmbeddingParameter(0), -100, -1.01)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, -1.01)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4463,8 +4476,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
       CreateVector("my_model", {0.1, 0.2, 0.3})};
 
   // Create a query that overrides the metric to COSINE.
-  std::string query =
-      "semanticSearch(getEmbeddingParameter(0), 0.95, 1.05, \"COSINE\")";
+  std::string query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), 0.95, 1.05, \"COSINE\")");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   // The default metric to be overridden
@@ -4498,7 +4511,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
   }
 
   // Create a query that overrides the metric to DOT_PRODUCT.
-  query = "semanticSearch(getEmbeddingParameter(0), 0.1, 0.2, \"DOT_PRODUCT\")";
+  query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), 0.1, 0.2, \"DOT_PRODUCT\")");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4529,8 +4543,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
   }
 
   // Create a query that overrides the metric to EUCLIDEAN.
-  query =
-      "semanticSearch(getEmbeddingParameter(0), -0.05, 0.05, \"EUCLIDEAN\")";
+  query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), -0.05, 0.05, \"EUCLIDEAN\")");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4662,10 +4676,10 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionRepeatedProperty) {
   //   semantic scores {7 (section0, index0)}.
   // - The "semanticSearch(getEmbeddingParameter(1), -2)" part should match
   //   semantic scores {6 (section0, index1)}.
-  std::string query =
+  std::string query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), -5, 1) OR "
       "semanticSearch(getEmbeddingParameter(0), 3) OR "
-      "semanticSearch(getEmbeddingParameter(1), -2)";
+      "semanticSearch(getEmbeddingParameter(1), -2)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4854,9 +4868,9 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
   //   semantic scores {-2, 0}.
   // - The "semanticSearch(getEmbeddingParameter(1), 0)" part should match
   //   semantic scores {4}.
-  std::string query =
+  std::string query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), -5) AND "
-      "semanticSearch(getEmbeddingParameter(1), 0)";
+      "semanticSearch(getEmbeddingParameter(1), 0)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4923,9 +4937,9 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
   //   semantic scores {6 (section0)}.
   // - The "semanticSearch(getEmbeddingParameter(1), 0.1)" part should return
   //   semantic scores {}.
-  query =
+  query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), 1) OR "
-      "semanticSearch(getEmbeddingParameter(1), 0.1)";
+      "semanticSearch(getEmbeddingParameter(1), 0.1)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -5047,9 +5061,9 @@ TEST_P(QueryVisitorTest,
 
   // The query should match both document 0 and document 1, since the overall
   // range is [-10, 10]. The scores in the results should be merged.
-  std::string query =
+  std::string query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), -10, 0) OR "
-      "semanticSearch(getEmbeddingParameter(0), 0.0001, 10)";
+      "semanticSearch(getEmbeddingParameter(0), 0.0001, 10)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -5123,9 +5137,9 @@ TEST_P(QueryVisitorTest,
 
   // The same query appears twice, in which case all the scores in the results
   // should repeat twice.
-  query =
+  query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), -10, 10) OR "
-      "semanticSearch(getEmbeddingParameter(0), -10, 10)";
+      "semanticSearch(getEmbeddingParameter(0), -10, 10)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -5210,7 +5224,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   // - The "semanticSearch(getEmbeddingParameter(0), 0)" part only matches
   //   document 1.
   // - The "foo" part only matches document 0.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 0) OR foo";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 0) OR foo");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -5272,7 +5287,7 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   //   document 0 and 1.
   // - The "foo" part only matches document 0.
   // As a result, only document 0 will be returned.
-  query = "semanticSearch(getEmbeddingParameter(0), -5) AND foo";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -5) AND foo");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -5361,7 +5376,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionSectionRestriction) {
 
   // An embedding query with section restriction. The scores returned should
   // only be limited to the section restricted.
-  std::string query = "prop1:semanticSearch(getEmbeddingParameter(0), -100)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -100)", "prop1");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -5434,7 +5450,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionDeletedDocument) {
   // was not deleted.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
       CreateVector("my_model", {1.0, 1.0, 1.0})};
-  std::string query = "semanticSearch(getEmbeddingParameter(0), -1)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -1)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -5509,7 +5526,7 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionCallStats) {
   // Create a query that matches all embeddings.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
       CreateVector("my_model", {1., 1., 1.})};
-  std::string query = "semanticSearch(getEmbeddingParameter(0))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -5600,7 +5617,7 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionCallStats_Ann) {
   // Create a query that matches all embeddings.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
       CreateVector("my_model", {1., 1., 1.})};
-  std::string query = "semanticSearch(getEmbeddingParameter(0))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -5892,7 +5909,8 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionMixedAnnAndLinear) {
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
       CreateVector("my_model", {1, 1, 1})};
 
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 0.5)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 0.5)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -5929,6 +5947,70 @@ TEST_P(QueryVisitorTest, SemanticSearchFunctionMixedAnnAndLinear) {
     EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
                 IsEmpty());
   }
+}
+
+TEST_P(QueryVisitorTest, PinyinNormalizerDoesNotTransliterateQueryTerm) {
+  if (IsCfStringTokenization() || IsReverseJniTokenization()) {
+    GTEST_SKIP() << "Pinyin transliteration requires ICU.";
+  }
+
+  NormalizerRulesConfig pinyin_rules_config;
+  pinyin_rules_config.enable_pinyin_normalization = true;
+  NormalizerOptions pinyin_normalizer_options(
+      /*max_term_byte_size=*/std::numeric_limits<int32_t>::max(),
+      /*enable_icu_normalizer=*/true, pinyin_rules_config);
+  ICING_ASSERT_OK_AND_ASSIGN(
+      normalizer_, normalizer_factory::Create(pinyin_normalizer_options));
+
+  // Doc 0 is indexed with Hanzi "北京" and its Pinyin terms.
+  Index::Editor editor = index_->Edit(kDocumentId0, kSectionId0,
+                                      /*namespace_id=*/0);
+  ICING_ASSERT_OK(editor.BufferTerm("北京", TERM_MATCH_PREFIX));
+  ICING_ASSERT_OK(editor.BufferTerm("bei jing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("beijing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("bei", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
+
+  // Doc 1 is indexed with homophone Hanzi "背景" and its Pinyin terms.
+  editor = index_->Edit(kDocumentId1, kSectionId0, /*namespace_id=*/0);
+  ICING_ASSERT_OK(editor.BufferTerm("背景", TERM_MATCH_PREFIX));
+  ICING_ASSERT_OK(editor.BufferTerm("bei jing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("beijing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("bei", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
+
+  // Doc 2 is indexed with only the Latin Pinyin string "beijing".
+  editor = index_->Edit(kDocumentId2, kSectionId0, /*namespace_id=*/0);
+  ICING_ASSERT_OK(editor.BufferTerm("beijing", TERM_MATCH_PREFIX));
+  ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
+
+  // 1. A Hanzi query "北京" should NOT be transliterated into Pinyin during
+  // query normalization (is_query_term = true), so it matches only Doc 0
+  // (neither homophone Doc 1 nor Pinyin-only Doc 2).
+  std::string hanzi_query0 = CreateQuery("北京");
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(hanzi_query0));
+  EXPECT_THAT(ExtractKeys(query_results.query_terms), UnorderedElementsAre(""));
+  EXPECT_THAT(query_results.query_terms[""], UnorderedElementsAre("北京"));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId0));
+
+  // 2. Similarly, homophone Hanzi query "背景" matches only Doc 1.
+  std::string hanzi_query1 = CreateQuery("背景");
+  ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(hanzi_query1));
+  EXPECT_THAT(ExtractKeys(query_results.query_terms), UnorderedElementsAre(""));
+  EXPECT_THAT(query_results.query_terms[""], UnorderedElementsAre("背景"));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId1));
+
+  // 3. A Pinyin query "beijing" matches all three documents (Doc 2, Doc 1,
+  // Doc 0).
+  std::string pinyin_query = CreateQuery("beijing");
+  ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(pinyin_query));
+  EXPECT_THAT(ExtractKeys(query_results.query_terms), UnorderedElementsAre(""));
+  EXPECT_THAT(query_results.query_terms[""], UnorderedElementsAre("beijing"));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId2, kDocumentId1, kDocumentId0));
 }
 
 INSTANTIATE_TEST_SUITE_P(

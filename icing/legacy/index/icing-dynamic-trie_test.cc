@@ -1676,5 +1676,93 @@ TEST_F(IcingDynamicTrieTest, IteratorUninitialized) {
   EXPECT_FALSE(it.Advance());
 }
 
+TEST_F(IcingDynamicTrieTest, CollectStatsNoStackOverflow) {
+  IcingFilesystem filesystem;
+  IcingDynamicTrie trie(trie_files_prefix_, IcingDynamicTrie::RuntimeOptions(),
+                        &filesystem);
+  ASSERT_THAT(trie.CreateIfNotExist(IcingDynamicTrie::Options()), IsOk());
+  ASSERT_THAT(trie.Init(), IsOk());
+
+  // 100,000 character shared prefix
+  std::string base_key(100000, 'a');
+
+  // Insert initial entry
+  uint32_t value = 0;
+  ASSERT_THAT(trie.Insert(base_key, &value), IsOk());
+
+  // Now insert 10 additional keys, each changing a character near the end
+  // moving backwards from n down to n-10
+  for (int i = 1; i <= 1; ++i) {
+    std::string modified_key = base_key;
+    modified_key[modified_key.size() - i] = 'b';
+    value = i;
+    ASSERT_THAT(trie.Insert(modified_key, &value), IsOk());
+  }
+
+  // CollectStats should now succeed and not overflow the heap/stack
+  IcingDynamicTrie::Stats stats;
+  trie.CollectStats(&stats);
+  EXPECT_GE(stats.max_depth, 100000);
+}
+
+TEST_F(IcingDynamicTrieTest, DumpTrieNoStackOverflow) {
+  IcingFilesystem filesystem;
+  IcingDynamicTrie trie(trie_files_prefix_, IcingDynamicTrie::RuntimeOptions(),
+                        &filesystem);
+  ASSERT_THAT(trie.CreateIfNotExist(IcingDynamicTrie::Options()), IsOk());
+  ASSERT_THAT(trie.Init(), IsOk());
+
+  // 100,000 character shared prefix to force deep recursion if not iterative
+  std::string base_key(100000, 'a');
+
+  // Insert initial entry
+  uint32_t value = 0;
+  ASSERT_THAT(trie.Insert(base_key, &value), IsOk());
+
+  // Insert additional keys changing characters near the end to force the
+  // trie to split suffixes into internal nodes for the shared prefix.
+  for (int i = 1; i <= 10; ++i) {
+    std::string modified_key = base_key;
+    modified_key[modified_key.size() - i] = 'b';
+    value = i;
+    ASSERT_THAT(trie.Insert(modified_key, &value), IsOk());
+  }
+
+  // DumpTrie should now succeed and not crash due to stack overflow
+  std::ostream null_stream(nullptr);
+  std::vector<std::string> keys;
+
+  trie.DumpTrie(&null_stream, &keys);
+
+  // Verify that all keys were successfully dumped
+  std::vector<std::string> expected_keys;
+  expected_keys.push_back(base_key);
+  for (int i = 1; i <= 10; ++i) {
+    std::string modified_key = base_key;
+    modified_key[modified_key.size() - i] = 'b';
+    expected_keys.push_back(modified_key);
+  }
+  EXPECT_EQ(keys, expected_keys);
+}
+
+TEST_F(IcingDynamicTrieTest, DumpTriePrettyPrint) {
+  IcingFilesystem filesystem;
+  IcingDynamicTrie trie(trie_files_prefix_, IcingDynamicTrie::RuntimeOptions(),
+                        &filesystem);
+  ASSERT_THAT(trie.CreateIfNotExist(IcingDynamicTrie::Options()), IsOk());
+  ASSERT_THAT(trie.Init(), IsOk());
+
+  uint32_t value = 1;
+  ASSERT_THAT(trie.Insert("ab", &value), IsOk());
+  value = 2;
+  ASSERT_THAT(trie.Insert("ac", &value), IsOk());
+
+  std::vector<std::string> keys;
+  std::ostringstream os;
+  trie.DumpTrie(&os, &keys);
+
+  EXPECT_EQ(os.str(), "a\n b\n   01000000 []\n c\n   02000000 []\n");
+}
+
 }  // namespace lib
 }  // namespace icing

@@ -207,7 +207,6 @@ TEST_F(IndexTest, EmptyIndexAfterMerge) {
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
 }
 
-
 TEST_F(IndexTest, AdvancePastEnd) {
   Index::Editor edit =
       index_->Edit(kDocumentId0, kSectionId2, /*namespace_id=*/0);
@@ -1618,6 +1617,106 @@ TEST_F(IndexTest, IndexOptimize) {
   }
 }
 
+TEST_F(IndexTest, OptimizeInto) {
+  std::string prefix = "prefix";
+  std::default_random_engine random;
+  std::vector<std::string> query_terms;
+  // Add 1024 hits to main index, and 1024 hits to lite index.
+  for (int i = 0; i < 2048; ++i) {
+    if (i == 1024) {
+      ICING_ASSERT_OK(index_->Merge());
+    }
+    // Generate a unique term for document i.
+    query_terms.push_back(prefix + RandomString("abcdefg", 5, &random) +
+                          std::to_string(i));
+    TermMatchType::Code term_match_type = TermMatchType::PREFIX;
+    SectionId section_id = static_cast<SectionId>(i % 64);
+    if (section_id == 2) {
+      // Make section 2 an exact section.
+      term_match_type = TermMatchType::EXACT_ONLY;
+    }
+    Index::Editor edit = index_->Edit(/*document_id=*/i, section_id,
+                                      /*namespace_id=*/0);
+    ICING_ASSERT_OK(
+        edit.BufferTerm(query_terms.at(i).c_str(), term_match_type));
+    ICING_ASSERT_OK(edit.IndexAllBufferedTerms());
+    index_->set_last_added_document_id(i);
+  }
+
+  // Delete one document for every three documents.
+  DocumentId document_id = 0;
+  DocumentId new_last_added_document_id = kInvalidDocumentId;
+  std::vector<DocumentId> document_id_old_to_new;
+  for (int i = 0; i < 2048; ++i) {
+    if (i % 3 == 0) {
+      document_id_old_to_new.push_back(kInvalidDocumentId);
+    } else {
+      new_last_added_document_id = document_id++;
+      document_id_old_to_new.push_back(new_last_added_document_id);
+    }
+  }
+
+  std::vector<DocHitInfo> exp_prefix_hits;
+  for (int i = 0; i < 2048; ++i) {
+    if (document_id_old_to_new[i] == kInvalidDocumentId) {
+      continue;
+    }
+    if (i % 64 == 2) {
+      // Section 2 is an exact section, so we should not see any hits in
+      // prefix search.
+      continue;
+    }
+    exp_prefix_hits.push_back(DocHitInfo(document_id_old_to_new[i]));
+    exp_prefix_hits.back().UpdateSection(
+        /*section_id=*/static_cast<SectionId>(i % 64));
+  }
+  std::reverse(exp_prefix_hits.begin(), exp_prefix_hits.end());
+
+  // OptimizeInto a new directory.
+  std::string new_index_dir = index_dir_ + "_optimized";
+  ICING_ASSERT_OK(index_->OptimizeInto(new_index_dir, document_id_old_to_new,
+                                       new_last_added_document_id));
+
+  Index::Options new_options(new_index_dir,
+                             /*index_merge_size=*/1024 * 1024,
+                             /*lite_index_sort_size=*/1024 * 8);
+  ICING_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Index> new_index,
+      Index::Create(new_options, &filesystem_, &icing_filesystem_,
+                    feature_flags_.get()));
+  EXPECT_EQ(new_index->last_added_document_id(), new_last_added_document_id);
+
+  // Check prefix search on new_index.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<DocHitInfoIterator> prefix_itr,
+      new_index->GetIterator(prefix, /*term_start_index=*/0,
+                             /*unnormalized_term_length=*/0, kSectionIdMaskAll,
+                             TermMatchType::PREFIX));
+  EXPECT_THAT(GetHits(std::move(prefix_itr)), ContainerEq(exp_prefix_hits));
+
+  // Check exact search on new_index.
+  for (int i = 0; i < 2048; ++i) {
+    ICING_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<DocHitInfoIterator> exact_itr,
+        new_index->GetIterator(query_terms[i], /*term_start_index=*/0,
+                               /*unnormalized_term_length=*/0,
+                               kSectionIdMaskAll, TermMatchType::EXACT_ONLY));
+    std::vector<DocHitInfo> hits = GetHits(std::move(exact_itr));
+    if (document_id_old_to_new[i] == kInvalidDocumentId) {
+      EXPECT_THAT(hits, IsEmpty());
+    } else {
+      EXPECT_THAT(hits, ElementsAre(EqualsDocHitInfo(
+                            document_id_old_to_new[i],
+                            std::vector<SectionId>{
+                                static_cast<SectionId>(i % 64)})));
+    }
+  }
+
+  // Cleanup
+  new_index.reset();
+  icing_filesystem_.DeleteDirectoryRecursively(new_index_dir.c_str());
+}
+
 TEST_F(IndexTest, IndexCreateIOFailure) {
   // Create the index with mock filesystem. By default, Mock will return false,
   // so the first attempted file operation will fail.
@@ -2791,20 +2890,10 @@ class IndexUpdateChecksumEnsuresDataConsistencyTest
       public ::testing::WithParamInterface<bool> {
  protected:
   void SetUp() override {
-    bool enable_optimize_improvements = GetParam();
     feature_flags_ = std::make_unique<FeatureFlags>(
-        /*enable_circular_schema_definitions=*/true,
-        /*enable_repeated_field_joins=*/true,
-        /*enable_embedding_backup_generation=*/true,
-        /*enable_proto_log_new_header_format=*/true,
-        /*enable_reusable_decompression_buffer=*/true,
-        /*enable_schema_type_id_optimization=*/true,
-        enable_optimize_improvements,
-        /*expired_document_purge_threshold_ms=*/0,
-        /*enable_non_existent_qualified_id_join=*/true,
-        /*enable_skip_set_schema_type_equality_check=*/true,
-        /*enable_schema_definition_deduping=*/true,
-        /*enable_delete_propagation_from=*/true);
+        FeatureFlagsBuilder(GetTestFeatureFlags())
+            .set_enable_optimize_improvements(GetParam())
+            .Build());
 
     index_dir_ = GetTestTempDir() + "/index_test/";
     Index::Options options(index_dir_, /*index_merge_size=*/1024 * 1024,

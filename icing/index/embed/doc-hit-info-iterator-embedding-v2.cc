@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -75,14 +76,20 @@ DocHitInfoIteratorEmbeddingV2::Create(
     // Otherwise, return the error as is.
     return embedding_hit_accessor_or.status();
   }
-  ICING_ASSIGN_OR_RETURN(int dimension, embedding_util::GetDimension(*query));
-  std::vector<float> query_floats;
+  std::optional<EmbeddingQuery> embedding_query;
   if (!query->quantized_values().empty()) {
-    query_floats.resize(dimension);
-    embedding_util::Dequantize(query->quantized_values().data(), dimension,
-                               query_floats.data());
+    ICING_ASSIGN_OR_RETURN(
+        embedding_query, EmbeddingQuery::CreateFromQuantized(
+                             query->quantized_values(),
+                             embedding_index->feature_flags()
+                                 ->enable_quantization_scoring_optimization()));
   } else if (!query->values().empty()) {
-    query_floats.assign(query->values().begin(), query->values().end());
+    ICING_ASSIGN_OR_RETURN(
+        embedding_query,
+        EmbeddingQuery::CreateFromFloats(
+            std::vector<float>(query->values().begin(), query->values().end()),
+            embedding_index->feature_flags()
+                ->enable_quantization_scoring_optimization()));
   } else {
     return absl_ports::InvalidArgumentError("Query vector is empty");
   }
@@ -92,7 +99,7 @@ DocHitInfoIteratorEmbeddingV2::Create(
 
   return std::unique_ptr<DocHitInfoIteratorEmbeddingV2>(
       new DocHitInfoIteratorEmbeddingV2(
-          std::move(query_floats), metric_type, std::move(embedding_scorer),
+          std::move(*embedding_query), metric_type, std::move(embedding_scorer),
           score_low, score_high, info_map, global_scores, global_section_infos,
           embedding_index, std::move(embedding_hit_accessor), document_store,
           schema_store, current_time_ms));
@@ -100,6 +107,8 @@ DocHitInfoIteratorEmbeddingV2::Create(
 
 libtextclassifier3::Status
 DocHitInfoIteratorEmbeddingV2::RetrieveNextHitsBatch() {
+  ICING_RETURN_IF_ERROR(embedding_hit_accessor_->AssertSharedLockHeld());
+
   ICING_ASSIGN_OR_RETURN(
       std::vector<EmbeddingIndex::EmbeddingHitAccessor::HitInfo>
           embedding_hit_infos,
@@ -113,9 +122,9 @@ DocHitInfoIteratorEmbeddingV2::RetrieveNextHitsBatch() {
   cached_hit_scores_idx_ = 0;
   cached_hit_scores_.clear();
   cached_hit_scores_.resize(embedding_hit_infos.size());
-  cached_section_id_masks_.clear();
+  cached_delegate_matches_.clear();
   if (delegate_ != nullptr) {
-    cached_section_id_masks_.resize(embedding_hit_infos.size());
+    cached_delegate_matches_.resize(embedding_hit_infos.size());
   }
 
   std::vector<int> access_order(embedding_hit_infos.size());
@@ -135,12 +144,15 @@ DocHitInfoIteratorEmbeddingV2::RetrieveNextHitsBatch() {
           break;
         }
       }
-      SectionIdMask section_id_mask = kSectionIdMaskNone;
       if (delegate_->doc_hit_info().document_id() ==
           embedding_hit_infos[i].hit.basic_hit().document_id()) {
-        section_id_mask = delegate_->doc_hit_info().hit_section_ids_mask();
+        cached_delegate_matches_[i] = {
+            delegate_->doc_hit_info().hit_section_ids_mask(),
+            /*is_matched=*/true};
+      } else {
+        cached_delegate_matches_[i] = {kSectionIdMaskNone,
+                                       /*is_matched=*/false};
       }
-      cached_section_id_masks_[i] = section_id_mask;
     }
   }
 
@@ -167,7 +179,7 @@ DocHitInfoIteratorEmbeddingV2::RetrieveNextHitsBatch() {
         continue;
       }
       if (delegate_ != nullptr &&
-          cached_section_id_masks_[access_order[i]] == kSectionIdMaskNone) {
+          !cached_delegate_matches_[access_order[i]].is_matched) {
         // The document has been filtered out by the delegate. Therefore, there
         // is no need to calculate the embedding score for this document.
         continue;
@@ -210,7 +222,7 @@ DocHitInfoIteratorEmbeddingV2::RetrieveNextHitsBatch() {
     ICING_ASSIGN_OR_RETURN(
         float semantic_score,
         embedding_hit_accessor_->ScoreEmbeddingHit(
-            *embedding_scorer_, query_floats_, hit_info,
+            *embedding_scorer_, query_, hit_info,
             section_metadata->quantization_type, schema_name_hash, is_ann));
     cached_hit_scores_[access_order[i]] = {embedding_hit.basic_hit(),
                                            semantic_score, is_ann};
@@ -222,15 +234,15 @@ DocHitInfoIteratorEmbeddingV2::RetrieveNextHitsBatch() {
     const HitWithScore& hit_with_score = cached_hit_scores_[i];
     if (hit_with_score.hit.is_valid()) {
       cached_hit_scores_[hit_cnt] = hit_with_score;
-      if (delegate_ != nullptr && i < cached_section_id_masks_.size()) {
-        cached_section_id_masks_[hit_cnt] = cached_section_id_masks_[i];
+      if (delegate_ != nullptr && i < cached_delegate_matches_.size()) {
+        cached_delegate_matches_[hit_cnt] = cached_delegate_matches_[i];
       }
       ++hit_cnt;
     }
   }
   cached_hit_scores_.resize(hit_cnt);
-  if (!cached_section_id_masks_.empty()) {
-    cached_section_id_masks_.resize(hit_cnt);
+  if (!cached_delegate_matches_.empty()) {
+    cached_delegate_matches_.resize(hit_cnt);
   }
   return libtextclassifier3::Status::OK;
 }
@@ -267,6 +279,7 @@ DocHitInfoIteratorEmbeddingV2::AdvanceToNextUnfilteredDocument() {
   int current_section_match_count = 0;
 
   SectionIdMask delegate_section_id_mask = kSectionIdMaskNone;
+  std::vector<HitWithScore> current_doc_hit_scores;
   while (true) {
     ICING_ASSIGN_OR_RETURN(const HitWithScore* embedding_hit_score,
                            AdvanceToNextEmbeddingHit());
@@ -276,21 +289,24 @@ DocHitInfoIteratorEmbeddingV2::AdvanceToNextUnfilteredDocument() {
     }
     if (delegate_ != nullptr) {
       delegate_section_id_mask |=
-          cached_section_id_masks_[cached_hit_scores_idx_ - 1];
+          cached_delegate_matches_[cached_hit_scores_idx_ - 1].section_id_mask;
     }
+    current_doc_hit_scores.push_back(*embedding_hit_score);
+  }
 
+  for (const HitWithScore& embedding_hit_score : current_doc_hit_scores) {
     // We've reached a new section. Reset the match count and retrieve the
     // quantization type for the new section.
-    if (current_section_id != embedding_hit_score->hit.section_id()) {
+    if (current_section_id != embedding_hit_score.hit.section_id()) {
       current_section_match_count = 0;
-      current_section_id = embedding_hit_score->hit.section_id();
+      current_section_id = embedding_hit_score.hit.section_id();
     }
 
-    float semantic_score = embedding_hit_score->score;
+    float semantic_score = embedding_hit_score.score;
     // If the semantic score is within the desired score range, update
     // doc_hit_info_ and info_map_.
     if (score_low_ <= semantic_score && semantic_score <= score_high_) {
-      doc_hit_info_.UpdateSection(embedding_hit_score->hit.section_id());
+      doc_hit_info_.UpdateSection(embedding_hit_score.hit.section_id());
       if (matched_infos == nullptr) {
         matched_infos = &(info_map_[doc_hit_info_.document_id()]);
       }
@@ -305,7 +321,7 @@ DocHitInfoIteratorEmbeddingV2::AdvanceToNextUnfilteredDocument() {
         // use -1 as the position for ANN to indicate that the specific vector
         // position is not supported.
         int position =
-            embedding_hit_score->is_ann ? -1 : current_section_match_count;
+            embedding_hit_score.is_ann ? -1 : current_section_match_count;
         ICING_RETURN_IF_ERROR(matched_infos->AppendSectionInfo(
             *global_section_infos_, current_section_id, position));
       }
@@ -329,7 +345,11 @@ DocHitInfoIteratorEmbeddingV2::AdvanceToNextUnfilteredDocument() {
 
 libtextclassifier3::Status DocHitInfoIteratorEmbeddingV2::Advance() {
   do {
-    ICING_RETURN_IF_ERROR(AdvanceToNextUnfilteredDocument());
+    libtextclassifier3::Status status = AdvanceToNextUnfilteredDocument();
+    if (!status.ok()) {
+      doc_hit_info_ = DocHitInfo(kInvalidDocumentId, kSectionIdMaskNone);
+      return status;
+    }
   } while (doc_hit_info_.hit_section_ids_mask() == kSectionIdMaskNone);
   ++num_advance_calls_;
   return libtextclassifier3::Status::OK;

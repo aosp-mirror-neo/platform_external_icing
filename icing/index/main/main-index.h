@@ -207,6 +207,25 @@ class MainIndex {
   libtextclassifier3::Status Reset() {
     ICING_RETURN_IF_ERROR(flash_index_storage_->Reset());
     main_lexicon_->Clear();
+    // Flush the main index right after reset.
+    // - With the kExplicitFlush (MAP_PRIVATE) storage policy (i.e. when
+    //   enable_optimize_improvements is false), main_lexicon_->Clear() writes
+    //   the new trie header into the MAP_SHARED header mmap without refreshing
+    //   its checksums.
+    // - Also UpdateCrc() is a no-op under kExplicitFlush (MAP_PRIVATE), so
+    //   IcingSearchEngine::PersistToDisk(RECOVERY_PROOF) will NOT update the
+    //   checksums either.
+    // - Without calling PersistToDisk() (i.e. Sync() for the lexicon), the next
+    //   Init() fails the header checksum check and the term index gets rebuilt
+    //   unnecessarily.
+    // - Therefore, let's call PersistToDisk() to do a full flush, including
+    //   updating the checksums.
+    // - Note: This is a quick fix for main lexicon checksum update. For a long
+    //   term fix, we should consider fixing IcingDynamicTrie::UpdateCrc()
+    //   behavior for MAP_PRIVATE. See b/577213532.
+    if (feature_flags_.enable_term_index_flush_fix()) {
+      ICING_RETURN_IF_ERROR(PersistToDisk());
+    }
     return libtextclassifier3::Status::OK;
   }
 
@@ -242,6 +261,22 @@ class MainIndex {
   //                               invalid state and should be cleared.
   libtextclassifier3::Status Optimize(
       const std::vector<DocumentId>& document_id_old_to_new);
+
+  // Transfers and compacts data into a new main index under new_directory.
+  // Unlike Optimize(), this method does not modify or swap the current index
+  // directory, and writes directly into new_directory.
+  //
+  // - new_directory: destination directory for the optimized index.
+  // - document_id_old_to_new: a map for converting old document id to new
+  //   document id.
+  //
+  // Returns:
+  //   - OK on success
+  //   - INVALID_ARGUMENT_ERROR if new_directory is the same as the current
+  //   - INTERNAL_ERROR on IO error
+  libtextclassifier3::Status OptimizeInto(
+      const std::string& new_directory,
+      const std::vector<DocumentId>& document_id_old_to_new) const;
 
  private:
   explicit MainIndex(const std::string& index_directory,
@@ -362,7 +397,7 @@ class MainIndex {
   //   INTERNAL_ERROR on IO error
   libtextclassifier3::Status TransferIndex(
       const std::vector<DocumentId>& document_id_old_to_new,
-      MainIndex* new_index);
+      MainIndex* new_index) const;
 
   std::string base_dir_;
   const Filesystem* filesystem_;

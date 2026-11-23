@@ -160,6 +160,9 @@ libtextclassifier3::Status MainIndex::Init() {
   std::string lexicon_file = base_dir_ + "/main-lexicon";
   IcingDynamicTrie::RuntimeOptions runtime_options;
   if (feature_flags_.enable_optimize_improvements()) {
+    // TODO(b/439850795): remove this block once we confirm another fix
+    //   mitigates the recovery rate issue. Since the main index is modified
+    //   infrequently, we don't need to use MAP_SHARED for it.
     runtime_options.set_storage_policy(
         IcingDynamicTrie::RuntimeOptions::kMapSharedWithCrc);
   }
@@ -774,6 +777,25 @@ libtextclassifier3::Status MainIndex::Optimize(
   return Init();
 }
 
+libtextclassifier3::Status MainIndex::OptimizeInto(
+    const std::string& new_directory,
+    const std::vector<DocumentId>& document_id_old_to_new) const {
+  if (new_directory == base_dir_) {
+    return absl_ports::InvalidArgumentError(
+        "New directory is the same as the current one.");
+  }
+  if (!filesystem_->DeleteDirectoryRecursively(new_directory.c_str())) {
+    ICING_LOG(ERROR) << "Recursively deleting " << new_directory;
+    return absl_ports::InternalError(
+        "Unable to delete temp directory to prepare to build new index.");
+  }
+  ICING_ASSIGN_OR_RETURN(std::unique_ptr<MainIndex> new_index,
+                         MainIndex::Create(new_directory, filesystem_,
+                                           icing_filesystem_, &feature_flags_));
+  ICING_RETURN_IF_ERROR(TransferIndex(document_id_old_to_new, new_index.get()));
+  return new_index->PersistToDisk();
+}
+
 libtextclassifier3::StatusOr<DocumentId> MainIndex::TransferAndAddHits(
     const std::vector<DocumentId>& document_id_old_to_new,
     std::string_view term, PostingListHitAccessor& old_pl_accessor,
@@ -860,7 +882,7 @@ libtextclassifier3::StatusOr<DocumentId> MainIndex::TransferAndAddHits(
 
 libtextclassifier3::Status MainIndex::TransferIndex(
     const std::vector<DocumentId>& document_id_old_to_new,
-    MainIndex* new_index) {
+    MainIndex* new_index) const {
   DocumentId largest_document_id = kInvalidDocumentId;
   for (IcingDynamicTrie::Iterator term_itr(*main_lexicon_, /*prefix=*/"",
                                            /*reverse=*/true);

@@ -35,6 +35,7 @@
 #include "icing/index/data-indexing-handler.h"
 #include "icing/index/embed/embedding-index.h"
 #include "icing/index/embed/embedding-query-results.h"
+#include "icing/index/index-processor.h"
 #include "icing/index/index.h"
 #include "icing/index/numeric/numeric-index.h"
 #include "icing/jni/jni-cache.h"
@@ -43,6 +44,7 @@
 #include "icing/legacy/index/icing-filesystem.h"
 #include "icing/performance-configuration.h"
 #include "icing/proto/blob.pb.h"
+#include "icing/proto/change_notification.pb.h"
 #include "icing/proto/debug.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/initialize.pb.h"
@@ -60,6 +62,7 @@
 #include "icing/schema/schema-store.h"
 #include "icing/scoring/scored-document-hit.h"
 #include "icing/store/blob-store.h"
+#include "icing/store/deletion-store.h"
 #include "icing/store/document-group-info.h"
 #include "icing/store/document-id.h"
 #include "icing/store/document-store.h"
@@ -345,6 +348,54 @@ class IcingSearchEngine {
   //   All namespaces on success
   GetAllNamespacesResultProto GetAllNamespaces();
 
+  // Returns the documents that changed after the timestamp in page_token,
+  // grouped by namespace and schema. Each change is identified by the uri of
+  // the changed document and the time at which the change occurred.
+  //
+  // Returns both documents that were added or updated (and are still alive),
+  // and documents that were deleted. Every deletion after the timestamp in
+  // page_token is returned, regardless of when the deleted document was last
+  // added or updated. Icing can't tell which documents the caller has seen, so
+  // it can't safely skip deletions of documents added or updated after the
+  // timestamp. For example:
+  //   - The caller may have seen an earlier version of a document that was
+  //     updated after the timestamp and then deleted.
+  //   - The caller may retry with an old token after having already processed
+  //     documents that were added after it.
+  // As a result, callers may receive deletions of documents they never saw,
+  // and must tolerate them. Deletions are kept for a limited time, so
+  // deletions older than that may be missing.
+  //
+  // Expired documents are returned as deletions too, but only once they are
+  // purged, by Optimize or HandleExpiredDocuments, with the time of the purge
+  // as the time of the change. Until then, an expired document is neither
+  // returned as added or updated nor as deleted. An expired document that was
+  // replaced by a newer document with the same namespace and uri is not
+  // returned as deleted, since the newer document still exists.
+  //
+  // If schemas is non-empty, only documents whose schema type is in schemas
+  // are returned. If schemas is empty, documents of all schema types are
+  // returned.
+  //
+  // Results are paginated. If has_more_changes is true in the response, call
+  // GetDocumentChanges again with the returned next_page_token to get the next
+  // page. next_page_token is always populated, and can be saved by the caller
+  // to later retrieve changes that occur after this call. Retrieving changes is
+  // idempotent: calling this again with the same arguments returns the same
+  // changes, plus any that have happened since, so callers should be prepared
+  // to process the same change more than once. In particular, if a page ends in
+  // the middle of changes that share the same timestamp, the next page
+  // re-returns the changes at that timestamp that were already returned.
+  //
+  // Returns:
+  //   OK on success
+  //   FAILED_PRECONDITION if IcingSearchEngine has not been initialized yet, or
+  //     if offline observers are not enabled
+  //   INTERNAL_ERROR on IO error
+  DocumentChangeResponseProto GetDocumentChanges(
+      const std::unordered_set<std::string>& schemas,
+      const DocumentChangeResponseProto::PaginationToken& page_token);
+
   // Deletes the Document specified by the given namespace / uri pair from the
   // search engine. Delete changes are automatically applied to disk, callers
   // can also call PersistToDisk() to flush changes immediately.
@@ -551,16 +602,37 @@ class IcingSearchEngine {
   // committed in the metadata store. The caller is responsible for verifying
   // the digest of the blob file.
   //
+  // If blob_key is provided, it is persisted as-is together with the blob info
+  // and can later be retrieved via GetBlobKey. The blob key can only be set at
+  // commit time. If the commit fails (e.g. digest mismatch), the blob key is
+  // dropped and nothing is persisted. See BlobKeyProto for the caller's
+  // responsibility regarding the key material.
+  //
   // Returns:
   //   OK on success
   //   AlreadyExistsError if the blob is already committed
-  //   InvalidArgumentError on invalid blob handle or if the digest is mismatch
-  //     with file content
+  //   InvalidArgumentError on invalid blob handle, if the digest is mismatch
+  //     with file content, or if blob_key is provided with an empty key
   //   NotFoundError if the blob is not found
-  BlobProto CommitBlob(const PropertyProto::BlobHandleProto& blob_handle)
+  BlobProto CommitBlob(
+      const PropertyProto::BlobHandleProto& blob_handle,
+      std::optional<BlobKeyProto> blob_key = std::nullopt)
+      ICING_LOCKS_EXCLUDED(mutex_);
+
+  // Gets the blob key of a committed blob, which was provided via CommitBlob.
+  //
+  // Returns:
+  //   OK on success. blob_key is set only if the blob was committed with a
+  //     blob key; callers should check has_blob_key().
+  //   InvalidArgumentError on invalid blob handle
+  //   NotFoundError if the blob is not found or is not committed
+  BlobProto GetBlobKey(const PropertyProto::BlobHandleProto& blob_handle)
       ICING_LOCKS_EXCLUDED(mutex_);
 
   // Gets all the blob info from the blob store.
+  //
+  // The returned BlobInfoProtos include the blob_key of each blob if it has
+  // one, so that PutBlobInfos can migrate them to another Icing instance.
   //
   // Returns:
   //   BlobProto with all the blob info on success
@@ -640,6 +712,47 @@ class IcingSearchEngine {
   //   FAILED_PRECONDITION IcingSearchEngine has not been initialized yet
   OptimizeResultProto Optimize() ICING_LOCKS_EXCLUDED(mutex_);
 
+  // Prepares the destination directory for optimization (Stage 1).
+  // Performs the heavy I/O work (copying and optimizing document store and
+  // indexes) in a temporary directory. Holds a shared lock, allowing read
+  // queries to run concurrently. Writes are blocked during this call.
+  //
+  // If the temporary directory has already been fully prepared from the
+  // current state (e.g. by a previous call without any writes since then), the
+  // existing result is reused and the heavy work is skipped.
+  //
+  // Calls to OptimizePrepareDestDirectory and OptimizeSwapToDestDirectory are
+  // serialized.
+  //
+  // NOTE: It is recommended to call PersistToDisk(PersistType::FULL) before
+  // calling this method. Otherwise, if Icing restarts after this method
+  // returns, unpersisted changes may be lost or recovered differently, which
+  // changes the checksums, and the subsequent OptimizeSwapToDestDirectory call
+  // with this result will be aborted.
+  //
+  // Returns:
+  //   OptimizePrepareResultProto with OK and intermediate result on success.
+  //   FAILED_PRECONDITION if IcingSearchEngine has not been initialized yet.
+  //   INTERNAL_ERROR on I/O errors.
+  OptimizePrepareResultProto OptimizePrepareDestDirectory()
+      ICING_LOCKS_EXCLUDED(optimize_mutex_, mutex_);
+
+  // Swaps to the optimized destination directory (Stage 2).
+  // Verifies if any writes occurred since Prepare using the intermediate
+  // result, and that the temporary directory was prepared together with it. If
+  // so, swaps the optimized directories and re-initializes the engine. Holds a
+  // unique lock, blocking all reads and writes.
+  //
+  // Returns:
+  //   OK on success
+  //   ABORTED_ERROR if writes occurred since Prepare, or the temporary
+  //     directory doesn't match prepare_result (caller should retry Prepare)
+  //   FAILED_PRECONDITION if IcingSearchEngine has not been initialized yet
+  //   INTERNAL_ERROR on I/O errors
+  OptimizeResultProto OptimizeSwapToDestDirectory(
+      const OptimizePrepareResultProto& prepare_result)
+      ICING_LOCKS_EXCLUDED(optimize_mutex_, mutex_);
+
   // Returns potential size and document savings if Optimize were called.
   //
   // Returns:
@@ -703,12 +816,26 @@ class IcingSearchEngine {
   // Used to provide reader and writer locks
   absl_ports::shared_mutex mutex_;
 
+  // Serializes 2-stage optimize calls (OptimizePrepareDestDirectory and
+  // OptimizeSwapToDestDirectory), since they share the same temporary
+  // directory. It is always acquired before mutex_. Other APIs don't need to
+  // acquire this lock.
+  absl_ports::shared_mutex optimize_mutex_ ICING_ACQUIRED_BEFORE(mutex_);
+
   // Stores and processes the schema
   std::unique_ptr<SchemaStore> schema_store_ ICING_GUARDED_BY(mutex_);
 
+  // Stores a DeletionEvent for every deleted or expired document, so that
+  // offline observers can retrieve deletions. Only created if offline observers
+  // are enabled, nullptr otherwise.
+  //
+  // Declared before document_store_, which holds a raw pointer to it, so that
+  // it is destroyed after document_store_.
+  std::unique_ptr<DeletionStore> deletion_store_ ICING_GUARDED_BY(mutex_);
+
   // Used to store all valid documents
   //
-  // Dependencies: schema_store_
+  // Dependencies: schema_store_, deletion_store_
   std::unique_ptr<DocumentStore> document_store_ ICING_GUARDED_BY(mutex_);
 
   // Used to manage pagination state of query results. Even though
@@ -770,6 +897,54 @@ class IcingSearchEngine {
   // Pointer to JNI class references
   const std::unique_ptr<const JniCache> jni_cache_;
 
+  struct ReplayDocumentsResult {
+    libtextclassifier3::Status overall_status;
+    int num_failed_reindexed_documents = 0;
+    int num_deleted_documents = 0;
+  };
+
+  // Prepares documents (tokenization and dependency evaluation) for indexing.
+  static libtextclassifier3::StatusOr<TokenizedDocument>
+  PrepareDocumentsForIndexing(const DocumentStore* document_store,
+                              const SchemaStore* schema_store,
+                              const LanguageSegmenter* language_segmenter,
+                              bool enable_delete_propagation_from,
+                              DocumentProto&& document,
+                              int64_t current_time_ms);
+
+  // Replays documents in [start_document_id, end_document_id] into the
+  // index_processor, deletes failing documents from document_store, and
+  // optionally propagates deletion to child documents.
+  static libtextclassifier3::StatusOr<ReplayDocumentsResult>
+  ReplayDocumentsForIndexRestoration(
+      const IcingSearchEngineOptions& options, DocumentStore* document_store,
+      const SchemaStore* schema_store,
+      const LanguageSegmenter* language_segmenter,
+      const QualifiedIdJoinIndex* qualified_id_join_index,
+      IndexProcessor* index_processor, DocumentId start_document_id,
+      DocumentId end_document_id, int64_t current_time_ms);
+
+  // Deletes documents propagated from the given deleted document ids via
+  // joinable properties with delete propagation enabled.
+  static libtextclassifier3::StatusOr<DocumentGroupInfo> PropagateDelete(
+      const SchemaStore* schema_store,
+      const QualifiedIdJoinIndex* qualified_id_join_index,
+      DocumentStore* document_store,
+      const std::unordered_set<DocumentId>& deleted_document_ids,
+      int64_t current_time_ms, bool enable_delete_propagation_from);
+
+  // Rebuilds all 4 indices in the temporary directory during Stage 1 (Prepare)
+  // under shared_lock if index translation optimization fails or index rebuild
+  // is requested.
+  static libtextclassifier3::Status RebuildTemporaryIndices(
+      const Filesystem* filesystem, const IcingFilesystem* icing_filesystem,
+      const Clock* clock, const Normalizer* normalizer,
+      const SchemaStore* schema_store,
+      const LanguageSegmenter* language_segmenter,
+      const FeatureFlags& feature_flags,
+      const IcingSearchEngineOptions& options, const std::string& temp_base_dir,
+      DocumentStore* temp_doc_store, OptimizeStatsProto* optimize_stats);
+
   // Resets all members that are created during Initialize.
   //
   // Note: this method DOES NOT reset task_scheduler_. task_scheduler_ should be
@@ -816,6 +991,18 @@ class IcingSearchEngine {
   // @param persist_stats: The NON-null stats about the PersistToDisk call.
   libtextclassifier3::Status PersistToDiskLocked(
       PersistType::Code persist_type, PersistToDiskStatsProto* persist_stats)
+      ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Helper method to persist all data, compile the latency, and transform the
+  // status into the result proto.
+  //
+  // @param persist_type: The type of persistence guarantee that PersistToDisk
+  //                      should provide.
+  // @param persist_to_disk_result: The NON-null object to populate status and
+  //                                stats.
+  void PersistToDiskAndTransformStatusLocked(
+      PersistType::Code persist_type,
+      PersistToDiskResultProto* persist_to_disk_result)
       ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Helper method to persist derived data (excluding document store) with
@@ -866,6 +1053,50 @@ class IcingSearchEngine {
       InitializeStatsProto* initialize_stats)
       ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
+  // Creates the DeletionStore if offline observers are enabled. Otherwise,
+  // leaves deletion_store_ as nullptr. Must be called before
+  // InitializeDocumentStore, which passes deletion_store_ to the DocumentStore.
+  // Since document_store_ holds a raw pointer to deletion_store_, this resets
+  // document_store_ (and result_state_manager_, which depends on it) first.
+  //
+  // If the existing DeletionStore can't be created (e.g. its files are
+  // corrupted), its directory is deleted and an empty DeletionStore is created
+  // instead, discarding all stored DeletionEvents.
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL on I/O error, or if an empty DeletionStore can't be created
+  libtextclassifier3::Status InitializeDeletionStore()
+      ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Purges DeletionEvents that are older than the time to live from
+  // deletion_store_, if it exists. If deletion_store_ is still initialized
+  // after an error (e.g. the swap failed but deletion_store_ was re-initialized
+  // from the old or empty files), the error is logged and otherwise ignored.
+  // Otherwise, deletion_store_ can't be used until it is recreated, so like a
+  // DocumentStore that can't be recreated after Optimize, this marks Icing as
+  // uninitialized so that the next Initialize() recreates it.
+  //
+  // Returns:
+  //   OK on success, if deletion_store_ is null, or if deletion_store_ is still
+  //   initialized after an error.
+  //   INTERNAL if deletion_store_ is left uninitialized.
+  libtextclassifier3::Status OptimizeDeletionStore()
+      ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Do any initialization/recovery necessary to create DocumentStore,
+  // indices (term index, integer index, qualified id join index, and embedding
+  // index), and ResultStateManager instances.
+  //
+  // Returns:
+  //   OK on success
+  //   DATA_LOSS_ERROR on partial data loss
+  //   INTERNAL on I/O error
+  libtextclassifier3::Status InitializeDocumentStoreAndIndices(
+      bool force_recovery_and_revalidate_documents,
+      InitializeStatsProto* initialize_stats)
+      ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
   // Do any initialization/recovery necessary to create a DocumentStore
   // instance.
   //
@@ -889,7 +1120,7 @@ class IcingSearchEngine {
   //   OK on success
   //   FAILED_PRECONDITION if initialize_stats is null
   libtextclassifier3::Status InitializeBlobStore(
-      int32_t orphan_blob_time_to_live_ms, int32_t compression_level,
+      int64_t orphan_blob_time_to_live_ms, int32_t compression_level,
       int32_t compression_mem_level) ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Do any initialization/recovery necessary to create term index, integer
@@ -1172,7 +1403,7 @@ class IcingSearchEngine {
   IndexRestorationResult RestoreIndexIfNeeded()
       ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  // Helper method to discard search (term, integer) indices.
+  // Helper method to discard all search indices (term, integer, embedding).
   //
   // Returns:
   //   OK on success
@@ -1205,6 +1436,12 @@ class IcingSearchEngine {
   // This is used to schedule the task with the task scheduler.
   std::function<void()> CreateMaintainAnnIndexTask(int retry_count = 0)
       ICING_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Helper method to run MaintainAnnIndex with shared lock.
+  void MaintainAnnIndexLocked(const MaintainAnnIndexOptions& options,
+                              Timer* maintain_timer, StatusProto* result_status,
+                              MaintainAnnIndexResultProto& result_proto)
+      ICING_SHARED_LOCKS_REQUIRED(mutex_);
 };
 
 }  // namespace lib

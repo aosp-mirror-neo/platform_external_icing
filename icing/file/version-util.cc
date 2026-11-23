@@ -433,6 +433,15 @@ derived_file_util::DerivedFilesRebuildInfo GetFeatureDerivedFilesRebuildInfo(
           /*needs_qualified_id_join_index_rebuild=*/false,
           /*needs_embedding_index_rebuild=*/false);
     }
+    case IcingSearchEngineFeatureInfoProto::FEATURE_PINYIN_TRANSLITERATION: {
+      return derived_file_util::DerivedFilesRebuildInfo(
+          /*needs_document_store_derived_files_rebuild=*/false,
+          /*needs_schema_store_derived_files_rebuild=*/false,
+          /*needs_term_index_rebuild=*/true,
+          /*needs_integer_index_rebuild=*/false,
+          /*needs_qualified_id_join_index_rebuild=*/false,
+          /*needs_embedding_index_rebuild=*/false);
+    }
     case IcingSearchEngineFeatureInfoProto::FEATURE_EMBEDDING_INDEX: {
       return derived_file_util::DerivedFilesRebuildInfo(
           /*needs_document_store_derived_files_rebuild=*/false,
@@ -504,6 +513,17 @@ derived_file_util::DerivedFilesRebuildInfo GetFeatureDerivedFilesRebuildInfo(
           /*needs_qualified_id_join_index_rebuild=*/true,
           /*needs_embedding_index_rebuild=*/false);
     }
+    case IcingSearchEngineFeatureInfoProto::FEATURE_OFFLINE_OBSERVERS: {
+      // The offline observers feature requires the document id to uri mapper to
+      // be initialized, which is a document store derived file.
+      return derived_file_util::DerivedFilesRebuildInfo(
+          /*needs_document_store_derived_files_rebuild=*/true,
+          /*needs_schema_store_derived_files_rebuild=*/false,
+          /*needs_term_index_rebuild=*/false,
+          /*needs_integer_index_rebuild=*/false,
+          /*needs_qualified_id_join_index_rebuild=*/false,
+          /*needs_embedding_index_rebuild=*/false);
+    }
     case IcingSearchEngineFeatureInfoProto::UNKNOWN:
       return derived_file_util::DerivedFilesRebuildInfo(
           /*needs_document_store_derived_files_rebuild=*/true,
@@ -531,20 +551,20 @@ bool SchemaDatabaseMigrationRequired(
   return true;
 }
 
-bool ShouldRecalculatePropertiesDigestsForDeduping(
-    const IcingSearchEngineVersionProto& prev_version_proto) {
-  if (prev_version_proto.version() < kSchemaDefinitionDedupingVersion) {
-    return true;
+bool IsSchemaDedupingEnabled(
+    const IcingSearchEngineVersionProto& version_proto) {
+  if (version_proto.version() < kSchemaDefinitionDedupingVersion) {
+    return false;
   }
-  for (const auto& feature : prev_version_proto.enabled_features()) {
+  for (const auto& feature : version_proto.enabled_features()) {
     // The schema deduplication feature was enabled in the previous version, so
     // no need to migrate.
     if (feature.feature_type() == IcingSearchEngineFeatureInfoProto::
                                       FEATURE_SCHEMA_DEFINITION_DEDUPLICATION) {
-      return false;
+      return true;
     }
   }
-  return true;
+  return false;
 }
 
 IcingSearchEngineFeatureInfoProto GetFeatureInfoProto(
@@ -606,6 +626,17 @@ void AddEnabledFeatures(const IcingSearchEngineOptions& options,
     enabled_features->Add(
         GetFeatureInfoProto(IcingSearchEngineFeatureInfoProto::
                                 FEATURE_SCHEMA_DEFINITION_DEDUPLICATION));
+  }
+  // PinyinTransliteration feature
+  if (options.enable_pinyin_transliteration()) {
+    enabled_features->Add(GetFeatureInfoProto(
+        IcingSearchEngineFeatureInfoProto::FEATURE_PINYIN_TRANSLITERATION));
+  }
+
+  // OfflineObservers feature
+  if (options.enable_offline_observers()) {
+    enabled_features->Add(GetFeatureInfoProto(
+        IcingSearchEngineFeatureInfoProto::FEATURE_OFFLINE_OBSERVERS));
   }
 }
 

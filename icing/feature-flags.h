@@ -16,6 +16,7 @@
 #define ICING_FEATURE_FLAGS_H_
 
 #include <cstdint>
+#include <utility>
 
 namespace icing {
 namespace lib {
@@ -25,22 +26,26 @@ class FeatureFlags {
   explicit FeatureFlags(bool allow_circular_schema_definitions,
                         bool enable_repeated_field_joins,
                         bool enable_embedding_backup_generation,
-                        bool enable_proto_log_new_header_format,
-                        bool enable_reusable_decompression_buffer,
-                        bool enable_schema_type_id_optimization,
                         bool enable_optimize_improvements,
                         int64_t expired_document_purge_threshold_ms,
                         bool enable_non_existent_qualified_id_join,
                         bool enable_skip_set_schema_type_equality_check,
                         bool enable_schema_definition_deduping,
-                        bool enable_delete_propagation_from)
+                        bool enable_delete_propagation_from,
+                        bool enable_account_property_incompatibility_check,
+                        bool schema_store_release_cached_proto_after_use,
+                        bool remove_schema_store_move_assignment,
+                        bool enable_fine_grained_index_rebuild,
+                        bool enable_read_during_ann_maintenance,
+                        bool enable_quantization_scoring_optimization,
+                        bool enable_pinyin_transliteration,
+                        bool enable_term_index_flush_fix,
+                        bool enable_offline_observers,
+                        bool enable_handle_zero_filled_magic_recovery,
+                        bool enable_proto_log_compression_mem_level = false)
       : allow_circular_schema_definitions_(allow_circular_schema_definitions),
         enable_repeated_field_joins_(enable_repeated_field_joins),
         enable_embedding_backup_generation_(enable_embedding_backup_generation),
-        enable_proto_log_new_header_format_(enable_proto_log_new_header_format),
-        enable_reusable_decompression_buffer_(
-            enable_reusable_decompression_buffer),
-        enable_schema_type_id_optimization_(enable_schema_type_id_optimization),
         enable_optimize_improvements_(enable_optimize_improvements),
         expired_document_purge_threshold_ms_(
             expired_document_purge_threshold_ms),
@@ -49,7 +54,24 @@ class FeatureFlags {
         enable_skip_set_schema_type_equality_check_(
             enable_skip_set_schema_type_equality_check),
         enable_schema_definition_deduping_(enable_schema_definition_deduping),
-        enable_delete_propagation_from_(enable_delete_propagation_from) {}
+        enable_delete_propagation_from_(enable_delete_propagation_from),
+        enable_account_property_incompatibility_check_(
+            enable_account_property_incompatibility_check),
+        schema_store_release_cached_proto_after_use_(
+            schema_store_release_cached_proto_after_use),
+        remove_schema_store_move_assignment_(
+            remove_schema_store_move_assignment),
+        enable_fine_grained_index_rebuild_(enable_fine_grained_index_rebuild),
+        enable_read_during_ann_maintenance_(enable_read_during_ann_maintenance),
+        enable_quantization_scoring_optimization_(
+            enable_quantization_scoring_optimization),
+        enable_pinyin_transliteration_(enable_pinyin_transliteration),
+        enable_term_index_flush_fix_(enable_term_index_flush_fix),
+        enable_offline_observers_(enable_offline_observers),
+        enable_handle_zero_filled_magic_recovery_(
+            enable_handle_zero_filled_magic_recovery),
+        enable_proto_log_compression_mem_level_(
+            enable_proto_log_compression_mem_level) {}
 
   bool allow_circular_schema_definitions() const {
     return allow_circular_schema_definitions_;
@@ -61,18 +83,6 @@ class FeatureFlags {
 
   bool enable_embedding_backup_generation() const {
     return enable_embedding_backup_generation_;
-  }
-
-  bool enable_proto_log_new_header_format() const {
-    return enable_proto_log_new_header_format_;
-  }
-
-  bool enable_reusable_decompression_buffer() const {
-    return enable_reusable_decompression_buffer_;
-  }
-
-  bool enable_schema_type_id_optimization() const {
-    return enable_schema_type_id_optimization_;
   }
 
   bool enable_optimize_improvements() const {
@@ -91,7 +101,6 @@ class FeatureFlags {
     return enable_skip_set_schema_type_equality_check_;
   }
 
-
   bool enable_schema_definition_deduping() const {
     return enable_schema_definition_deduping_;
   }
@@ -100,36 +109,67 @@ class FeatureFlags {
     return enable_delete_propagation_from_;
   }
 
+  bool enable_account_property_incompatibility_check() const {
+    return enable_account_property_incompatibility_check_;
+  }
+
+  bool schema_store_release_cached_proto_after_use() const {
+    return schema_store_release_cached_proto_after_use_;
+  }
+
+  bool remove_schema_store_move_assignment() const {
+    return remove_schema_store_move_assignment_;
+  }
+
+  bool enable_fine_grained_index_rebuild() const {
+    return enable_fine_grained_index_rebuild_;
+  }
+
+  bool enable_read_during_ann_maintenance() const {
+    return enable_read_during_ann_maintenance_;
+  }
+
+  bool enable_quantization_scoring_optimization() const {
+    return enable_quantization_scoring_optimization_;
+  }
+
+  bool enable_pinyin_transliteration() const {
+    return enable_pinyin_transliteration_;
+  }
+
+  bool enable_term_index_flush_fix() const {
+    return enable_term_index_flush_fix_;
+  }
+
+  bool enable_offline_observers() const { return enable_offline_observers_; }
+
+  bool enable_handle_zero_filled_magic_recovery() const {
+    return enable_handle_zero_filled_magic_recovery_;
+  }
+
+  bool enable_proto_log_compression_mem_level() const {
+    return enable_proto_log_compression_mem_level_;
+  }
+
  private:
+  FeatureFlags() = default;
+
+  friend class FeatureFlagsBuilder;
+
   // Whether to allow circular references in the schema definition. This was
   // added in the Android U timeline and is not a trunk-stable flag.
-  bool allow_circular_schema_definitions_;
+  bool allow_circular_schema_definitions_ = false;
 
-
-  bool enable_repeated_field_joins_;
+  bool enable_repeated_field_joins_ = false;
 
   // Controls code that runs in backup schema producer to remove embedding
   // properties.
-  bool enable_embedding_backup_generation_;
-
-
-
-
-  // Whether to enable the new header format (refactor legacy format and
-  // introduce unsynced tail checksum) related changes in
-  // PortableFileBackedProtoLog.
-  bool enable_proto_log_new_header_format_;
-
-  // Whether PortableFileBackedProtoLog should retain a decompression buffer
-  // that reads can reuse rather than allocating a new one for each read.
-  bool enable_reusable_decompression_buffer_;
-
-  bool enable_schema_type_id_optimization_;
+  bool enable_embedding_backup_generation_ = false;
 
   // Whether to enable a few minor improvements to Optimize:
   // 1. Avoid unnecessary Status allocs for deleted/expired docs
   // 2. Remove an unnecessary persist to disk call
-  bool enable_optimize_improvements_;
+  bool enable_optimize_improvements_ = false;
 
   // The time threshold for an expired document to be purged.
   // - Since we schedule a task to purge expired documents according to the next
@@ -143,14 +183,14 @@ class FeatureFlags {
   //   are already expired.
   // - Additionally, we will also purge documents that expire in the next 1000
   //   ms, i.e. (10000, 11000] ms.
-  int64_t expired_document_purge_threshold_ms_;
+  int64_t expired_document_purge_threshold_ms_ = 0;
 
   // Whether to allow a document to reference a join parent (by its qualified
   // id) that does not yet exist. When enabled, the join index will handle cases
   // where a child document is indexed before its parent. The join relationship
   // will be established once the parent document is indexed. If disabled, the
   // join relationship will be lost if the child is indexed before the parent.
-  bool enable_non_existent_qualified_id_join_;
+  bool enable_non_existent_qualified_id_join_ = false;
 
   // Whether to skip the schema type equality check during SetSchema. We
   // serialize the schema proto to strings when doing this check, which is slow.
@@ -161,14 +201,201 @@ class FeatureFlags {
   //   the case.
   // - Therefore, the Icing-side equality check in SetSchema is redundant and
   //   can be skipped if caller is AppSearch.
-  bool enable_skip_set_schema_type_equality_check_;
-
+  bool enable_skip_set_schema_type_equality_check_ = false;
 
   // Whether to enable deduping for the schema's type definitions.
-  bool enable_schema_definition_deduping_;
+  bool enable_schema_definition_deduping_ = false;
 
   // Whether to enable delete propagation PROPAGATE_FROM.
-  bool enable_delete_propagation_from_;
+  bool enable_delete_propagation_from_ = false;
+
+  // Whether to enable the account property incompatibility check.
+  bool enable_account_property_incompatibility_check_ = false;
+
+  // Whether to release schema-store's cached proto instances after use.
+  bool schema_store_release_cached_proto_after_use_ = false;
+
+  // Whether to remove schema store's move assignment and instead use in-place
+  // re-initialization during SetSchema().
+  bool remove_schema_store_move_assignment_ = false;
+
+  // Whether to enable fine-grained index rebuilding when schema changes occur.
+  bool enable_fine_grained_index_rebuild_ = false;
+
+  // Whether to unblock read requests during ANN index maintenance (k-means
+  // calculation).
+  bool enable_read_during_ann_maintenance_ = false;
+  // Whether to use the optimized scoring path when scoring against quantized
+  // document embeddings, instead of dequantizing per element during scoring.
+  bool enable_quantization_scoring_optimization_ = false;
+
+  // Whether to transliterate Hanzi characters to Pinyin during document
+  // indexing.
+  bool enable_pinyin_transliteration_ = false;
+
+  // Whether to enable the fix for the term index flush bug.
+  bool enable_term_index_flush_fix_ = false;
+
+  // Whether to enable offline observers.
+  bool enable_offline_observers_ = false;
+
+  // Whether to truncate the document log and continue with recovery when
+  // reading an entry with zeroed-out metadata/magic during document store
+  // recovery.
+  bool enable_handle_zero_filled_magic_recovery_ = false;
+
+  // Whether to pass compression_mem_level to GzipOutputStream when writing
+  // compressed protos in PortableFileBackedProtoLog.
+  bool enable_proto_log_compression_mem_level_ = false;
+};
+
+class FeatureFlagsBuilder {
+ public:
+  FeatureFlagsBuilder() = default;
+
+  explicit FeatureFlagsBuilder(FeatureFlags feature_flags)
+      : feature_flags_(std::move(feature_flags)) {}
+
+  FeatureFlagsBuilder& set_allow_circular_schema_definitions(
+      bool allow_circular_schema_definitions) {
+    feature_flags_.allow_circular_schema_definitions_ =
+        allow_circular_schema_definitions;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_repeated_field_joins(
+      bool enable_repeated_field_joins) {
+    feature_flags_.enable_repeated_field_joins_ = enable_repeated_field_joins;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_embedding_backup_generation(
+      bool enable_embedding_backup_generation) {
+    feature_flags_.enable_embedding_backup_generation_ =
+        enable_embedding_backup_generation;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_optimize_improvements(
+      bool enable_optimize_improvements) {
+    feature_flags_.enable_optimize_improvements_ = enable_optimize_improvements;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_expired_document_purge_threshold_ms(
+      int64_t expired_document_purge_threshold_ms) {
+    feature_flags_.expired_document_purge_threshold_ms_ =
+        expired_document_purge_threshold_ms;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_non_existent_qualified_id_join(
+      bool enable_non_existent_qualified_id_join) {
+    feature_flags_.enable_non_existent_qualified_id_join_ =
+        enable_non_existent_qualified_id_join;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_skip_set_schema_type_equality_check(
+      bool enable_skip_set_schema_type_equality_check) {
+    feature_flags_.enable_skip_set_schema_type_equality_check_ =
+        enable_skip_set_schema_type_equality_check;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_schema_definition_deduping(
+      bool enable_schema_definition_deduping) {
+    feature_flags_.enable_schema_definition_deduping_ =
+        enable_schema_definition_deduping;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_delete_propagation_from(
+      bool enable_delete_propagation_from) {
+    feature_flags_.enable_delete_propagation_from_ =
+        enable_delete_propagation_from;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_account_property_incompatibility_check(
+      bool enable_account_property_incompatibility_check) {
+    feature_flags_.enable_account_property_incompatibility_check_ =
+        enable_account_property_incompatibility_check;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_schema_store_release_cached_proto_after_use(
+      bool schema_store_release_cached_proto_after_use) {
+    feature_flags_.schema_store_release_cached_proto_after_use_ =
+        schema_store_release_cached_proto_after_use;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_remove_schema_store_move_assignment(
+      bool remove_schema_store_move_assignment) {
+    feature_flags_.remove_schema_store_move_assignment_ =
+        remove_schema_store_move_assignment;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_fine_grained_index_rebuild(
+      bool enable_fine_grained_index_rebuild) {
+    feature_flags_.enable_fine_grained_index_rebuild_ =
+        enable_fine_grained_index_rebuild;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_read_during_ann_maintenance(
+      bool enable_read_during_ann_maintenance) {
+    feature_flags_.enable_read_during_ann_maintenance_ =
+        enable_read_during_ann_maintenance;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_quantization_scoring_optimization(
+      bool enable_quantization_scoring_optimization) {
+    feature_flags_.enable_quantization_scoring_optimization_ =
+        enable_quantization_scoring_optimization;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_pinyin_transliteration(
+      bool enable_pinyin_transliteration) {
+    feature_flags_.enable_pinyin_transliteration_ =
+        enable_pinyin_transliteration;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_term_index_flush_fix(
+      bool enable_term_index_flush_fix) {
+    feature_flags_.enable_term_index_flush_fix_ = enable_term_index_flush_fix;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_offline_observers(
+      bool enable_offline_observers) {
+    feature_flags_.enable_offline_observers_ = enable_offline_observers;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_handle_zero_filled_magic_recovery(
+      bool enable_handle_zero_filled_magic_recovery) {
+    feature_flags_.enable_handle_zero_filled_magic_recovery_ =
+        enable_handle_zero_filled_magic_recovery;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_proto_log_compression_mem_level(
+      bool enable_proto_log_compression_mem_level) {
+    feature_flags_.enable_proto_log_compression_mem_level_ =
+        enable_proto_log_compression_mem_level;
+    return *this;
+  }
+
+  FeatureFlags Build() { return feature_flags_; }
+
+ private:
+  FeatureFlags feature_flags_;
 };
 
 }  // namespace lib

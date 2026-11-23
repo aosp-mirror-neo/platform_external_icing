@@ -114,6 +114,7 @@ using ::testing::AtLeast;
 using ::testing::DoDefault;
 using ::testing::EndsWith;
 using ::testing::Eq;
+using ::testing::Ge;
 using ::testing::HasSubstr;
 using ::testing::IsEmpty;
 using ::testing::IsTrue;
@@ -261,11 +262,13 @@ IcingSearchEngineOptions GetDefaultIcingOptions() {
   icing_options.set_base_dir(GetTestBaseDir());
   icing_options.set_document_store_namespace_id_fingerprint(true);
   icing_options.set_enable_delete_propagation_from(false);
-  icing_options.set_enable_proto_log_new_header_format(true);
   icing_options.set_embedding_index_num_shards(32);
   icing_options.set_enable_non_existent_qualified_id_join(true);
   icing_options.set_enable_database_stableness_log(true);
   icing_options.set_enable_schema_definition_deduping(true);
+  icing_options.set_schema_store_release_cached_proto_after_use(true);
+  icing_options.set_enable_index_restoration_critical_error_handling_fix(true);
+  icing_options.set_enable_pinyin_transliteration(true);
   return icing_options;
 }
 
@@ -740,6 +743,7 @@ TEST_F(IcingSearchEngineInitializationTest,
     InitializeResultProto init_result = icing.Initialize();
     ASSERT_THAT(init_result.status(),
                 ProtoStatusIs(StatusProto::WARNING_DATA_LOSS));
+    EXPECT_TRUE(init_result.has_reset());
     ASSERT_THAT(init_result.initialize_stats().num_previous_init_failures(),
                 Eq(6));
     EXPECT_THAT(
@@ -832,6 +836,7 @@ TEST_F(IcingSearchEngineInitializationTest,
     InitializeResultProto init_result = icing.Initialize();
     ASSERT_THAT(init_result.status(),
                 ProtoStatusIs(StatusProto::WARNING_DATA_LOSS));
+    EXPECT_TRUE(init_result.has_reset());
     ASSERT_THAT(init_result.initialize_stats().num_previous_init_failures(),
                 Eq(6));
 
@@ -851,8 +856,9 @@ TEST_F(IcingSearchEngineInitializationTest,
 }
 
 TEST_F(IcingSearchEngineInitializationTest,
-       IndexRestorationShouldIgnoreErrorsAndReturnWarningDataLoss) {
+       IndexRestoration_shouldIgnoreInternalErrorsAndReturnWarningDataLoss) {
   IcingSearchEngineOptions icing_options = GetDefaultIcingOptions();
+  icing_options.set_enable_index_restoration_critical_error_handling_fix(false);
 
   // Create a schema with indexable integer property "timestamp".
   SchemaProto email_schema =
@@ -921,6 +927,8 @@ TEST_F(IcingSearchEngineInitializationTest,
   InitializeResultProto initialize_result = icing.Initialize();
   EXPECT_THAT(initialize_result.status(),
               ProtoStatusIs(StatusProto::WARNING_DATA_LOSS));
+  // Index restoration does not reset the engine.
+  EXPECT_FALSE(initialize_result.has_reset());
 
   EXPECT_THAT(
       initialize_result.initialize_stats().document_store_recovery_cause(),
@@ -959,6 +967,116 @@ TEST_F(IcingSearchEngineInitializationTest,
       icing.Get("namespace", "uri2", GetResultSpecProto::default_instance())
           .status(),
       ProtoStatusIs(StatusProto::NOT_FOUND));
+}
+
+TEST_F(IcingSearchEngineInitializationTest,
+       IndexRestoration_shouldHandleInternalErrors) {
+  SchemaProto schema =
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder().SetType("Person").AddProperty(
+              PropertyConfigBuilder()
+                  .SetName("name")
+                  .SetDataTypeString(TERM_MATCH_PREFIX, TOKENIZER_PLAIN)
+                  .SetCardinality(CARDINALITY_REQUIRED)))
+          .AddType(SchemaTypeConfigBuilder()
+                       .SetType("Message")
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("body")
+                                        .SetDataTypeString(TERM_MATCH_PREFIX,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_REQUIRED))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("indexableInteger")
+                                        .SetDataTypeInt64(NUMERIC_MATCH_RANGE)
+                                        .SetCardinality(CARDINALITY_REQUIRED))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("senderQualifiedId")
+                                        .SetDataTypeJoinableString(
+                                            JOINABLE_VALUE_TYPE_QUALIFIED_ID)
+                                        .SetCardinality(CARDINALITY_REQUIRED)))
+          .Build();
+
+  DocumentProto person =
+      DocumentBuilder()
+          .SetKey("namespace", "person")
+          .SetSchema("Person")
+          .AddStringProperty("name", "person")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .Build();
+  DocumentProto message =
+      DocumentBuilder()
+          .SetKey("namespace", "message/1")
+          .SetSchema("Message")
+          .AddStringProperty("body", kIpsumText)
+          .AddInt64Property("indexableInteger", 123)
+          .AddStringProperty("senderQualifiedId", "namespace#person")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .Build();
+
+  IcingSearchEngineOptions options = GetDefaultIcingOptions();
+  options.set_index_merge_size(
+      static_cast<int>(person.ByteSizeLong() + message.ByteSizeLong()));
+  options.set_enable_index_restoration_critical_error_handling_fix(true);
+  // 1. Create an index with a LiteIndex that will only allow a person and a
+  //    message document before needing a merge.
+  {
+    TestIcingSearchEngine icing(options, std::make_unique<Filesystem>(),
+                                std::make_unique<IcingFilesystem>(),
+                                std::make_unique<FakeClock>(),
+                                GetTestJniCache());
+
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+
+    ASSERT_THAT(icing.Put(person).status(), ProtoIsOk());
+    // Add two message documents. These should trigger lite index to main index
+    // merge.
+    ASSERT_THAT(icing.Put(message).status(), ProtoIsOk());
+    message = DocumentBuilder(message).SetUri("message/2").Build();
+    ASSERT_THAT(icing.Put(message).status(), ProtoIsOk());
+
+    // Add another message document.
+    message = DocumentBuilder(message).SetUri("message/3").Build();
+    ASSERT_THAT(icing.Put(message).status(), ProtoIsOk());
+    ASSERT_THAT(icing.PersistToDisk(PersistType::FULL).status(), ProtoIsOk());
+  }
+
+  // 2. Manually delete the term index directory.
+  std::string idx_subdir = GetIndexDir() + "/idx";
+  ASSERT_TRUE(filesystem()->DeleteDirectoryRecursively(idx_subdir.c_str()));
+
+  // 3. Mock the filesystem to simulate an internal error for index merge during
+  //    index restoration.
+  std::string flash_index_storage_path = GetIndexDir() + "/idx/main/main_index";
+  auto mock_filesystem = std::make_unique<MockFilesystem>();
+  // 3.1 Spy OpenForWrite() to get the fd of main index FlashIndexStorage.
+  int flash_index_storage_fd = -1;
+  ON_CALL(*mock_filesystem, OpenForWrite(HasSubstr(flash_index_storage_path)))
+      .WillByDefault([&](const char* file_name) -> int {
+        flash_index_storage_fd = filesystem()->OpenForWrite(file_name);
+        return flash_index_storage_fd;
+      });
+  // 3.2 Fail DataSync for main index FlashIndexStorage.
+  ON_CALL(*mock_filesystem, DataSync).WillByDefault([&](int fd) -> bool {
+    if (fd == flash_index_storage_fd) {
+      return false;
+    }
+    return filesystem()->DataSync(fd);
+  });
+  // 3.3. After failing to merge, the main index (and FlashIndexStorage) is
+  //      reset. Fail this step as well.
+  ON_CALL(*mock_filesystem, DeleteFile(HasSubstr(flash_index_storage_path)))
+      .WillByDefault(Return(false));
+
+  // 4. Initialize IcingSearchEngine. When rebuilding the term index, index
+  //    merge should fail and we should get internal error without crashing.
+  TestIcingSearchEngine icing(options, std::move(mock_filesystem),
+                              std::make_unique<IcingFilesystem>(),
+                              std::make_unique<FakeClock>(), GetTestJniCache());
+  InitializeResultProto initialize_result = icing.Initialize();
+  // Verify that flash index storage fd is captured.
+  ASSERT_THAT(flash_index_storage_fd, Ge(0));
+  EXPECT_THAT(initialize_result.status(), ProtoStatusIs(StatusProto::INTERNAL));
 }
 
 TEST_F(IcingSearchEngineInitializationTest, RecoverFromMissingHeaderFile) {
@@ -1055,6 +1173,34 @@ TEST_F(IcingSearchEngineInitializationTest, UnableToRecoverFromCorruptSchema) {
   IcingSearchEngine icing(GetDefaultIcingOptions(), GetTestJniCache());
   EXPECT_THAT(icing.Initialize().status(),
               ProtoStatusIs(StatusProto::INTERNAL));
+}
+
+TEST_F(IcingSearchEngineInitializationTest, MissingSchemaWipesOutDatabase) {
+  DocumentProto email =
+      CreateEmailDocument("namespace", "uri", 100, "subject", "body");
+  {
+    // Set schema and add the email document
+    IcingSearchEngine icing(GetDefaultIcingOptions(), GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(CreateEmailSchema()).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(email).status(), ProtoIsOk());
+  }  // Engine shuts down and persists to disk.
+
+  // Delete ONLY the schema directory to simulate losing the schema.
+  ASSERT_TRUE(filesystem()->DeleteDirectoryRecursively(GetSchemaDir().c_str()));
+
+  {
+    IcingSearchEngine icing(GetDefaultIcingOptions(), GetTestJniCache());
+    InitializeResultProto init_result = icing.Initialize();
+    EXPECT_THAT(init_result.status(), ProtoIsOk());
+
+    // Verify that the document store was wiped out and we can't retrieve the
+    // document.
+    EXPECT_THAT(
+        icing.Get("namespace", "uri", GetResultSpecProto::default_instance())
+            .status(),
+        ProtoStatusIs(StatusProto::NOT_FOUND));
+  }
 }
 
 TEST_F(IcingSearchEngineInitializationTest,
@@ -1756,10 +1902,12 @@ TEST_F(IcingSearchEngineInitializationTest, RecoverFromCorruptedDocumentStore) {
                                score_cache->Get(/*idx=*/0));
     ICING_ASSERT_OK(score_cache->Set(
         /*idx=*/0,
-        DocumentAssociatedScoreData(score_data->corpus_id(),
-                                    score_data->document_score() + 1,
-                                    score_data->creation_timestamp_ms(),
-                                    score_data->length_in_tokens())));
+        DocumentAssociatedScoreData(
+            score_data->corpus_id(), score_data->document_score() + 1,
+            score_data->creation_timestamp_ms(),
+            score_data->scorable_property_cache_index(),
+            score_data->length_in_tokens(),
+            score_data->effective_last_update_timestamp_ms())));
     ICING_ASSERT_OK(score_cache->PersistToDisk());
   }
 
@@ -5113,53 +5261,51 @@ TEST_F(
               EqualsProto(expected_get_result_google::protobuf));
 }
 
-TEST_F(IcingSearchEngineInitializationTest,
-       IndexRecovery_failingDocumentShouldPropagateDeletionToChildDocuments) {
+TEST_F(
+    IcingSearchEngineInitializationTest,
+    IndexRecovery_failingDocumentShouldBeDeletedWithoutFailingInitialization) {
   SchemaProto schema =
       SchemaBuilder()
-          .AddType(SchemaTypeConfigBuilder()
-                       .SetType("Person")
-                       .AddProperty(PropertyConfigBuilder()
-                                        .SetName("name")
-                                        .SetDataTypeString(TERM_MATCH_PREFIX,
-                                                           TOKENIZER_PLAIN)
-                                        .SetCardinality(CARDINALITY_REQUIRED))
-                       .AddProperty(PropertyConfigBuilder()
-                                        .SetName("timestamp")
-                                        .SetDataTypeInt64(NUMERIC_MATCH_RANGE)
-                                        .SetCardinality(CARDINALITY_REQUIRED)))
           .AddType(
               SchemaTypeConfigBuilder()
-                  .SetType("Message")
+                  .SetType("Label")
                   .AddProperty(
                       PropertyConfigBuilder()
-                          .SetName("body")
+                          .SetName("name")
                           .SetDataTypeString(TERM_MATCH_PREFIX, TOKENIZER_PLAIN)
                           .SetCardinality(CARDINALITY_REQUIRED))
                   .AddProperty(PropertyConfigBuilder()
-                                   .SetName("sender")
+                                   .SetName("target")
                                    .SetDataTypeJoinableString(
                                        JOINABLE_VALUE_TYPE_QUALIFIED_ID,
                                        DELETE_PROPAGATION_TYPE_PROPAGATE_FROM)
-                                   .SetCardinality(CARDINALITY_REQUIRED)))
+                                   .SetCardinality(CARDINALITY_OPTIONAL)))
           .Build();
 
-  DocumentProto person = DocumentBuilder()
-                             .SetKey("namespace", "person1")
-                             .SetSchema("Person")
-                             .AddStringProperty("name", "person")
-                             .AddInt64Property("timestamp", 1024)
+  // Create 3 documents with the following relation (with delete propagation
+  // enabled): label1 -> label2
+  DocumentProto label1 = DocumentBuilder()
+                             .SetKey("namespace", "label/1")
+                             .SetSchema("Label")
+                             .AddStringProperty("name", "foo")
                              .SetCreationTimestampMs(10)
                              .SetTtlMs(10000)  // Expire at 10010 ms.
                              .Build();
-  DocumentProto message = DocumentBuilder()
-                              .SetKey("namespace", "message/1")
-                              .SetSchema("Message")
-                              .AddStringProperty("body", "message body")
-                              .AddStringProperty("sender", "namespace#person1")
-                              .SetCreationTimestampMs(10)
-                              .SetTtlMs(0)  // Never expire.
-                              .Build();
+  DocumentProto label2 = DocumentBuilder()
+                             .SetKey("namespace", "label/2")
+                             .SetSchema("Label")
+                             .AddStringProperty("name", "bar")
+                             .AddStringProperty("target", "namespace#label/1")
+                             .SetCreationTimestampMs(10)
+                             .SetTtlMs(0)  // Never expire.
+                             .Build();
+  DocumentProto label3 = DocumentBuilder()
+                             .SetKey("namespace", "label/3")
+                             .SetSchema("Label")
+                             .AddStringProperty("name", "baz")
+                             .SetCreationTimestampMs(10)
+                             .SetTtlMs(0)  // Never expire.
+                             .Build();
 
   IcingSearchEngineOptions options = GetDefaultIcingOptions();
   options.set_enable_delete_propagation_from(true);
@@ -5173,27 +5319,41 @@ TEST_F(IcingSearchEngineInitializationTest,
                                 GetTestJniCache());
     ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
     ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
-    ASSERT_THAT(icing.Put(person).status(), ProtoIsOk());
-    ASSERT_THAT(icing.Put(message).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(label1).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(label2).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(label3).status(), ProtoIsOk());
   }
 
-  // 2. Delete integer index to trigger index restoration.
-  ASSERT_TRUE(
-      filesystem()->DeleteDirectoryRecursively(GetIntegerIndexDir().c_str()));
+  {
+    // Delete term and qualified id join index to trigger index restoration.
+    // Note: we have to create an empty term index back because of the version
+    //   check against FlashIndexStorage magic.
+    std::string idx_subdir = GetIndexDir() + "/idx";
+    ASSERT_TRUE(filesystem()->DeleteDirectoryRecursively(idx_subdir.c_str()));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<Index> index,
+        Index::Create(Index::Options(GetIndexDir(),
+                                     /*index_merge_size=*/100,
+                                     /*lite_index_sort_size=*/50),
+                      filesystem(), icing_filesystem(), feature_flags_.get()));
+    ICING_ASSERT_OK(index->PersistToDisk());
 
-  // 3. Mock filesystem to fail creating "timestamp" integer index storage.
-  auto mock_filesystem = std::make_unique<MockFilesystem>();
-  ON_CALL(*mock_filesystem,
-          CreateDirectory(HasSubstr(GetIntegerIndexDir() + "/timestamp")))
-      .WillByDefault(Return(false));
+    ASSERT_TRUE(filesystem()->DeleteDirectoryRecursively(
+        GetQualifiedIdJoinIndexDir().c_str()));
+  }
 
-  // 4. Initialize IcingSearchEngine again with the mock filesystem. When
-  //    indexing document "person1", it will fail to create "timestamp" integer
-  //    index storage, but soft index restoration mechanism should skip the
-  //    error and delete the document without failing initialization.
+  // Initialize IcingSearchEngine again with the fake clock adjusted to t =
+  // 20000 ms. When rebuilding the index:
+  // - label1 should be skipped since it is expired.
+  // - label2 should fail with non-fatal (or non-internal) error, since its
+  //   parent (label1) is expired.
+  // - label3 should be reindexed and alive.
+  //
+  // Initialization should succeed with WARNING_DATA_LOSS.
   auto fake_clock = std::make_unique<FakeClock>();
   fake_clock->SetTimerElapsedMilliseconds(10);
-  TestIcingSearchEngine icing(options, std::move(mock_filesystem),
+  fake_clock->SetSystemTimeMilliseconds(20000);
+  TestIcingSearchEngine icing(options, std::make_unique<Filesystem>(),
                               std::make_unique<IcingFilesystem>(),
                               std::move(fake_clock), GetTestJniCache());
 
@@ -5204,7 +5364,8 @@ TEST_F(IcingSearchEngineInitializationTest,
   EXPECT_THAT(
       initialize_result.initialize_stats().document_store_recovery_cause(),
       Eq(InitializeStatsProto::NONE));
-  // Indices should be restored. "person1" should fail to be reindexed.
+  EXPECT_FALSE(initialize_result.has_reset());
+  // Term and qualified id join index should be restored.
   EXPECT_THAT(
       initialize_result.initialize_stats().index_restoration_latency_ms(),
       Eq(10));
@@ -5212,13 +5373,13 @@ TEST_F(IcingSearchEngineInitializationTest,
       initialize_result.initialize_stats().num_failed_reindexed_documents(),
       Eq(1));
   EXPECT_THAT(initialize_result.initialize_stats().index_restoration_cause(),
-              Eq(InitializeStatsProto::NONE));
+              Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
   EXPECT_THAT(
       initialize_result.initialize_stats().integer_index_restoration_cause(),
-      Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
+      Eq(InitializeStatsProto::NONE));
   EXPECT_THAT(initialize_result.initialize_stats()
                   .qualified_id_join_index_restoration_cause(),
-              Eq(InitializeStatsProto::NONE));
+              Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
   EXPECT_THAT(
       initialize_result.initialize_stats().embedding_index_restoration_cause(),
       Eq(InitializeStatsProto::NONE));
@@ -5226,25 +5387,171 @@ TEST_F(IcingSearchEngineInitializationTest,
   EXPECT_THAT(initialize_result.needs_persist_type(),
               Eq(PersistType::RECOVERY_PROOF));
 
-  // ("namespace", "person1") should be deleted.
+  // ("namespace", "label/2") should be deleted.
   GetResultProto expected_get_result_proto1;
   expected_get_result_proto1.mutable_status()->set_code(StatusProto::NOT_FOUND);
   expected_get_result_proto1.mutable_status()->set_message(
-      "Document (namespace, person1) not found.");
+      "Document (namespace, label/2) not found.");
   EXPECT_THAT(
-      icing.Get("namespace", "person1", GetResultSpecProto::default_instance()),
+      icing.Get("namespace", "label/2", GetResultSpecProto::default_instance()),
       EqualsProto(expected_get_result_proto1));
 
-  // ("namespace", "message/1") should be deleted. Although this document should
-  // successfully be reindexed, when "person1" fails to be reindexed, all
+  // ("namespace", "label/3") should be alive and searchable by query = "baz".
+  SearchSpecProto search_spec;
+  search_spec.set_term_match_type(TermMatchType::EXACT_ONLY);
+  search_spec.set_query("baz");
+  SearchResultProto results = icing.Search(search_spec, GetDefaultScoringSpec(),
+                                           ResultSpecProto::default_instance());
+  EXPECT_THAT(results.status(), ProtoIsOk());
+  EXPECT_THAT(results.results(), SizeIs(1));
+  EXPECT_THAT(results.results(0).document(), EqualsProto(label3));
+}
+
+TEST_F(IcingSearchEngineInitializationTest,
+       IndexRecovery_failingDocumentShouldPropagateDeletionToChildDocuments) {
+  SchemaProto schema =
+      SchemaBuilder()
+          .AddType(
+              SchemaTypeConfigBuilder()
+                  .SetType("Label")
+                  .AddProperty(
+                      PropertyConfigBuilder()
+                          .SetName("name")
+                          .SetDataTypeString(TERM_MATCH_PREFIX, TOKENIZER_PLAIN)
+                          .SetCardinality(CARDINALITY_REQUIRED))
+                  .AddProperty(PropertyConfigBuilder()
+                                   .SetName("target")
+                                   .SetDataTypeJoinableString(
+                                       JOINABLE_VALUE_TYPE_QUALIFIED_ID,
+                                       DELETE_PROPAGATION_TYPE_PROPAGATE_FROM)
+                                   .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build();
+
+  // Create 3 documents with the following relation (with delete propagation
+  // enabled): label1 -> label2 -> label3
+  DocumentProto label1 = DocumentBuilder()
+                             .SetKey("namespace", "label/1")
+                             .SetSchema("Label")
+                             .AddStringProperty("name", "foo")
+                             .SetCreationTimestampMs(10)
+                             .SetTtlMs(10000)  // Expire at 10010 ms.
+                             .Build();
+  DocumentProto label2 = DocumentBuilder()
+                             .SetKey("namespace", "label/2")
+                             .SetSchema("Label")
+                             .AddStringProperty("name", "bar")
+                             .AddStringProperty("target", "namespace#label/1")
+                             .SetCreationTimestampMs(10)
+                             .SetTtlMs(0)  // Never expire.
+                             .Build();
+  DocumentProto label3 = DocumentBuilder()
+                             .SetKey("namespace", "label/3")
+                             .SetSchema("Label")
+                             .AddStringProperty("name", "baz")
+                             .AddStringProperty("target", "namespace#label/2")
+                             .SetCreationTimestampMs(10)
+                             .SetTtlMs(0)  // Never expire.
+                             .Build();
+
+  IcingSearchEngineOptions options = GetDefaultIcingOptions();
+  options.set_enable_delete_propagation_from(true);
+  options.set_expired_document_purge_threshold_ms(0);
+
+  {
+    // Initialize Icing and put all documents. Destruct Icing.
+    TestIcingSearchEngine icing(options, std::make_unique<Filesystem>(),
+                                std::make_unique<IcingFilesystem>(),
+                                std::make_unique<FakeClock>(),
+                                GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(label1).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(label2).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(label3).status(), ProtoIsOk());
+  }
+
+  {
+    // Delete term and qualified id join index to trigger index restoration.
+    // Note: we have to create an empty term index back because of the version
+    //   check against FlashIndexStorage magic.
+    std::string idx_subdir = GetIndexDir() + "/idx";
+    ASSERT_TRUE(filesystem()->DeleteDirectoryRecursively(idx_subdir.c_str()));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<Index> index,
+        Index::Create(Index::Options(GetIndexDir(),
+                                     /*index_merge_size=*/100,
+                                     /*lite_index_sort_size=*/50),
+                      filesystem(), icing_filesystem(), feature_flags_.get()));
+    ICING_ASSERT_OK(index->PersistToDisk());
+
+    ASSERT_TRUE(filesystem()->DeleteDirectoryRecursively(
+        GetQualifiedIdJoinIndexDir().c_str()));
+  }
+
+  // Initialize IcingSearchEngine again with the fake clock adjusted to t =
+  // 20000 ms. When rebuilding the index:
+  // - label1 should be skipped since it is expired.
+  // - label2 should fail with non-fatal (or non-internal) error, since its
+  //   parent (label1) is expired.
+  // - label3 could be reindexed, but since its parent (label2) fails to be
+  //   reindexed, it should be deleted due to delete propagation.
+  //
+  // Initialization should succeed with WARNING_DATA_LOSS.
+  auto fake_clock = std::make_unique<FakeClock>();
+  fake_clock->SetTimerElapsedMilliseconds(10);
+  fake_clock->SetSystemTimeMilliseconds(20000);
+  TestIcingSearchEngine icing(options, std::make_unique<Filesystem>(),
+                              std::make_unique<IcingFilesystem>(),
+                              std::move(fake_clock), GetTestJniCache());
+
+  InitializeResultProto initialize_result = icing.Initialize();
+  EXPECT_THAT(initialize_result.status(),
+              ProtoStatusIs(StatusProto::WARNING_DATA_LOSS));
+
+  EXPECT_THAT(
+      initialize_result.initialize_stats().document_store_recovery_cause(),
+      Eq(InitializeStatsProto::NONE));
+  // Term and qualified id join index should be restored.
+  EXPECT_THAT(
+      initialize_result.initialize_stats().index_restoration_latency_ms(),
+      Eq(10));
+  EXPECT_THAT(
+      initialize_result.initialize_stats().num_failed_reindexed_documents(),
+      Eq(1));
+  EXPECT_THAT(initialize_result.initialize_stats().index_restoration_cause(),
+              Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
+  EXPECT_THAT(
+      initialize_result.initialize_stats().integer_index_restoration_cause(),
+      Eq(InitializeStatsProto::NONE));
+  EXPECT_THAT(initialize_result.initialize_stats()
+                  .qualified_id_join_index_restoration_cause(),
+              Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
+  EXPECT_THAT(
+      initialize_result.initialize_stats().embedding_index_restoration_cause(),
+      Eq(InitializeStatsProto::NONE));
+  // needs_persist_type should be set to RECOVERY_PROOF.
+  EXPECT_THAT(initialize_result.needs_persist_type(),
+              Eq(PersistType::RECOVERY_PROOF));
+
+  // ("namespace", "label/2") should be deleted.
+  GetResultProto expected_get_result_proto1;
+  expected_get_result_proto1.mutable_status()->set_code(StatusProto::NOT_FOUND);
+  expected_get_result_proto1.mutable_status()->set_message(
+      "Document (namespace, label/2) not found.");
+  EXPECT_THAT(
+      icing.Get("namespace", "label/2", GetResultSpecProto::default_instance()),
+      EqualsProto(expected_get_result_proto1));
+
+  // ("namespace", "label/3") should be deleted. Although this document should
+  // successfully be reindexed, when "label/2" fails to be reindexed, all
   // of its child documents should be deleted.
   GetResultProto expected_get_result_google::protobuf;
   expected_get_result_google::protobuf.mutable_status()->set_code(StatusProto::NOT_FOUND);
   expected_get_result_google::protobuf.mutable_status()->set_message(
-      "Document (namespace, message/1) not found.");
-  EXPECT_THAT(icing.Get("namespace", "message/1",
-                        GetResultSpecProto::default_instance()),
-              EqualsProto(expected_get_result_google::protobuf));
+      "Document (namespace, label/3) not found.");
+  EXPECT_THAT(
+      icing.Get("namespace", "label/3", GetResultSpecProto::default_instance()),
+      EqualsProto(expected_get_result_google::protobuf));
 }
 
 TEST_F(IcingSearchEngineInitializationTest,
@@ -5349,6 +5656,7 @@ TEST_F(IcingSearchEngineInitializationTest,
                               std::move(fake_clock), GetTestJniCache());
   InitializeResultProto initialize_result_proto = icing.Initialize();
   EXPECT_THAT(initialize_result_proto.status(), ProtoIsOk());
+  EXPECT_FALSE(initialize_result_proto.has_reset());
   EXPECT_THAT(
       initialize_result_proto.initialize_stats().schema_store_recovery_cause(),
       Eq(InitializeStatsProto::NONE));
@@ -5393,6 +5701,7 @@ TEST_F(IcingSearchEngineInitializationTest,
       GetTestJniCache());
   InitializeResultProto initialize_result_google::protobuf = another_icing.Initialize();
   EXPECT_THAT(initialize_result_google::protobuf.status(), ProtoIsOk());
+  EXPECT_FALSE(initialize_result_google::protobuf.has_reset());
   EXPECT_THAT(
       initialize_result_google::protobuf.initialize_stats().schema_store_recovery_cause(),
       Eq(InitializeStatsProto::NONE));
@@ -5478,6 +5787,7 @@ TEST_F(IcingSearchEngineInitializationTest,
     EXPECT_THAT(
         initialize_result_proto.initialize_stats().document_store_data_status(),
         Eq(InitializeStatsProto::PARTIAL_LOSS));
+    EXPECT_FALSE(initialize_result_proto.has_reset());
     // Document store rewinds to previous checkpoint and all derived files were
     // regenerated.
     // - Last stored doc id will be consistent with last added document ids in
@@ -5556,7 +5866,7 @@ TEST_F(IcingSearchEngineInitializationTest,
 
     // Set dirty bit to true to reflect that something changed in the log.
     header.SetDirtyFlag(true);
-    header.UpdateHeaderChecksums(/*enable_new_header_format=*/true);
+    header.UpdateHeaderChecksums();
 
     WriteDocumentLogHeader(*filesystem(), document_log_file, header);
   }
@@ -5572,6 +5882,7 @@ TEST_F(IcingSearchEngineInitializationTest,
                                 std::move(fake_clock), GetTestJniCache());
     InitializeResultProto initialize_result_proto = icing.Initialize();
     EXPECT_THAT(initialize_result_proto.status(), ProtoIsOk());
+    EXPECT_TRUE(initialize_result_proto.has_reset());
     EXPECT_THAT(initialize_result_proto.initialize_stats()
                     .document_store_recovery_cause(),
                 Eq(InitializeStatsProto::DATA_LOSS));
@@ -5652,6 +5963,7 @@ TEST_F(IcingSearchEngineInitializationTest,
                                 std::move(fake_clock), GetTestJniCache());
     InitializeResultProto initialize_result_proto = icing.Initialize();
     EXPECT_THAT(initialize_result_proto.status(), ProtoIsOk());
+    EXPECT_FALSE(initialize_result_proto.has_reset());
     EXPECT_THAT(
         initialize_result_proto.initialize_stats().index_restoration_cause(),
         Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
@@ -5723,6 +6035,7 @@ TEST_F(
                                 std::move(fake_clock), GetTestJniCache());
     InitializeResultProto initialize_result_proto = icing.Initialize();
     EXPECT_THAT(initialize_result_proto.status(), ProtoIsOk());
+    EXPECT_FALSE(initialize_result_proto.has_reset());
     EXPECT_THAT(
         initialize_result_proto.initialize_stats().index_restoration_cause(),
         Eq(InitializeStatsProto::NONE));
@@ -5832,6 +6145,7 @@ TEST_F(
                                 std::move(fake_clock), GetTestJniCache());
     InitializeResultProto initialize_result_proto = icing.Initialize();
     EXPECT_THAT(initialize_result_proto.status(), ProtoIsOk());
+    EXPECT_FALSE(initialize_result_proto.has_reset());
     EXPECT_THAT(
         initialize_result_proto.initialize_stats().index_restoration_cause(),
         Eq(InitializeStatsProto::NONE));
@@ -5928,6 +6242,7 @@ TEST_F(IcingSearchEngineInitializationTest,
                                 std::move(fake_clock), GetTestJniCache());
     InitializeResultProto initialize_result_proto = icing.Initialize();
     EXPECT_THAT(initialize_result_proto.status(), ProtoIsOk());
+    EXPECT_FALSE(initialize_result_proto.has_reset());
 
     // Schema store recovery stats.
     EXPECT_THAT(initialize_result_proto.initialize_stats()
@@ -6141,6 +6456,7 @@ TEST_F(IcingSearchEngineInitializationTest,
     EXPECT_THAT(
         initialize_result_proto.initialize_stats().document_store_data_status(),
         Eq(InitializeStatsProto::NO_DATA_LOSS));
+    EXPECT_FALSE(initialize_result_proto.has_reset());
 
     // Term index recovery stats.
     EXPECT_THAT(
@@ -6648,6 +6964,173 @@ TEST_F(IcingSearchEngineInitializationTest,
 }
 
 TEST_F(IcingSearchEngineInitializationTest,
+       ZeroFilledMagicRecoveryReturnsInternalError) {
+  DocumentProto doc1 = DocumentBuilder()
+                           .SetKey("icing", "email/1")
+                           .SetSchema("Email")
+                           .AddStringProperty("subject", "test subject one")
+                           .AddStringProperty("body", "test body one")
+                           .SetCreationTimestampMs(1000)
+                           .Build();
+  DocumentProto doc2 = DocumentBuilder()
+                           .SetKey("icing", "email/2")
+                           .SetSchema("Email")
+                           .AddStringProperty("subject", "test subject two")
+                           .AddStringProperty("body", "test body two")
+                           .SetCreationTimestampMs(2000)
+                           .Build();
+
+  std::string document_log_path = absl_ports::StrCat(
+      GetDocumentDir(), "/", DocumentLogCreator::GetDocumentLogFilename());
+  int64_t doc2_offset = -1;
+
+  {
+    IcingSearchEngineOptions options = GetDefaultIcingOptions();
+    IcingSearchEngine icing(options, GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(CreateEmailSchema()).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(doc1).status(), ProtoIsOk());
+    doc2_offset = filesystem()->GetFileSize(document_log_path.c_str());
+    ASSERT_THAT(icing.Put(doc2).status(), ProtoIsOk());
+  }
+
+  // Zero-fill metadata of doc2.
+  ScopedFd sfd(filesystem()->OpenForWrite(document_log_path.c_str()));
+  ASSERT_TRUE(sfd.is_valid());
+  uint32_t zero_metadata = 0;
+  filesystem()->PWrite(sfd.get(), doc2_offset, &zero_metadata,
+                       sizeof(zero_metadata));
+  sfd.reset();
+
+  // Corrupt document store header checksum to trigger document store recovery.
+  std::string header_file =
+      absl_ports::StrCat(GetDocumentDir(), "/document_store_header");
+  DocumentStore::Header header;
+  header.magic = DocumentStore::Header::kMagic;
+  header.checksum = 10;
+  filesystem()->DeleteFile(header_file.c_str());
+  filesystem()->Write(header_file.c_str(), &header, sizeof(header));
+
+  // With flag disabled: initialization fails with INTERNAL error.
+  IcingSearchEngineOptions options = GetDefaultIcingOptions();
+  options.set_enable_handle_zero_filled_magic_recovery(false);
+  IcingSearchEngine icing(options, GetTestJniCache());
+  InitializeResultProto init_result = icing.Initialize();
+  EXPECT_THAT(init_result.status(),
+              ProtoStatusIs(StatusProto::INTERNAL));
+}
+
+TEST_F(IcingSearchEngineInitializationTest,
+       ZeroFilledMagicRecoveryTruncatesWhenEnabled) {
+  DocumentProto doc1 = DocumentBuilder()
+                           .SetKey("icing", "email/1")
+                           .SetSchema("Email")
+                           .AddStringProperty("subject", "test subject one")
+                           .AddStringProperty("body", "test body one")
+                           .SetCreationTimestampMs(1000)
+                           .Build();
+  DocumentProto doc2 = DocumentBuilder()
+                           .SetKey("icing", "email/2")
+                           .SetSchema("Email")
+                           .AddStringProperty("subject", "test subject two")
+                           .AddStringProperty("body", "test body two")
+                           .SetCreationTimestampMs(2000)
+                           .Build();
+
+  std::string document_log_path = absl_ports::StrCat(
+      GetDocumentDir(), "/", DocumentLogCreator::GetDocumentLogFilename());
+  int64_t doc2_offset = -1;
+
+  {
+    IcingSearchEngineOptions options = GetDefaultIcingOptions();
+    IcingSearchEngine icing(options, GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(CreateEmailSchema()).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(doc1).status(), ProtoIsOk());
+    doc2_offset = filesystem()->GetFileSize(document_log_path.c_str());
+    ASSERT_THAT(icing.Put(doc2).status(), ProtoIsOk());
+  }
+
+  // Zero-fill metadata of doc2.
+  ScopedFd sfd(filesystem()->OpenForWrite(document_log_path.c_str()));
+  ASSERT_TRUE(sfd.is_valid());
+  uint32_t zero_metadata = 0;
+  filesystem()->PWrite(sfd.get(), doc2_offset, &zero_metadata,
+                       sizeof(zero_metadata));
+  sfd.reset();
+
+  // Corrupt document store header checksum to trigger document store recovery.
+  std::string header_file =
+      absl_ports::StrCat(GetDocumentDir(), "/document_store_header");
+  DocumentStore::Header header;
+  header.magic = DocumentStore::Header::kMagic;
+  header.checksum = 10;
+  filesystem()->DeleteFile(header_file.c_str());
+  filesystem()->Write(header_file.c_str(), &header, sizeof(header));
+
+  // With flag enabled: initialization succeeds with WARNING_DATA_LOSS and
+  // PARTIAL_LOSS.
+  {
+    IcingSearchEngineOptions options = GetDefaultIcingOptions();
+    options.set_enable_handle_zero_filled_magic_recovery(true);
+    IcingSearchEngine icing(options, GetTestJniCache());
+    InitializeResultProto init_result = icing.Initialize();
+    EXPECT_THAT(init_result.status(), ProtoIsOk());
+    EXPECT_THAT(init_result.initialize_stats().document_store_data_status(),
+                Eq(InitializeStatsProto::PARTIAL_LOSS));
+    EXPECT_THAT(init_result.initialize_stats().index_restoration_cause(),
+                Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
+    EXPECT_THAT(
+        init_result.initialize_stats().integer_index_restoration_cause(),
+        Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
+    EXPECT_THAT(
+        init_result.initialize_stats().embedding_index_restoration_cause(),
+        Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
+    EXPECT_THAT(init_result.initialize_stats()
+                    .qualified_id_join_index_restoration_cause(),
+                Eq(InitializeStatsProto::INCONSISTENT_WITH_GROUND_TRUTH));
+
+    // doc1 is still retrievable.
+    EXPECT_THAT(icing.Get(doc1.namespace_(), doc1.uri(),
+                          GetResultSpecProto::default_instance()).document(),
+                EqualsProto(doc1));
+    // doc2 was truncated away.
+    EXPECT_THAT(icing.Get(doc2.namespace_(), doc2.uri(),
+                          GetResultSpecProto::default_instance()).status(),
+                ProtoStatusIs(StatusProto::NOT_FOUND));
+
+    // Document log file size is truncated to doc2_offset.
+    EXPECT_THAT(filesystem()->GetFileSize(document_log_path.c_str()),
+                Eq(doc2_offset));
+
+    // Putting new documents works.
+    DocumentProto doc3 = DocumentBuilder()
+                             .SetKey("icing", "email/3")
+                             .SetSchema("Email")
+                             .AddStringProperty("subject", "test subject three")
+                             .AddStringProperty("body", "test body three")
+                             .SetCreationTimestampMs(3000)
+                             .Build();
+    EXPECT_THAT(icing.Put(doc3).status(), ProtoIsOk());
+    EXPECT_THAT(icing.Get(doc3.namespace_(), doc3.uri(),
+                          GetResultSpecProto::default_instance()).document(),
+                EqualsProto(doc3));
+  }
+
+  // Subsequent initialization after clean shutdown succeeds with OK.
+  {
+    IcingSearchEngineOptions options = GetDefaultIcingOptions();
+    options.set_enable_handle_zero_filled_magic_recovery(true);
+    IcingSearchEngine icing(options, GetTestJniCache());
+    InitializeResultProto init_result = icing.Initialize();
+    EXPECT_THAT(init_result.status(), ProtoIsOk());
+    EXPECT_THAT(icing.Get(doc1.namespace_(), doc1.uri(),
+                          GetResultSpecProto::default_instance()).document(),
+                EqualsProto(doc1));
+  }
+}
+
+TEST_F(IcingSearchEngineInitializationTest,
        InitializeShouldLogRecoveryCauseSchemaStoreIOError) {
   {
     IcingSearchEngine icing(GetDefaultIcingOptions(), GetTestJniCache());
@@ -6908,6 +7391,89 @@ TEST_F(IcingSearchEngineInitializationTest,
 }
 
 TEST_F(IcingSearchEngineInitializationTest,
+       Initialize_shouldResetDatabaseStablenessLogAfterReporting) {
+  auto fake_clock = std::make_unique<FakeClock>();
+  FakeClock* fake_clock_ptr = fake_clock.get();
+  IcingSearchEngineOptions icing_options = GetDefaultIcingOptions();
+
+  TestIcingSearchEngine icing(icing_options, std::make_unique<Filesystem>(),
+                              std::make_unique<IcingFilesystem>(),
+                              std::move(fake_clock), GetTestJniCache());
+
+  fake_clock_ptr->SetSystemTimeMilliseconds(1000);
+  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+  fake_clock_ptr->SetSystemTimeMilliseconds(2000);
+  // Call SetSchema with PersistToDisk.
+  fake_clock_ptr->SetSystemTimeMilliseconds(3000);
+  ASSERT_THAT(icing.SetSchema(CreateMessageSchema()).status(), ProtoIsOk());
+  fake_clock_ptr->SetSystemTimeMilliseconds(4000);
+  ASSERT_THAT(icing.PersistToDisk(PersistType::LITE).status(), ProtoIsOk());
+
+  // Call several write APIs without PersistToDisk.
+  fake_clock_ptr->SetSystemTimeMilliseconds(5000);
+  DocumentProto document =
+      DocumentBuilder()
+          .SetKey("icing", "fake_type/0")
+          .SetSchema("Message")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .AddStringProperty("body", "message body")
+          .AddInt64Property("indexableInteger", 123)
+          .Build();
+  ASSERT_THAT(icing.Put(document).status(), ProtoIsOk());
+
+  fake_clock_ptr->SetSystemTimeMilliseconds(6000);
+  UsageReport usage_report;
+  usage_report.set_document_namespace("icing");
+  usage_report.set_document_uri("fake_type/0");
+  usage_report.set_usage_timestamp_ms(
+      fake_clock_ptr->GetSystemTimeMilliseconds());
+  usage_report.set_usage_type(UsageReport::USAGE_TYPE1);
+  ASSERT_THAT(icing.ReportUsage(usage_report).status(), ProtoIsOk());
+
+  // Initialize the 2nd Icing instance. Database stableness info should be
+  // reported.
+  IcingSearchEngine icing2(icing_options, GetTestJniCache());
+  InitializeResultProto initialize_result_google::protobuf = icing2.Initialize();
+  EXPECT_THAT(initialize_result_google::protobuf.status(), ProtoIsOk());
+  EXPECT_THAT(
+      initialize_result_google::protobuf.initialize_stats().last_persist_to_disk_type(),
+      Eq(PersistType::LITE));
+  EXPECT_THAT(initialize_result_google::protobuf.initialize_stats()
+                  .after_last_flush_full_call_types(),
+              UnorderedElementsAre(
+                  IcingApiCallType::INITIALIZE, IcingApiCallType::SET_SCHEMA,
+                  IcingApiCallType::PUT, IcingApiCallType::REPORT_USAGE));
+  EXPECT_THAT(initialize_result_google::protobuf.initialize_stats()
+                  .after_last_flush_recovery_proof_call_types(),
+              UnorderedElementsAre(
+                  IcingApiCallType::INITIALIZE, IcingApiCallType::SET_SCHEMA,
+                  IcingApiCallType::PUT, IcingApiCallType::REPORT_USAGE));
+  EXPECT_THAT(initialize_result_google::protobuf.initialize_stats()
+                  .after_last_flush_lite_call_types(),
+              UnorderedElementsAre(IcingApiCallType::PUT,
+                                   IcingApiCallType::REPORT_USAGE));
+
+  // Initialize the 3rd Icing instance again. Database stableness info should
+  // be reset after reporting, so there should be no previous persist type
+  // and no previous API calls (except for INITIALIZE).
+  IcingSearchEngine icing3(icing_options, GetTestJniCache());
+  InitializeResultProto initialize_result_proto3 = icing3.Initialize();
+  EXPECT_THAT(initialize_result_proto3.status(), ProtoIsOk());
+  EXPECT_THAT(
+      initialize_result_proto3.initialize_stats().last_persist_to_disk_type(),
+      Eq(PersistType::UNKNOWN));
+  EXPECT_THAT(initialize_result_proto3.initialize_stats()
+                  .after_last_flush_full_call_types(),
+              UnorderedElementsAre(IcingApiCallType::INITIALIZE));
+  EXPECT_THAT(initialize_result_proto3.initialize_stats()
+                  .after_last_flush_recovery_proof_call_types(),
+              UnorderedElementsAre(IcingApiCallType::INITIALIZE));
+  EXPECT_THAT(initialize_result_proto3.initialize_stats()
+                  .after_last_flush_lite_call_types(),
+              UnorderedElementsAre(IcingApiCallType::INITIALIZE));
+}
+
+TEST_F(IcingSearchEngineInitializationTest,
        Initialize_corruptedDatabaseStablenessLogShouldIgnoreError) {
   IcingSearchEngineOptions icing_options = GetDefaultIcingOptions();
 
@@ -6955,138 +7521,6 @@ TEST_F(IcingSearchEngineInitializationTest,
   EXPECT_THAT(initialize_result_proto.initialize_stats()
                   .after_last_flush_recovery_proof_call_types(),
               IsEmpty());
-}
-
-TEST_F(IcingSearchEngineInitializationTest,
-       ProtoLogNewHeaderFormat_switchFlagFromOnToOffShouldDiscardUnsyncedTail) {
-  SchemaProto schema =
-      SchemaBuilder()
-          .AddType(SchemaTypeConfigBuilder().SetType("Person").AddProperty(
-              PropertyConfigBuilder()
-                  .SetName("name")
-                  .SetDataTypeString(TERM_MATCH_PREFIX, TOKENIZER_PLAIN)
-                  .SetCardinality(CARDINALITY_REQUIRED)))
-          .Build();
-
-  DocumentProto document0 =
-      DocumentBuilder()
-          .SetKey("namespace", "uri/0")
-          .SetSchema("Person")
-          .AddStringProperty("name", "person")
-          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
-          .Build();
-  DocumentProto document1 =
-      DocumentBuilder()
-          .SetKey("namespace", "uri/1")
-          .SetSchema("Person")
-          .AddStringProperty("name", "person")
-          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
-          .Build();
-
-  IcingSearchEngineOptions options = GetDefaultIcingOptions();
-  options.set_enable_proto_log_new_header_format(true);
-  IcingSearchEngine icing(options, GetTestJniCache());
-
-  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
-  ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
-
-  // Put document0 and persist to disk.
-  ASSERT_THAT(icing.Put(document0).status(), ProtoIsOk());
-  ASSERT_THAT(icing.PersistToDisk(PersistType::FULL).status(), ProtoIsOk());
-
-  // Put document1 and don't persist to disk.
-  ASSERT_THAT(icing.Put(document1).status(), ProtoIsOk());
-
-  // Initialize another Icing instance with the flag off.
-  IcingSearchEngineOptions another_options = GetDefaultIcingOptions();
-  another_options.set_enable_proto_log_new_header_format(false);
-  IcingSearchEngine another_icing(another_options, GetTestJniCache());
-
-  InitializeResultProto initialize_result = another_icing.Initialize();
-  // Partial data loss should be reported.
-  EXPECT_THAT(initialize_result.initialize_stats().document_store_data_status(),
-              Eq(InitializeStatsProto::PARTIAL_LOSS));
-
-  // Verify that the persisted document can be retrieved.
-  GetResultProto expected_get_result_proto0;
-  expected_get_result_proto0.mutable_status()->set_code(StatusProto::OK);
-  *expected_get_result_proto0.mutable_document() = document0;
-  EXPECT_THAT(another_icing.Get("namespace", "uri/0",
-                                GetResultSpecProto::default_instance()),
-              EqualsProto(expected_get_result_proto0));
-  // Verify that document in the unsynced tail cannot be retrieved.
-  EXPECT_THAT(
-      another_icing
-          .Get("namespace", "uri/1", GetResultSpecProto::default_instance())
-          .status(),
-      ProtoStatusIs(StatusProto::NOT_FOUND));
-}
-
-TEST_F(IcingSearchEngineInitializationTest,
-       ProtoLogNewHeaderFormat_switchFlagOffToOnShouldDiscardUnsyncedTail) {
-  SchemaProto schema =
-      SchemaBuilder()
-          .AddType(SchemaTypeConfigBuilder().SetType("Person").AddProperty(
-              PropertyConfigBuilder()
-                  .SetName("name")
-                  .SetDataTypeString(TERM_MATCH_PREFIX, TOKENIZER_PLAIN)
-                  .SetCardinality(CARDINALITY_REQUIRED)))
-          .Build();
-
-  DocumentProto document0 =
-      DocumentBuilder()
-          .SetKey("namespace", "uri/0")
-          .SetSchema("Person")
-          .AddStringProperty("name", "person")
-          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
-          .Build();
-  DocumentProto document1 =
-      DocumentBuilder()
-          .SetKey("namespace", "uri/1")
-          .SetSchema("Person")
-          .AddStringProperty("name", "person")
-          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
-          .Build();
-
-  IcingSearchEngineOptions options = GetDefaultIcingOptions();
-  options.set_enable_proto_log_new_header_format(false);
-  IcingSearchEngine icing(options, GetTestJniCache());
-
-  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
-  ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
-
-  // Put document0 and persist to disk.
-  ASSERT_THAT(icing.Put(document0).status(), ProtoIsOk());
-  ASSERT_THAT(icing.PersistToDisk(PersistType::FULL).status(), ProtoIsOk());
-
-  // Put document1 and don't persist to disk.
-  ASSERT_THAT(icing.Put(document1).status(), ProtoIsOk());
-
-  // Initialize another Icing instance with the flag off.
-  IcingSearchEngineOptions another_options = GetDefaultIcingOptions();
-  another_options.set_enable_proto_log_new_header_format(true);
-  IcingSearchEngine another_icing(another_options, GetTestJniCache());
-
-  InitializeResultProto initialize_result = another_icing.Initialize();
-  // Partial data loss should be reported.
-  EXPECT_THAT(initialize_result.initialize_stats().document_store_data_status(),
-              Eq(InitializeStatsProto::PARTIAL_LOSS));
-
-  // Verify that the persisted document can be retrieved.
-  GetResultProto expected_get_result_proto0;
-  expected_get_result_proto0.mutable_status()->set_code(StatusProto::OK);
-  *expected_get_result_proto0.mutable_document() = document0;
-  EXPECT_THAT(another_icing.Get("namespace", "uri/0",
-                                GetResultSpecProto::default_instance()),
-              EqualsProto(expected_get_result_proto0));
-  // Verify that document in the unsynced tail cannot be retrieved. Although we
-  // enable the flag, the existing data generated by the flag off instance
-  // cannot be recovered since the unsynced tail checksum doesn't match.
-  EXPECT_THAT(
-      another_icing
-          .Get("namespace", "uri/1", GetResultSpecProto::default_instance())
-          .status(),
-      ProtoStatusIs(StatusProto::NOT_FOUND));
 }
 
 TEST_F(IcingSearchEngineInitializationTest,
@@ -7320,6 +7754,170 @@ TEST_F(IcingSearchEngineInitializationTest,
   EXPECT_THAT(
       icing.Get("namespace", "label/3", GetResultSpecProto::default_instance()),
       EqualsProto(expected_get_result_proto3));
+}
+
+TEST_F(IcingSearchEngineInitializationTest,
+       TermIndexUnnecessaryRecovery_termIndexFlushFixFlagDisabled) {
+  SchemaProto schema =
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder()
+                       .SetType("FakeType")
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("title")
+                                        .SetDataTypeString(TERM_MATCH_EXACT,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("body")
+                                        .SetDataTypeString(TERM_MATCH_EXACT,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build();
+
+  DocumentProto doc0 = DocumentBuilder()
+                           .SetKey("icing", "fake_type/0")
+                           .SetSchema("FakeType")
+                           .AddStringProperty("title", "test title zero")
+                           .AddStringProperty("body", "foo bar baz")
+                           .Build();
+  DocumentProto doc1 = DocumentBuilder()
+                           .SetKey("icing", "fake_type/1")
+                           .SetSchema("FakeType")
+                           .AddStringProperty("title", "test title one")
+                           .AddStringProperty("body", "foo bar baz")
+                           .Build();
+
+  IcingSearchEngineOptions options = GetDefaultIcingOptions();
+  options.set_enable_optimize_improvements(false);
+  options.set_enable_term_index_flush_fix(false);
+
+  IcingSearchEngine icing(options, GetTestJniCache());
+  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+  ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+  // Index doc0 and doc1.
+  ASSERT_THAT(icing.Put(doc0).status(), ProtoIsOk());
+  ASSERT_THAT(icing.Put(doc1).status(), ProtoIsOk());
+
+  // Delete doc0.
+  ASSERT_THAT(icing.Delete(doc0.namespace_(), doc0.uri()).status(),
+              ProtoIsOk());
+  // - Call SetSchema with index incompatible change.
+  // - Term index is reset and rebuilt.
+  SchemaProto index_incompatible_schema =
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder()
+                       .SetType("FakeType")
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("title")
+                                        .SetDataTypeString(TERM_MATCH_PREFIX,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("body")
+                                        .SetDataTypeString(TERM_MATCH_PREFIX,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build();
+  SetSchemaResultProto set_schema_result =
+      icing.SetSchema(index_incompatible_schema);
+  ASSERT_THAT(set_schema_result.status(), ProtoIsOk());
+  ASSERT_THAT(set_schema_result.index_incompatible_changed_schema_types(),
+              UnorderedElementsAre("FakeType"));
+  ASSERT_THAT(set_schema_result.has_term_index_restored(), IsTrue());
+
+  // Call PersistToDisk(RECOVERY_PROOF).
+  ASSERT_THAT(icing.PersistToDisk(PersistType::RECOVERY_PROOF).status(),
+              ProtoIsOk());
+
+  // Initialize another IcingSearchEngine. Even though we called
+  // PersistToDisk(RECOVERY_PROOF), term index was still rebuilt by
+  // another_icing due to term index reset checksum bug.
+  IcingSearchEngine another_icing(options, GetTestJniCache());
+  InitializeResultProto initialize_result = another_icing.Initialize();
+  ASSERT_THAT(initialize_result.status(), ProtoIsOk());
+  ASSERT_THAT(initialize_result.initialize_stats().index_restoration_cause(),
+              Eq(InitializeStatsProto::IO_ERROR));
+}
+
+TEST_F(IcingSearchEngineInitializationTest,
+       TermIndexNoUnnecessaryRecovery_termIndexFlushFixFlagEnabled) {
+  SchemaProto schema =
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder()
+                       .SetType("FakeType")
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("title")
+                                        .SetDataTypeString(TERM_MATCH_EXACT,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("body")
+                                        .SetDataTypeString(TERM_MATCH_EXACT,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build();
+
+  DocumentProto doc0 = DocumentBuilder()
+                           .SetKey("icing", "fake_type/0")
+                           .SetSchema("FakeType")
+                           .AddStringProperty("title", "test title zero")
+                           .AddStringProperty("body", "foo bar baz")
+                           .Build();
+  DocumentProto doc1 = DocumentBuilder()
+                           .SetKey("icing", "fake_type/1")
+                           .SetSchema("FakeType")
+                           .AddStringProperty("title", "test title one")
+                           .AddStringProperty("body", "foo bar baz")
+                           .Build();
+
+  IcingSearchEngineOptions options = GetDefaultIcingOptions();
+  options.set_enable_optimize_improvements(false);
+  options.set_enable_term_index_flush_fix(true);
+
+  IcingSearchEngine icing(options, GetTestJniCache());
+  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+  ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+  // Index doc0 and doc1.
+  ASSERT_THAT(icing.Put(doc0).status(), ProtoIsOk());
+  ASSERT_THAT(icing.Put(doc1).status(), ProtoIsOk());
+
+  // Delete doc0.
+  ASSERT_THAT(icing.Delete(doc0.namespace_(), doc0.uri()).status(),
+              ProtoIsOk());
+  // - Call SetSchema with index incompatible change.
+  // - Term index is reset and rebuilt.
+  SchemaProto index_incompatible_schema =
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder()
+                       .SetType("FakeType")
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("title")
+                                        .SetDataTypeString(TERM_MATCH_PREFIX,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("body")
+                                        .SetDataTypeString(TERM_MATCH_PREFIX,
+                                                           TOKENIZER_PLAIN)
+                                        .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build();
+  SetSchemaResultProto set_schema_result =
+      icing.SetSchema(index_incompatible_schema);
+  ASSERT_THAT(set_schema_result.status(), ProtoIsOk());
+  ASSERT_THAT(set_schema_result.index_incompatible_changed_schema_types(),
+              UnorderedElementsAre("FakeType"));
+  ASSERT_THAT(set_schema_result.has_term_index_restored(), IsTrue());
+
+  // Call PersistToDisk(RECOVERY_PROOF).
+  ASSERT_THAT(icing.PersistToDisk(PersistType::RECOVERY_PROOF).status(),
+              ProtoIsOk());
+
+  // Initialize another IcingSearchEngine. Should not rebuild term index.
+  IcingSearchEngine another_icing(options, GetTestJniCache());
+  InitializeResultProto initialize_result = another_icing.Initialize();
+  ASSERT_THAT(initialize_result.status(), ProtoIsOk());
+  ASSERT_THAT(initialize_result.initialize_stats().index_restoration_cause(),
+              Eq(InitializeStatsProto::NONE));
 }
 
 struct IcingSearchEngineInitializationVersionChangeTestParam {
@@ -8215,6 +8813,10 @@ TEST_P(IcingSearchEngineInitializationSchemaDedupingMigrationTest,
   *all_email_search_result_proto.mutable_results()->Add()->mutable_document() =
       db1_email_doc;
 
+  int32_t previous_version = std::get<0>(GetParam());
+  bool previous_version_has_deduping_enabled = std::get<1>(GetParam());
+  bool current_version_has_deduping_enabled = std::get<2>(GetParam());
+
   {  // Initialize IcingSearchEngine for the first time with deduping enabled
     IcingSearchEngineOptions options = GetDefaultIcingOptions();
     options.set_enable_schema_definition_deduping(true);
@@ -8240,9 +8842,6 @@ TEST_P(IcingSearchEngineInitializationSchemaDedupingMigrationTest,
 
   {  // Initialize IcingSearchEngine for the second time, simulating any version
      // rollback or feature flag flips.
-    int32_t previous_version = std::get<0>(GetParam());
-    bool previous_version_has_deduping_enabled = std::get<1>(GetParam());
-
     IcingSearchEngineOptions options = GetDefaultIcingOptions();
     options.set_enable_schema_definition_deduping(
         previous_version_has_deduping_enabled);
@@ -8342,20 +8941,16 @@ TEST_P(IcingSearchEngineInitializationSchemaDedupingMigrationTest,
     EXPECT_THAT(search_result_proto3,
                 EqualsSearchResultIgnoreStatsAndScores(id_search_result_proto));
 
-    // 5. Verify GetSchema
-    GetSchemaResultProto expected_get_schema_result_proto;
-    expected_get_schema_result_proto.mutable_status()->set_code(
-        StatusProto::OK);
-    *expected_get_schema_result_proto.mutable_schema() = full_schema;
-    EXPECT_THAT(icing.GetSchema(),
-                EqualsProto(expected_get_schema_result_proto));
+    // 5. Verify GetSchema.
+    GetSchemaResultProto get_schema_result = icing.GetSchema();
+    EXPECT_THAT(get_schema_result.status(), ProtoIsOk());
+    EXPECT_THAT(get_schema_result.schema(),
+                EqualsSchemaProtoIgnorePropertiesDigest(full_schema));
   }
 
   {
     // Initialize IcingSearchEngine for the third time using the latest version
     // and the current feature flag.
-    bool current_version_has_deduping_enabled = std::get<2>(GetParam());
-
     IcingSearchEngineOptions options = GetDefaultIcingOptions();
     options.set_enable_schema_definition_deduping(
         current_version_has_deduping_enabled);
@@ -8398,13 +8993,11 @@ TEST_P(IcingSearchEngineInitializationSchemaDedupingMigrationTest,
     EXPECT_THAT(search_result_proto3,
                 EqualsSearchResultIgnoreStatsAndScores(id_search_result_proto));
 
-    // Verify GetSchema
-    GetSchemaResultProto expected_get_schema_result_proto;
-    expected_get_schema_result_proto.mutable_status()->set_code(
-        StatusProto::OK);
-    *expected_get_schema_result_proto.mutable_schema() = full_schema;
-    EXPECT_THAT(icing.GetSchema(),
-                EqualsProto(expected_get_schema_result_proto));
+    // Verify GetSchema.
+    GetSchemaResultProto get_schema_result = icing.GetSchema();
+    EXPECT_THAT(get_schema_result.status(), ProtoIsOk());
+    EXPECT_THAT(get_schema_result.schema(),
+                EqualsSchemaProtoIgnorePropertiesDigest(full_schema));
   }
 }
 
@@ -8595,106 +9188,112 @@ INSTANTIATE_TEST_SUITE_P(
                     std::vector<bool>{true, true, true, true},
                     std::vector<bool>{false, false, false, false}));
 
-class IcingSearchEngineInitializationChangeEnableProtoLogNewHeaderFormatFlagTest
+class IcingSearchEngineInitializationChangePinyinTransliterationFlagTest
     : public IcingSearchEngineInitializationTest,
-      public ::testing::WithParamInterface<std::vector<bool>> {};
+      public ::testing::WithParamInterface<std::tuple<bool, bool>> {};
 
-TEST_P(
-    IcingSearchEngineInitializationChangeEnableProtoLogNewHeaderFormatFlagTest,
-    ChangeFlag) {
-  std::vector<bool> enable_proto_log_new_header_format_flags = GetParam();
+TEST_P(IcingSearchEngineInitializationChangePinyinTransliterationFlagTest,
+       ChangePinyinTransliterationFlagTest) {
+  if (IsCfStringTokenization() || IsReverseJniTokenization()) {
+    GTEST_SKIP() << "Pinyin transliteration requires ICU.";
+  }
 
-  SchemaProto schema =
-      SchemaBuilder()
-          .AddType(SchemaTypeConfigBuilder().SetType("Person").AddProperty(
-              PropertyConfigBuilder()
-                  .SetName("name")
-                  .SetDataTypeString(TERM_MATCH_PREFIX, TOKENIZER_PLAIN)
-                  .SetCardinality(CARDINALITY_REQUIRED)))
-          .Build();
+  bool before_enable_pinyin_transliteration = std::get<0>(GetParam());
+  bool after_enable_pinyin_transliteration = std::get<1>(GetParam());
+  bool flag_changed = before_enable_pinyin_transliteration !=
+                      after_enable_pinyin_transliteration;
 
-  DocumentProto document =
+  DocumentProto document0 =
       DocumentBuilder()
-          .SetKey("namespace", "uri")
-          .SetSchema("Person")
-          .AddStringProperty("name", "person")
+          .SetKey("namespace", "uri0")
+          .SetSchema("Message")
+          .AddStringProperty("body", "每天")
+          .AddInt64Property("indexableInteger", 123)
           .SetCreationTimestampMs(kDefaultCreationTimestampMs)
           .Build();
 
+  // 1. Create an index with the document using
+  // before_enable_pinyin_transliteration.
   {
     IcingSearchEngineOptions options = GetDefaultIcingOptions();
-    options.set_enable_proto_log_new_header_format(
-        enable_proto_log_new_header_format_flags[0]);
-    IcingSearchEngine icing(options, GetTestJniCache());
+    options.set_icu_data_file_absolute_path(
+        GetTestFilePath("icing/icu.dat"));
+    options.set_enable_pinyin_transliteration(
+        before_enable_pinyin_transliteration);
+    TestIcingSearchEngine icing(options, std::make_unique<Filesystem>(),
+                                std::make_unique<IcingFilesystem>(),
+                                std::make_unique<FakeClock>(),
+                                GetTestJniCache());
 
     ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
-    ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
-    ASSERT_THAT(icing.Put(document).status(), ProtoIsOk());
-    ASSERT_THAT(icing.PersistToDisk(PersistType::FULL).status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(CreateMessageSchema()).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(document0).status(), ProtoIsOk());
   }
 
-  // Create icing multiple times with different
-  // enable_proto_log_new_header_format flags.
-  for (int i = 1; i < enable_proto_log_new_header_format_flags.size(); ++i) {
-    // Ensure that persisted data is kept.
-    IcingSearchEngineOptions options = GetDefaultIcingOptions();
-    options.set_enable_proto_log_new_header_format(
-        enable_proto_log_new_header_format_flags[i]);
-    IcingSearchEngine icing(options, GetTestJniCache());
+  // 2. Re-initialize the index with after_enable_pinyin_transliteration.
+  //
+  // Mock filesystem to observe and check the behavior of all indices.
+  auto mock_filesystem = std::make_unique<MockFilesystem>();
+  EXPECT_CALL(*mock_filesystem, DeleteDirectoryRecursively(_))
+      .WillRepeatedly(DoDefault());
+  // Ensure that the term index is rebuilt if the flag is changed.
+  EXPECT_CALL(*mock_filesystem,
+              DeleteDirectoryRecursively(EndsWith("/index_dir")))
+      .Times(flag_changed ? 1 : 0);
 
-    InitializeResultProto initialize_result = icing.Initialize();
-    ASSERT_THAT(initialize_result.status(), ProtoIsOk());
+  IcingSearchEngineOptions options = GetDefaultIcingOptions();
+  options.set_icu_data_file_absolute_path(
+      GetTestFilePath("icing/icu.dat"));
+  options.set_enable_pinyin_transliteration(
+      after_enable_pinyin_transliteration);
+  TestIcingSearchEngine icing(options, std::move(mock_filesystem),
+                              std::make_unique<IcingFilesystem>(),
+                              std::make_unique<FakeClock>(), GetTestJniCache());
+  InitializeResultProto initialize_result = icing.Initialize();
+  ASSERT_THAT(initialize_result.status(), ProtoIsOk());
+  // Ensure that the term index is rebuilt if the flag is changed.
+  EXPECT_THAT(initialize_result.initialize_stats().index_restoration_cause(),
+              Eq(flag_changed ? InitializeStatsProto::FEATURE_FLAG_CHANGED
+                              : InitializeStatsProto::NONE));
+  EXPECT_THAT(
+      initialize_result.initialize_stats().integer_index_restoration_cause(),
+      Eq(InitializeStatsProto::NONE));
+  EXPECT_THAT(initialize_result.initialize_stats()
+                  .qualified_id_join_index_restoration_cause(),
+              Eq(InitializeStatsProto::NONE));
 
-    // No data loss should be reported.
-    EXPECT_THAT(
-        initialize_result.initialize_stats().document_store_data_status(),
-        Eq(InitializeStatsProto::NONE));
+  SearchSpecProto search_spec;
+  search_spec.set_term_match_type(TermMatchType::PREFIX);
 
-    // We don't really care about the derived files recovery cause, but normally
-    // this flag change should not affect derived files recovery, so let's check
-    // it here.
-    EXPECT_THAT(
-        initialize_result.initialize_stats().schema_store_recovery_cause(),
-        Eq(InitializeStatsProto::NONE));
-    EXPECT_THAT(
-        initialize_result.initialize_stats().document_store_recovery_cause(),
-        Eq(InitializeStatsProto::NONE));
-    EXPECT_THAT(initialize_result.initialize_stats().index_restoration_cause(),
-                Eq(InitializeStatsProto::NONE));
-    EXPECT_THAT(
-        initialize_result.initialize_stats().integer_index_restoration_cause(),
-        Eq(InitializeStatsProto::NONE));
-    EXPECT_THAT(initialize_result.initialize_stats()
-                    .qualified_id_join_index_restoration_cause(),
-                Eq(InitializeStatsProto::NONE));
-    EXPECT_THAT(initialize_result.initialize_stats()
-                    .embedding_index_restoration_cause(),
-                Eq(InitializeStatsProto::NONE));
+  // Hanzi query "每天" should always match regardless of the flag.
+  search_spec.set_query("每天");
+  SearchResultProto results = icing.Search(search_spec, GetDefaultScoringSpec(),
+                                           ResultSpecProto::default_instance());
+  EXPECT_THAT(results.status(), ProtoIsOk());
+  ASSERT_THAT(results.results(), SizeIs(1));
+  EXPECT_THAT(results.results(0).document(), EqualsProto(document0));
 
-    // PersistToDisk is not needed.
-    EXPECT_THAT(initialize_result.needs_persist_type(),
-                Eq(PersistType::UNKNOWN));
-
-    // Verify that the persisted document can be retrieved.
-    GetResultProto expected_get_result_proto;
-    expected_get_result_proto.mutable_status()->set_code(StatusProto::OK);
-    *expected_get_result_proto.mutable_document() = document;
-
-    EXPECT_THAT(
-        icing.Get("namespace", "uri", GetResultSpecProto::default_instance()),
-        EqualsProto(expected_get_result_proto));
+  // Pinyin queries should match if and only if
+  // after_enable_pinyin_transliteration is true.
+  for (const std::string& pinyin_query : {"meitian", "mei"}) {
+    search_spec.set_query(pinyin_query);
+    results = icing.Search(search_spec, GetDefaultScoringSpec(),
+                           ResultSpecProto::default_instance());
+    EXPECT_THAT(results.status(), ProtoIsOk());
+    if (after_enable_pinyin_transliteration) {
+      ASSERT_THAT(results.results(), SizeIs(1));
+      EXPECT_THAT(results.results(0).document(), EqualsProto(document0));
+    } else {
+      EXPECT_THAT(results.results(), IsEmpty());
+    }
   }
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    IcingSearchEngineInitializationChangeEnableProtoLogNewHeaderFormatFlagTest,
-    IcingSearchEngineInitializationChangeEnableProtoLogNewHeaderFormatFlagTest,
-    testing::Values(std::vector<bool>{false, true, false, true, false, true},
-                    std::vector<bool>{true, false, true, false, true, false},
-                    std::vector<bool>{false, true, true, true, false, true},
-                    std::vector<bool>{true, false, false, false, true, false},
-                    std::vector<bool>{true, true, true, true},
-                    std::vector<bool>{false, false, false, false}));
+    IcingSearchEngineInitializationChangePinyinTransliterationFlagTest,
+    IcingSearchEngineInitializationChangePinyinTransliterationFlagTest,
+    testing::Values(std::make_tuple(false, false), std::make_tuple(false, true),
+                    std::make_tuple(true, false), std::make_tuple(true, true)));
 
 }  // namespace
 }  // namespace lib

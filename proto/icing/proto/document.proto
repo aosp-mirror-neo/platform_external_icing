@@ -35,7 +35,7 @@ message PutDocumentRequest {
 }
 
 // Defines a unit of data understood by the IcingSearchEngine.
-// Next tag: 10
+// Next tag: 12
 message DocumentProto {
   // REQUIRED: Namespace that this Document resides in.
   // Namespaces can affect read/write permissions.
@@ -51,7 +51,7 @@ message DocumentProto {
   // See icing.lib.SchemaTypeConfigProto.schema_type for details.
   optional string schema = 3;
 
-  // OPTIONAL: Seconds since epoch at which the Document was created.
+  // OPTIONAL: Milliseconds since epoch at which the Document was created.
   // Negative values will lead to validation errors. If not specified, it will
   // default to when the Icing receives the Document.
   optional int64 creation_timestamp_ms = 4;
@@ -84,6 +84,21 @@ message DocumentProto {
     optional int32 length_in_tokens = 1;
   }
   optional InternalFields internal_fields = 9;
+
+  // OPTIONAL: Milliseconds since epoch at which the Document was last written
+  // to Icing. Negative values will lead to validation errors. This field is
+  // populated by Icing on every Put and is strictly increasing across writes.
+  optional int64 last_update_timestamp_ms = 10;
+
+  // OPTIONAL: Milliseconds since epoch at which the Document was first written
+  // to Icing. Negative values will lead to validation errors. This field is
+  // populated by Icing on the first Put for a namespace + uri. On subsequent
+  // Puts for the same namespace + uri:
+  //   - If the existing Document is alive, the value is carried over from it,
+  //     so it stays different from last_update_timestamp_ms.
+  //   - If the existing Document was deleted or has expired, the Put is treated
+  //     as a new insertion and the value is set to last_update_timestamp_ms.
+  optional int64 original_creation_timestamp_ms = 11;
 
   reserved 6;
 }
@@ -142,8 +157,23 @@ message PropertyProto {
   repeated BlobHandleProto blob_handle_values = 9;
 }
 
+// Metadata for documents, grouped by namespace and schema. It is usually used
+// by an API result to report a list of affected documents grouped by namespace
+// and schema.
+//
+// Next tag: 2
+message DocumentGroupInfoProto {
+  // Next tag: 4
+  message GroupEntryProto {
+    optional string schema = 1;
+    optional string name_space = 2;
+    repeated string uris = 3;
+  }
+  repeated GroupEntryProto groups = 1;
+}
+
 // Holds a list of PutResultProto.
-// Next tag: 6
+// Next tag: 8
 message BatchPutResultProto {
   // The overall status of doing the batch put. It is independent of the status
   // of the individual PutResultProtos. E.g. we may still return OK here even if
@@ -163,10 +193,20 @@ message BatchPutResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 5;
+
+  // Size of the PutDocumentRequest request in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 request_bytes = 6;
+
+  // Size of the BatchPutResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 7;
 }
 
 // Result of a call to IcingSearchEngine.Put
-// Next tag: 8
+// Next tag: 10
 message PutResultProto {
   // Status code can be one of:
   //   OK
@@ -208,10 +248,20 @@ message PutResultProto {
   //   status is OK). The caller should ignore this field if the value is 0,
   //   since it is impossible to have a document expires at t = 0.
   optional int64 document_expiration_timestamp_ms = 7;
+
+  // Size of the DocumentProto request in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 request_bytes = 8;
+
+  // Size of the PutResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 9;
 }
 
 // Result of a call to IcingSearchEngine.Get
-// Next tag: 6
+// Next tag: 8
 message GetResultProto {
   // Status code can be one of:
   //   OK
@@ -242,10 +292,20 @@ message GetResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 5;
+
+  // Size of the GetResultSpecProto request in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 request_bytes = 6;
+
+  // Size of the GetResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 7;
 }
 
 // Result of a call to IcingSearchEngine.BatchGet
-// Next tag: 5
+// Next tag: 7
 message BatchGetResultProto {
   optional StatusProto status = 1;
   repeated GetResultProto get_result_protos = 2;
@@ -256,10 +316,20 @@ message BatchGetResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 4;
+
+  // Size of the GetResultSpecProto request in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 request_bytes = 5;
+
+  // Size of the BatchGetResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 6;
 }
 
 // Result of a call to IcingSearchEngine.GetAllNamespaces
-// Next tag: 5
+// Next tag: 6
 message GetAllNamespacesResultProto {
   // Status code can be one of:
   //   OK
@@ -277,10 +347,15 @@ message GetAllNamespacesResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 4;
+
+  // Size of the GetAllNamespacesResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 6;
 }
 
 // Result of a call to IcingSearchEngine.Delete
-// Next tag: 5
+// Next tag: 7
 message DeleteResultProto {
   // Status code can be one of:
   //   OK
@@ -303,10 +378,17 @@ message DeleteResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 4;
+
+  // Size of the DeleteResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 6;
+
+  optional PersistToDiskResultProto persist_to_disk_result_proto = 5;
 }
 
 // Result of a call to IcingSearchEngine.DeleteByNamespace
-// Next tag: 5
+// Next tag: 7
 message DeleteByNamespaceResultProto {
   // Status code can be one of:
   //   OK
@@ -329,10 +411,17 @@ message DeleteByNamespaceResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 4;
+
+  // Size of the DeleteByNamespaceResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 6;
+
+  optional PersistToDiskResultProto persist_to_disk_result_proto = 5;
 }
 
 // Result of a call to IcingSearchEngine.DeleteBySchemaType
-// Next tag: 5
+// Next tag: 7
 message DeleteBySchemaTypeResultProto {
   // Status code can be one of:
   //   OK
@@ -355,10 +444,17 @@ message DeleteBySchemaTypeResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 4;
+
+  // Size of the DeleteBySchemaTypeResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 6;
+
+  optional PersistToDiskResultProto persist_to_disk_result_proto = 5;
 }
 
 // Result of a call to IcingSearchEngine.DeleteByQuery
-// Next tag: 7
+// Next tag: 10
 message DeleteByQueryResultProto {
   // Status code can be one of:
   //   OK
@@ -377,6 +473,8 @@ message DeleteByQueryResultProto {
 
   // Used by DeleteByQueryResultProto to return information about deleted
   // documents.
+  //
+  // TODO(b/512989426): migrate to use DocumentGroupInfoProto.
   message DocumentGroupInfo {
     optional string namespace = 1;
     optional string schema = 2;
@@ -386,6 +484,8 @@ message DeleteByQueryResultProto {
   // Additional return message that shows the uris of the deleted documents, if
   // users set return_deleted_document_info to true.
   // The result is grouped by the corresponding namespace and type.
+  //
+  // TODO(b/512989426): migrate to use DocumentGroupInfoProto.
   repeated DocumentGroupInfo deleted_documents = 4;
 
   reserved 2;
@@ -396,9 +496,21 @@ message DeleteByQueryResultProto {
   // The start time of the binder transaction latency. This is used to measure
   // the latency of passing data from the VM via the binder.
   optional int64 vm_binder_transaction_latency_start_time_ms = 6;
+
+  // Size of the SearchSpecProto request in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 request_bytes = 7;
+
+  // Size of the DeleteByQueryResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 8;
+
+  optional PersistToDiskResultProto persist_to_disk_result_proto = 9;
 }
 
-// Next tag: 6
+// Next tag: 8
 message HandleExpiredDocumentsResultProto {
   // Status code can be one of:
   //   OK
@@ -412,17 +524,7 @@ message HandleExpiredDocumentsResultProto {
   // go/icing-library-apis.
   optional StatusProto status = 1;
 
-  // Metadata for the deleted documents, grouped by namespace and schema.
-  message DocumentGroupInfo {
-    optional string name_space = 1;
-    optional string schema = 2;
-    repeated string uris = 3;
-  }
-  // A list of groups of deleted documents. A document was deleted because:
-  // - It was expired.
-  // - OR it was a child document of an expired document with delete propagation
-  //   enabled.
-  repeated DocumentGroupInfo deleted_documents = 2;
+  reserved 2;
 
   // The number of expired documents that were deleted. This DOES NOT include
   // the propagated child documents.
@@ -434,4 +536,15 @@ message HandleExpiredDocumentsResultProto {
 
   // The expiration timestamp (in milliseconds) of the next expired document.
   optional int64 next_expiration_timestamp_ms = 5;
+
+  // Group info of all deleted documents. A document was deleted because:
+  // - It was expired.
+  // - OR it was a child document of an expired document with delete propagation
+  //   enabled.
+  optional DocumentGroupInfoProto deleted_document_group_info = 6;
+
+  // Size of the HandleExpiredDocumentsResultProto response in bytes.
+  // This field is not populated by libicing and is populated by the
+  // IcingSearchEngine java class.
+  optional int32 response_bytes = 8;
 }

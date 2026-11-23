@@ -16,7 +16,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include "icing/icing-search-engine.h"
@@ -25,6 +27,7 @@
 #include "icing/jni/scoped-utf-chars.h"
 #include "icing/proto/ann.pb.h"
 #include "icing/proto/blob.pb.h"
+#include "icing/proto/change_notification.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/initialize.pb.h"
 #include "icing/proto/optimize.pb.h"
@@ -293,6 +296,34 @@ jbyteArray nativeGetAllNamespaces(JNIEnv* env, jclass clazz, jobject object) {
   return SerializeProtoToJniByteArray(env, get_all_namespaces_result_proto);
 }
 
+// TODO(b/568469783) - pre-register this API explicitly via RegisterNatives
+// in JNI_OnLoad once Jetpack build is dropped back into g3
+JNIEXPORT jbyteArray JNICALL
+Java_com_google_android_icing_IcingSearchEngineImpl_nativeGetDocumentChanges(
+    JNIEnv* env, jclass clazz, jobject object,
+    jbyteArray get_document_changes_request_bytes) {
+  icing::lib::IcingSearchEngine* icing =
+      GetIcingSearchEnginePointer(env, object);
+
+  icing::lib::GetDocumentChangesRequestProto get_document_changes_request;
+  if (!ParseProtoFromJniByteArray(env, get_document_changes_request_bytes,
+                                  &get_document_changes_request)) {
+    ICING_LOG(icing::lib::ERROR)
+        << "Failed to parse GetDocumentChangesRequestProto in "
+           "nativeGetDocumentChanges";
+    return nullptr;
+  }
+  std::unordered_set<std::string> schemas(
+      get_document_changes_request.schema_filters().begin(),
+      get_document_changes_request.schema_filters().end());
+
+  icing::lib::DocumentChangeResponseProto document_change_response_proto =
+      icing->GetDocumentChanges(schemas,
+                                get_document_changes_request.page_token());
+
+  return SerializeProtoToJniByteArray(env, document_change_response_proto);
+}
+
 jbyteArray nativeGetNextPage(JNIEnv* env, jclass clazz, jobject object,
                              jlong next_page_token,
                              jlong java_to_native_start_timestamp_ms) {
@@ -460,6 +491,55 @@ jbyteArray nativeCommitBlob(JNIEnv* env, jclass clazz, jobject object,
 // TODO : b/434206770 - pre-register this API once Jetpack build is dropped back
 // into g3
 JNIEXPORT jbyteArray JNICALL
+Java_com_google_android_icing_IcingSearchEngineImpl_nativeCommitEncryptedBlob(
+    JNIEnv* env, jclass clazz, jobject object, jbyteArray blob_handle_bytes,
+    jbyteArray blob_key_bytes) {
+  icing::lib::IcingSearchEngine* icing =
+      GetIcingSearchEnginePointer(env, object);
+
+  icing::lib::PropertyProto::BlobHandleProto blob_handle;
+  if (!ParseProtoFromJniByteArray(env, blob_handle_bytes, &blob_handle)) {
+    ICING_LOG(icing::lib::ERROR)
+        << "Failed to parse BlobHandle in nativeCommitEncryptedBlob";
+    return nullptr;
+  }
+
+  icing::lib::BlobKeyProto blob_key;
+  if (!ParseProtoFromJniByteArray(env, blob_key_bytes, &blob_key)) {
+    ICING_LOG(icing::lib::ERROR)
+        << "Failed to parse BlobKeyProto in nativeCommitEncryptedBlob";
+    return nullptr;
+  }
+
+  icing::lib::BlobProto blob_result_proto =
+      icing->CommitBlob(blob_handle, std::move(blob_key));
+
+  return SerializeProtoToJniByteArray(env, blob_result_proto);
+}
+
+// TODO : b/434206770 - pre-register this API once Jetpack build is dropped back
+// into g3
+JNIEXPORT jbyteArray JNICALL
+Java_com_google_android_icing_IcingSearchEngineImpl_nativeGetBlobKey(
+    JNIEnv* env, jclass clazz, jobject object, jbyteArray blob_handle_bytes) {
+  icing::lib::IcingSearchEngine* icing =
+      GetIcingSearchEnginePointer(env, object);
+
+  icing::lib::PropertyProto::BlobHandleProto blob_handle;
+  if (!ParseProtoFromJniByteArray(env, blob_handle_bytes, &blob_handle)) {
+    ICING_LOG(icing::lib::ERROR)
+        << "Failed to parse BlobHandle in nativeGetBlobKey";
+    return nullptr;
+  }
+
+  icing::lib::BlobProto blob_result_proto = icing->GetBlobKey(blob_handle);
+
+  return SerializeProtoToJniByteArray(env, blob_result_proto);
+}
+
+// TODO : b/434206770 - pre-register this API once Jetpack build is dropped back
+// into g3
+JNIEXPORT jbyteArray JNICALL
 Java_com_google_android_icing_IcingSearchEngineImpl_nativeGetAllBlobInfos(JNIEnv* env, jclass clazz,
                                                   jobject object) {
   icing::lib::IcingSearchEngine* icing =
@@ -617,6 +697,43 @@ jbyteArray nativeOptimize(JNIEnv* env, jclass clazz, jobject object) {
       GetIcingSearchEnginePointer(env, object);
 
   icing::lib::OptimizeResultProto optimize_result_proto = icing->Optimize();
+
+  return SerializeProtoToJniByteArray(env, optimize_result_proto);
+}
+
+// TODO : b/434206770 - pre-register this API once Jetpack build is dropped back
+// into g3
+JNIEXPORT jbyteArray JNICALL
+Java_com_google_android_icing_IcingSearchEngineImpl_nativeOptimizePrepareDestDirectory(
+    JNIEnv* env, jclass clazz, jobject object) {
+  icing::lib::IcingSearchEngine* icing =
+      GetIcingSearchEnginePointer(env, object);
+
+  icing::lib::OptimizePrepareResultProto optimize_prepare_result_proto =
+      icing->OptimizePrepareDestDirectory();
+
+  return SerializeProtoToJniByteArray(env, optimize_prepare_result_proto);
+}
+
+// TODO : b/434206770 - pre-register this API once Jetpack build is dropped back
+// into g3
+JNIEXPORT jbyteArray JNICALL
+Java_com_google_android_icing_IcingSearchEngineImpl_nativeOptimizeSwapToDestDirectory(
+    JNIEnv* env, jclass clazz, jobject object,
+    jbyteArray optimize_prepare_result_bytes) {
+  icing::lib::IcingSearchEngine* icing =
+      GetIcingSearchEnginePointer(env, object);
+
+  icing::lib::OptimizePrepareResultProto optimize_prepare_result_proto;
+  if (!ParseProtoFromJniByteArray(env, optimize_prepare_result_bytes,
+                                  &optimize_prepare_result_proto)) {
+    ICING_LOG(icing::lib::ERROR)
+        << "Failed to parse OptimizePrepareResultProto in "
+           "nativeOptimizeSwapToDestDirectory";
+    return nullptr;
+  }
+  icing::lib::OptimizeResultProto optimize_result_proto =
+      icing->OptimizeSwapToDestDirectory(optimize_prepare_result_proto);
 
   return SerializeProtoToJniByteArray(env, optimize_result_proto);
 }

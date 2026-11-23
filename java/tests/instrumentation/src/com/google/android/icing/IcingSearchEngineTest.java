@@ -28,8 +28,11 @@ import com.google.android.icing.proto.DeleteByNamespaceResultProto;
 import com.google.android.icing.proto.DeleteByQueryResultProto;
 import com.google.android.icing.proto.DeleteBySchemaTypeResultProto;
 import com.google.android.icing.proto.DeleteResultProto;
+import com.google.android.icing.proto.DocumentChangeResponseProto;
+import com.google.android.icing.proto.DocumentGroupInfoProto;
 import com.google.android.icing.proto.DocumentProto;
 import com.google.android.icing.proto.GetAllNamespacesResultProto;
+import com.google.android.icing.proto.GetDocumentChangesRequestProto;
 import com.google.android.icing.proto.GetNextPageRequestProto;
 import com.google.android.icing.proto.GetOptimizeInfoResultProto;
 import com.google.android.icing.proto.GetResultProto;
@@ -43,6 +46,7 @@ import com.google.android.icing.proto.JoinableConfig;
 import com.google.android.icing.proto.LogSeverity;
 import com.google.android.icing.proto.MaintainAnnIndexOptions;
 import com.google.android.icing.proto.MaintainAnnIndexResultProto;
+import com.google.android.icing.proto.OptimizePrepareResultProto;
 import com.google.android.icing.proto.OptimizeResultProto;
 import com.google.android.icing.proto.PersistToDiskResultProto;
 import com.google.android.icing.proto.PersistType;
@@ -72,7 +76,6 @@ import com.google.android.icing.proto.SuggestionSpecProto;
 import com.google.android.icing.proto.TermMatchType;
 import com.google.android.icing.proto.TermMatchType.Code;
 import com.google.android.icing.proto.UsageReport;
-import com.google.common.collect.ImmutableList;
 import com.google.android.icing.protobuf.ByteString;
 import java.io.File;
 import java.io.FileDescriptor;
@@ -81,7 +84,9 @@ import java.io.FileOutputStream;
 import java.lang.reflect.Field;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import org.junit.After;
@@ -179,6 +184,19 @@ public final class IcingSearchEngineTest {
     MessageDigest messageDigest = MessageDigest.getInstance("SHA-256");
     messageDigest.update(data);
     return messageDigest.digest();
+  }
+
+  /** Gets the document group entry by the given schema and namespace. */
+  private static DocumentGroupInfoProto.GroupEntryProto getDocumentGroupEntry(
+      DocumentGroupInfoProto documentGroupInfo, String schema, String namespace) {
+    for (DocumentGroupInfoProto.GroupEntryProto documentGroupEntry :
+        documentGroupInfo.getGroupsList()) {
+      if (documentGroupEntry.getSchema().equals(schema)
+          && documentGroupEntry.getNameSpace().equals(namespace)) {
+        return documentGroupEntry;
+      }
+    }
+    return null;
   }
 
   @Before
@@ -465,6 +483,8 @@ public final class IcingSearchEngineTest {
     BatchPutResultProto expected =
         BatchPutResultProto.newBuilder()
             .setStatus(StatusProto.newBuilder().setCode(StatusProto.Code.OK))
+            .setRequestBytes(0)
+            .setResponseBytes(11)
             .build();
     assertThat(actualProto).isEqualTo(expected);
 
@@ -928,6 +948,79 @@ public final class IcingSearchEngineTest {
   }
 
   @Test
+  public void testGetDocumentChanges() throws Exception {
+    // Change notifications require offline observers.
+    icingSearchEngine.close();
+    icingSearchEngine =
+        new IcingSearchEngine(
+            IcingSearchEngineOptions.newBuilder()
+                .setBaseDir(tempDir.getCanonicalPath())
+                .setEnableOfflineObservers(true)
+                .build());
+    assertStatusOk(icingSearchEngine.initialize().getStatus());
+
+    SchemaProto schema = SchemaProto.newBuilder().addTypes(createEmailTypeConfig()).build();
+    assertStatusOk(
+        icingSearchEngine
+            .setSchema(schema, /* ignoreErrorsAndDeleteDocuments= */ false)
+            .getStatus());
+
+    // Added documents are returned.
+    assertStatusOk(icingSearchEngine.put(createEmailDocument("namespace", "uri1")).getStatus());
+    assertStatusOk(icingSearchEngine.put(createEmailDocument("namespace", "uri2")).getStatus());
+    DocumentChangeResponseProto addResponse =
+        icingSearchEngine.getDocumentChanges(
+            GetDocumentChangesRequestProto.newBuilder()
+                .setPageToken(
+                    DocumentChangeResponseProto.PaginationToken.newBuilder()
+                        .setLastSyncTimestampMs(0))
+                .build());
+    assertStatusOk(addResponse.getStatus());
+    assertThat(addResponse.getHasMoreChanges()).isFalse();
+    assertThat(addResponse.getDocumentChangeSetsList()).hasSize(1);
+    DocumentChangeResponseProto.DocumentChangeSetProto addChangeSet =
+        addResponse.getDocumentChangeSets(0);
+    assertThat(addChangeSet.getNameSpace()).isEqualTo("namespace");
+    assertThat(addChangeSet.getSchema()).isEqualTo(EMAIL_TYPE);
+    assertThat(getChangedUris(addChangeSet)).containsExactly("uri1", "uri2").inOrder();
+
+    // Updated and deleted documents are returned when retrieving changes after the previous
+    // response's next page token.
+    assertStatusOk(icingSearchEngine.put(createEmailDocument("namespace", "uri1")).getStatus());
+    assertStatusOk(icingSearchEngine.delete("namespace", "uri2").getStatus());
+    DocumentChangeResponseProto updateAndDeleteResponse =
+        icingSearchEngine.getDocumentChanges(
+            GetDocumentChangesRequestProto.newBuilder()
+                .setPageToken(addResponse.getNextPageToken())
+                .build());
+    assertStatusOk(updateAndDeleteResponse.getStatus());
+    assertThat(updateAndDeleteResponse.getHasMoreChanges()).isFalse();
+    assertThat(updateAndDeleteResponse.getDocumentChangeSetsList()).hasSize(1);
+    DocumentChangeResponseProto.DocumentChangeSetProto updateAndDeleteChangeSet =
+        updateAndDeleteResponse.getDocumentChangeSets(0);
+    assertThat(updateAndDeleteChangeSet.getNameSpace()).isEqualTo("namespace");
+    assertThat(updateAndDeleteChangeSet.getSchema()).isEqualTo(EMAIL_TYPE);
+    assertThat(getChangedUris(updateAndDeleteChangeSet))
+        .containsExactly("uri1", "uri2")
+        .inOrder();
+    for (DocumentChangeResponseProto.DocumentChangeSetProto.ChangeToken changeToken :
+        updateAndDeleteChangeSet.getChangeTokensList()) {
+      assertThat(changeToken.getOperationTimestampMs())
+          .isGreaterThan(addResponse.getNextPageToken().getLastSyncTimestampMs());
+    }
+  }
+
+  private static List<String> getChangedUris(
+      DocumentChangeResponseProto.DocumentChangeSetProto changeSet) {
+    List<String> uris = new ArrayList<>();
+    for (DocumentChangeResponseProto.DocumentChangeSetProto.ChangeToken changeToken :
+        changeSet.getChangeTokensList()) {
+      uris.add(changeToken.getUri());
+    }
+    return uris;
+  }
+
+  @Test
   public void testDeleteByNamespace() throws Exception {
     assertStatusOk(icingSearchEngine.initialize().getStatus());
 
@@ -1098,6 +1191,77 @@ public final class IcingSearchEngineTest {
 
     OptimizeResultProto optimizeResultProto = icingSearchEngine.optimize();
     assertStatusOk(optimizeResultProto.getStatus());
+  }
+
+  @Test
+  public void testTwoStageOptimize() throws Exception {
+    assertStatusOk(icingSearchEngine.initialize().getStatus());
+
+    SchemaTypeConfigProto emailTypeConfig = createEmailTypeConfig();
+    SchemaProto schema = SchemaProto.newBuilder().addTypes(emailTypeConfig).build();
+    assertStatusOk(
+        icingSearchEngine
+            .setSchema(schema, /* ignoreErrorsAndDeleteDocuments= */ false)
+            .getStatus());
+    assertStatusOk(icingSearchEngine.put(createEmailDocument("namespace", "uri1")).getStatus());
+    assertStatusOk(icingSearchEngine.put(createEmailDocument("namespace", "uri2")).getStatus());
+    assertStatusOk(icingSearchEngine.delete("namespace", "uri1").getStatus());
+
+    assertStatusOk(icingSearchEngine.persistToDisk(PersistType.Code.FULL).getStatus());
+    OptimizePrepareResultProto optimizePrepareResultProto =
+        icingSearchEngine.optimizePrepareDestDirectory();
+    assertStatusOk(optimizePrepareResultProto.getStatus());
+    assertThat(optimizePrepareResultProto.getResponseBytes()).isGreaterThan(0);
+
+    OptimizeResultProto optimizeResultProto =
+        icingSearchEngine.optimizeSwapToDestDirectory(optimizePrepareResultProto);
+    assertStatusOk(optimizeResultProto.getStatus());
+    assertThat(optimizeResultProto.getResponseBytes()).isGreaterThan(0);
+
+    GetResultProto getResultProto =
+        icingSearchEngine.get("namespace", "uri2", GetResultSpecProto.getDefaultInstance());
+    assertStatusOk(getResultProto.getStatus());
+    assertThat(
+            icingSearchEngine
+                .get("namespace", "uri1", GetResultSpecProto.getDefaultInstance())
+                .getStatus()
+                .getCode())
+        .isEqualTo(StatusProto.Code.NOT_FOUND);
+  }
+
+  @Test
+  public void testTwoStageOptimize_writeAfterPrepare_aborted() throws Exception {
+    assertStatusOk(icingSearchEngine.initialize().getStatus());
+
+    SchemaTypeConfigProto emailTypeConfig = createEmailTypeConfig();
+    SchemaProto schema = SchemaProto.newBuilder().addTypes(emailTypeConfig).build();
+    assertStatusOk(
+        icingSearchEngine
+            .setSchema(schema, /* ignoreErrorsAndDeleteDocuments= */ false)
+            .getStatus());
+    assertStatusOk(icingSearchEngine.put(createEmailDocument("namespace", "uri1")).getStatus());
+
+    assertStatusOk(icingSearchEngine.persistToDisk(PersistType.Code.FULL).getStatus());
+    OptimizePrepareResultProto optimizePrepareResultProto =
+        icingSearchEngine.optimizePrepareDestDirectory();
+    assertStatusOk(optimizePrepareResultProto.getStatus());
+
+    // A write after Stage 1 should make Stage 2 abort.
+    assertStatusOk(icingSearchEngine.put(createEmailDocument("namespace", "uri2")).getStatus());
+
+    OptimizeResultProto optimizeResultProto =
+        icingSearchEngine.optimizeSwapToDestDirectory(optimizePrepareResultProto);
+    assertThat(optimizeResultProto.getStatus().getCode()).isEqualTo(StatusProto.Code.ABORTED);
+
+    // Active storage should be untouched.
+    assertStatusOk(
+        icingSearchEngine
+            .get("namespace", "uri1", GetResultSpecProto.getDefaultInstance())
+            .getStatus());
+    assertStatusOk(
+        icingSearchEngine
+            .get("namespace", "uri2", GetResultSpecProto.getDefaultInstance())
+            .getStatus());
   }
 
   @Test

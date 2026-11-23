@@ -1075,7 +1075,7 @@ class IcingDynamicTrie::Dumper {
     if (storage_->empty()) {
       *pretty_print << "(empty)\n";
     } else {
-      DumpNodeRecursive("", *storage_->GetRootNode(), 0, pretty_print, keys);
+      DumpNodeIterative("", *storage_->GetRootNode(), 0, pretty_print, keys);
     }
   }
 
@@ -1120,43 +1120,77 @@ class IcingDynamicTrie::Dumper {
   //     it could traverse into a deleted subtree, or invalid memory addresses.
   //   - This also means storage_->empty() should be checked before calling this
   //     function with the root node.
-  void DumpNodeRecursive(const std::string &prefix, const Node &node, int level,
-                         std::ostream *ret,
-                         std::vector<std::string> *keys) const {
+  // Note: Refactored from recursive to iterative to prevent stack overflow
+  // on deep tries.
+  void DumpNodeIterative(const std::string& prefix, const Node& node, int level,
+                         std::ostream* ret,
+                         std::vector<std::string>* keys) const {
     // This function should be called only if the node is valid. The first call
     // is always from the root node, so it means the trie should not be empty at
     // this moment. Otherwise (root) node could contain invalid next_index(),
     // is_leaf(), and log2_num_children().
-    if (node.is_leaf()) {
-      // Dump suffix and value.
-      for (int i = 0; i < level; i++) {
-        *ret << ' ';
-      }
-      const char *suffix = storage_->GetSuffix(node.next_index());
-      *ret << suffix;
-      *ret << ' ';
-      *ret << SuffixToValueAsString(suffix);
-      *ret << '\n';
-      keys->push_back(prefix + suffix);
-    } else {
-      // Go through each child (next) node. Print char and recursively
-      // print trie underneath.
-      for (uint32_t i = 0; i < (1U << node.log2_num_children()); i++) {
-        const Next &next = *storage_->GetNext(node.next_index(), i);
-        if (next.node_index() == kInvalidNodeIndex) break;
-        for (int j = 0; j < level; j++) {
+    struct StackFrame {
+      uint32_t node_index;
+      int level;
+      int prefix_len;
+      int val;  // character to print, or -1 for none
+    };
+    std::vector<StackFrame> stack;
+    stack.push_back({storage_->GetNodeIndex(&node), level,
+                     static_cast<int>(prefix.size()), -1});
+
+    std::string current_prefix = prefix;
+    current_prefix.reserve(
+        std::max(current_prefix.size() + 256, static_cast<size_t>(256)));
+
+    while (!stack.empty()) {
+      StackFrame frame = stack.back();
+      stack.pop_back();
+
+      if (frame.val != -1) {
+        current_prefix.resize(frame.prefix_len);
+        if (frame.val != 0) {
+          current_prefix.push_back(frame.val);
+        }
+        for (int j = 0; j < frame.level - 1; j++) {
           *ret << ' ';
         }
-        std::string new_prefix = prefix;
-        if (next.val()) {
-          *ret << static_cast<char>(next.val());
-          new_prefix += next.val();
+        if (frame.val) {
+          *ret << static_cast<char>(frame.val);
         } else {
           *ret << "null";
         }
         *ret << '\n';
-        DumpNodeRecursive(new_prefix, *storage_->GetNode(next.node_index()),
-                          level + 1, ret, keys);
+      }
+
+      const Node& cur_node = *storage_->GetNode(frame.node_index);
+
+      if (cur_node.is_leaf()) {
+        // Dump suffix and value.
+        const char* suffix = storage_->GetSuffix(cur_node.next_index());
+        for (int i = 0; i < frame.level; i++) {
+          *ret << ' ';
+        }
+        *ret << suffix;
+        *ret << ' ';
+        *ret << SuffixToValueAsString(suffix);
+        *ret << '\n';
+        keys->push_back(current_prefix + suffix);
+      } else {
+        // Find count of valid children.
+        uint32_t count = 0;
+        for (; count < (1U << cur_node.log2_num_children()); count++) {
+          const Next& next = *storage_->GetNext(cur_node.next_index(), count);
+          if (next.node_index() == kInvalidNodeIndex) break;
+        }
+
+        // Push children in reverse order.
+        int next_prefix_len = static_cast<int>(current_prefix.size());
+        for (int i = static_cast<int>(count) - 1; i >= 0; i--) {
+          const Next& next = *storage_->GetNext(cur_node.next_index(), i);
+          stack.push_back({next.node_index(), frame.level + 1, next_prefix_len,
+                           next.val()});
+        }
       }
     }
   }
@@ -1455,43 +1489,57 @@ libtextclassifier3::StatusOr<bool> IcingDynamicTrie::empty() const {
   return storage_->empty();
 }
 
-void IcingDynamicTrie::CollectStatsRecursive(const Node &node, Stats *stats,
+void IcingDynamicTrie::CollectStatsIterative(const Node& node, Stats* stats,
                                              uint32_t depth) const {
   // This function should be called only if the node is valid. The first call is
   // always from the root node, so it means the trie should not be empty at this
   // moment. Otherwise (root) node could contain invalid next_index(),
   // is_leaf(), and log2_num_children().
-  if (node.is_leaf()) {
-    stats->num_leaves++;
-    stats->sum_depth += depth;
-    stats->max_depth = std::max(stats->max_depth, depth);
-    const char *suffix = storage_->GetSuffix(node.next_index());
-    stats->suffixes_used += strlen(suffix) + 1 + value_size();
-    if (!suffix[0]) {
-      stats->null_suffixes++;
-    }
-  } else {
-    stats->num_intermediates++;
-    uint32_t i = 0;
-    for (; i < (1U << node.log2_num_children()); i++) {
-      const Next &next = *storage_->GetNext(node.next_index(), i);
-      if (next.node_index() == kInvalidNodeIndex) break;
-      CollectStatsRecursive(*storage_->GetNode(next.node_index()), stats,
-                            depth + 1);
-    }
+  struct StackFrame {
+    uint32_t node_index;
+    uint32_t depth;
+  };
+  std::vector<StackFrame> stack;
+  stack.push_back({storage_->GetNodeIndex(&node), depth});
 
-    // At least one valid node in each next array
-    if (i == 0) {
-      ICING_LOG(ERROR) << "No valid node in 'next' array";
-      return;
-    }
-    stats->sum_children += i;
-    stats->max_children = std::max(stats->max_children, i);
+  while (!stack.empty()) {
+    StackFrame frame = stack.back();
+    stack.pop_back();
 
-    stats->child_counts[i - 1]++;
-    stats->wasted[node.log2_num_children()] +=
-        (1 << node.log2_num_children()) - i;
-    stats->total_wasted += (1 << node.log2_num_children()) - i;
+    const Node& cur_node = *storage_->GetNode(frame.node_index);
+    uint32_t cur_depth = frame.depth;
+
+    if (cur_node.is_leaf()) {
+      stats->num_leaves++;
+      stats->sum_depth += cur_depth;
+      stats->max_depth = std::max(stats->max_depth, cur_depth);
+      const char* suffix = storage_->GetSuffix(cur_node.next_index());
+      stats->suffixes_used += strlen(suffix) + 1 + value_size();
+      if (!suffix[0]) {
+        stats->null_suffixes++;
+      }
+    } else {
+      stats->num_intermediates++;
+      uint32_t i = 0;
+      for (; i < (1U << cur_node.log2_num_children()); i++) {
+        const Next& next = *storage_->GetNext(cur_node.next_index(), i);
+        if (next.node_index() == kInvalidNodeIndex) break;
+        stack.push_back({next.node_index(), cur_depth + 1});
+      }
+
+      // At least one valid node in each next array
+      if (i == 0) {
+        ICING_LOG(ERROR) << "No valid node in 'next' array";
+        continue;
+      }
+      stats->sum_children += i;
+      stats->max_children = std::max(stats->max_children, i);
+
+      stats->child_counts[i - 1]++;
+      stats->wasted[cur_node.log2_num_children()] +=
+          (1 << cur_node.log2_num_children()) - i;
+      stats->total_wasted += (1 << cur_node.log2_num_children()) - i;
+    }
   }
 }
 
@@ -1513,7 +1561,7 @@ void IcingDynamicTrie::CollectStats(Stats *stats) const {
 
   // Stats collected from traversing the trie.
   if (!storage_->empty()) {
-    CollectStatsRecursive(*storage_->GetRootNode(), stats);
+    CollectStatsIterative(*storage_->GetRootNode(), stats);
   }
 
   // Free-list stats.
@@ -1687,7 +1735,8 @@ libtextclassifier3::Status IcingDynamicTrie::Insert(std::string_view key,
   if (!(storage_->nodes_left() >= 2 + key.size() + 1 &&
         storage_->nexts_left() >= 2 + key.size() + 1 + kMaxNextArraySize &&
         storage_->suffixes_left() >= key.size() + 1 + value_size())) {
-    return absl_ports::ResourceExhaustedError("No more space left");
+    return absl_ports::ResourceExhaustedError(
+        "No more resources left for dynamic trie");
   }
 
   uint32_t best_node_index;
@@ -2613,6 +2662,8 @@ libtextclassifier3::StatusOr<Crc32> IcingDynamicTrie::UpdateCrc() {
     return absl_ports::FailedPreconditionError("DynamicTrie not initialized");
   }
 
+  // TODO(b/577213532): investigate MAP_PRIVATE checksum mechanism for all major
+  //   methods of IcingDynamicTrie and fix the bug.
   if (runtime_options_.storage_policy != RuntimeOptions::kMapSharedWithCrc) {
     return Crc32();
   }
@@ -2644,6 +2695,8 @@ libtextclassifier3::StatusOr<Crc32> IcingDynamicTrie::GetCrc() const {
     return absl_ports::FailedPreconditionError("DynamicTrie not initialized");
   }
 
+  // TODO(b/577213532): investigate MAP_PRIVATE checksum mechanism for all major
+  //   methods of IcingDynamicTrie and fix the bug.
   if (runtime_options_.storage_policy != RuntimeOptions::kMapSharedWithCrc) {
     return Crc32();
   }

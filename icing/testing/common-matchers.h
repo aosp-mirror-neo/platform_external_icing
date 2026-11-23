@@ -66,11 +66,28 @@ MATCHER_P2(EqualsToken, type, text, "") {
 }
 
 MATCHER_P(EqualsNormalizedTerm, text, "") {
-  std::string arg_string(arg.text.data(), arg.text.length());
-  if (arg.text != text) {
+  if (arg.text != text || arg.pinyin_term.has_value()) {
     *result_listener << IcingStringUtil::StringPrintf(
-        "(Expected: text=\"%s\". Actual: text=\"%s\")", text,
-        arg_string.c_str());
+        "(Expected: text=\"%s\", pinyin_term=nullopt. Actual: text=\"%s\", "
+        "pinyin_term=%s)",
+        text, arg.text.c_str(),
+        arg.pinyin_term.has_value()
+            ? absl_ports::StrCat("\"", *arg.pinyin_term, "\"").c_str()
+            : "nullopt");
+    return false;
+  }
+  return true;
+}
+
+MATCHER_P2(EqualsNormalizedTerm, text, pinyin_term, "") {
+  if (arg.text != text || arg.pinyin_term != pinyin_term) {
+    *result_listener << IcingStringUtil::StringPrintf(
+        "(Expected: text=\"%s\", pinyin_term=\"%s\". Actual: text=\"%s\", "
+        "pinyin_term=%s)",
+        text, pinyin_term, arg.text.c_str(),
+        arg.pinyin_term.has_value()
+            ? absl_ports::StrCat("\"", *arg.pinyin_term, "\"").c_str()
+            : "nullopt");
     return false;
   }
   return true;
@@ -161,6 +178,22 @@ MATCHER_P5(EqualsDocumentAssociatedScoreData, corpus_id, document_score,
          arg.length_in_tokens() == length_in_tokens &&
          expected_has_valid_scorable_property_cache_index ==
              has_valid_scorable_property_cache_index;
+}
+
+MATCHER_P6(EqualsDocumentAssociatedScoreData, corpus_id, document_score,
+           creation_timestamp_ms, length_in_tokens,
+           has_valid_scorable_property_cache_index,
+           effective_last_update_timestamp_ms, "") {
+  bool expected_has_valid_scorable_property_cache_index =
+      arg.scorable_property_cache_index() != -1;
+  return arg.corpus_id() == corpus_id &&
+         arg.document_score() == document_score &&
+         arg.creation_timestamp_ms() == creation_timestamp_ms &&
+         arg.length_in_tokens() == length_in_tokens &&
+         expected_has_valid_scorable_property_cache_index ==
+             has_valid_scorable_property_cache_index &&
+         arg.effective_last_update_timestamp_ms() ==
+             effective_last_update_timestamp_ms;
 }
 
 MATCHER_P2(EqualsDocumentGroupKey, schema_type_name, name_space, "") {
@@ -365,8 +398,12 @@ MATCHER_P(EqualsSetSchemaResultIgnoringStats, expected, "") {
       actual.schema_types_new_by_name == expected.schema_types_new_by_name &&
       actual.schema_types_changed_fully_compatible_by_name ==
           expected.schema_types_changed_fully_compatible_by_name &&
-      actual.schema_types_index_incompatible_by_name ==
-          expected.schema_types_index_incompatible_by_name &&
+      actual.schema_types_term_index_incompatible_by_name ==
+          expected.schema_types_term_index_incompatible_by_name &&
+      actual.schema_types_integer_index_incompatible_by_name ==
+          expected.schema_types_integer_index_incompatible_by_name &&
+      actual.schema_types_embedding_index_incompatible_by_name ==
+          expected.schema_types_embedding_index_incompatible_by_name &&
       actual.schema_types_join_incompatible_by_name ==
           expected.schema_types_join_incompatible_by_name &&
       actual.schema_types_scorable_property_inconsistent_by_id ==
@@ -452,19 +489,47 @@ MATCHER_P(EqualsSetSchemaResultIgnoringStats, expected, "") {
               expected.schema_types_changed_fully_compatible_by_name, ","),
           "]");
 
-  // Format schema_types_deleted_by_id
-  std::string actual_schema_types_index_incompatible_by_name =
+  // Format schema_types_index_incompatible
+  std::string actual_schema_types_term_index_incompatible_by_name =
       absl_ports::StrCat(
           "[",
-          absl_ports::StrJoin(actual.schema_types_index_incompatible_by_name,
-                              ","),
+          absl_ports::StrJoin(
+              actual.schema_types_term_index_incompatible_by_name, ","),
           "]");
 
-  std::string expected_schema_types_index_incompatible_by_name =
+  std::string expected_schema_types_term_index_incompatible_by_name =
       absl_ports::StrCat(
           "[",
-          absl_ports::StrJoin(expected.schema_types_index_incompatible_by_name,
-                              ","),
+          absl_ports::StrJoin(
+              expected.schema_types_term_index_incompatible_by_name, ","),
+          "]");
+
+  std::string actual_schema_types_integer_index_incompatible_by_name =
+      absl_ports::StrCat(
+          "[",
+          absl_ports::StrJoin(
+              actual.schema_types_integer_index_incompatible_by_name, ","),
+          "]");
+
+  std::string expected_schema_types_integer_index_incompatible_by_name =
+      absl_ports::StrCat(
+          "[",
+          absl_ports::StrJoin(
+              expected.schema_types_integer_index_incompatible_by_name, ","),
+          "]");
+
+  std::string actual_schema_types_embedding_index_incompatible_by_name =
+      absl_ports::StrCat(
+          "[",
+          absl_ports::StrJoin(
+              actual.schema_types_embedding_index_incompatible_by_name, ","),
+          "]");
+
+  std::string expected_schema_types_embedding_index_incompatible_by_name =
+      absl_ports::StrCat(
+          "[",
+          absl_ports::StrJoin(
+              expected.schema_types_embedding_index_incompatible_by_name, ","),
           "]");
 
   // Format schema_types_join_incompatible_by_name
@@ -492,7 +557,9 @@ MATCHER_P(EqualsSetSchemaResultIgnoringStats, expected, "") {
       "\tschema_types_incompatible_by_id=%s\n"
       "\tschema_types_new_by_name=%s,\n"
       "\tschema_types_changed_fully_compatible_by_name=%s\n"
-      "\tschema_types_index_incompatible_by_name=%s,\n"
+      "\tschema_types_term_index_incompatible_by_name=%s,\n"
+      "\tschema_types_integer_index_incompatible_by_name=%s,\n"
+      "\tschema_types_embedding_index_incompatible_by_name=%s,\n"
       "\tschema_types_join_incompatible_by_name=%s\n"
       "}\n"
       "Actual {\n"
@@ -504,7 +571,9 @@ MATCHER_P(EqualsSetSchemaResultIgnoringStats, expected, "") {
       "\tschema_types_incompatible_by_id=%s\n"
       "\tschema_types_new_by_name=%s,\n"
       "\tschema_types_changed_fully_compatible_by_name=%s\n"
-      "\tschema_types_index_incompatible_by_name=%s,\n"
+      "\tschema_types_term_index_incompatible_by_name=%s,\n"
+      "\tschema_types_integer_index_incompatible_by_name=%s,\n"
+      "\tschema_types_embedding_index_incompatible_by_name=%s,\n"
       "\tschema_types_join_incompatible_by_name=%s\n"
       "}\n",
       expected.success, expected_old_schema_type_ids_changed.c_str(),
@@ -514,7 +583,9 @@ MATCHER_P(EqualsSetSchemaResultIgnoringStats, expected, "") {
       expected_schema_types_incompatible_by_id.c_str(),
       expected_schema_types_new_by_name.c_str(),
       expected_schema_types_changed_fully_compatible_by_name.c_str(),
-      expected_schema_types_index_incompatible_by_name.c_str(),
+      expected_schema_types_term_index_incompatible_by_name.c_str(),
+      expected_schema_types_integer_index_incompatible_by_name.c_str(),
+      expected_schema_types_embedding_index_incompatible_by_name.c_str(),
       expected_schema_types_join_incompatible_by_name.c_str(), actual.success,
       actual_old_schema_type_ids_changed.c_str(),
       actual_schema_types_deleted_by_name.c_str(),
@@ -523,7 +594,9 @@ MATCHER_P(EqualsSetSchemaResultIgnoringStats, expected, "") {
       actual_schema_types_incompatible_by_id.c_str(),
       actual_schema_types_new_by_name.c_str(),
       actual_schema_types_changed_fully_compatible_by_name.c_str(),
-      actual_schema_types_index_incompatible_by_name.c_str(),
+      actual_schema_types_term_index_incompatible_by_name.c_str(),
+      actual_schema_types_integer_index_incompatible_by_name.c_str(),
+      actual_schema_types_embedding_index_incompatible_by_name.c_str(),
       actual_schema_types_join_incompatible_by_name.c_str());
   return false;
 }

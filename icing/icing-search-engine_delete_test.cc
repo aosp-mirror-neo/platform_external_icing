@@ -19,19 +19,24 @@
 #include <string>
 #include <thread>  // NOLINT
 #include <utility>
+#include <vector>
 
 #include "icing/text_classifier/lib3/utils/base/status.h"
+#include "icing/text_classifier/lib3/utils/base/statusor.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "icing/absl_ports/str_cat.h"
 #include "icing/document-builder.h"
 #include "icing/file/filesystem.h"
 #include "icing/file/mock-filesystem.h"
+#include "icing/file/portable-file-backed-proto-log.h"
 #include "icing/icing-search-engine.h"
 #include "icing/jni/jni-cache.h"
 #include "icing/portable/endian.h"
 #include "icing/portable/equals-proto.h"
 #include "icing/portable/platform.h"
 #include "icing/proto/debug.pb.h"
+#include "icing/proto/deletion.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/document_wrapper.pb.h"
 #include "icing/proto/initialize.pb.h"
@@ -47,6 +52,8 @@
 #include "icing/proto/term.pb.h"
 #include "icing/proto/usage.pb.h"
 #include "icing/schema-builder.h"
+#include "icing/store/deletion-log-creator.h"
+#include "icing/store/deletion-store.h"
 #include "icing/testing/common-matchers.h"
 #include "icing/testing/fake-clock.h"
 #include "icing/testing/jni-test-helpers.h"
@@ -61,6 +68,8 @@ namespace {
 
 using ::icing::lib::portable_equals_proto::EqualsProto;
 using ::testing::AllOf;
+using ::testing::AnyNumber;
+using ::testing::DoDefault;
 using ::testing::Eq;
 using ::testing::Ge;
 using ::testing::Gt;
@@ -1206,7 +1215,7 @@ TEST_F(IcingSearchEngineDeleteTest,
   EXPECT_THAT(result_proto1.status(), ProtoIsOk());
   EXPECT_THAT(result_proto1.num_expired_documents(), Eq(0));
   EXPECT_THAT(result_proto1.num_propagated_deleted_documents(), Eq(0));
-  EXPECT_THAT(result_proto1.deleted_documents(), IsEmpty());
+  EXPECT_THAT(result_proto1.deleted_document_group_info().groups(), IsEmpty());
   EXPECT_THAT(result_proto1.next_expiration_timestamp_ms(), Eq(1010));
   EXPECT_THAT(
       icing.Get("namespace", "uri", GetResultSpecProto::default_instance()),
@@ -1220,17 +1229,14 @@ TEST_F(IcingSearchEngineDeleteTest,
   EXPECT_THAT(result_google::protobuf.status(), ProtoIsOk());
   EXPECT_THAT(result_google::protobuf.num_expired_documents(), Eq(1));
   EXPECT_THAT(result_google::protobuf.num_propagated_deleted_documents(), Eq(0));
-  EXPECT_THAT(
-      result_google::protobuf.deleted_documents(),
-      UnorderedElementsAre(AllOf(
-          Property(
-              &HandleExpiredDocumentsResultProto::DocumentGroupInfo::name_space,
-              Eq("namespace")),
-          Property(
-              &HandleExpiredDocumentsResultProto::DocumentGroupInfo::schema,
-              Eq("Message")),
-          Property(&HandleExpiredDocumentsResultProto::DocumentGroupInfo::uris,
-                   UnorderedElementsAre("uri")))));
+  EXPECT_THAT(result_google::protobuf.deleted_document_group_info().groups(),
+              UnorderedElementsAre(AllOf(
+                  Property(&DocumentGroupInfoProto::GroupEntryProto::schema,
+                           Eq("Message")),
+                  Property(&DocumentGroupInfoProto::GroupEntryProto::name_space,
+                           Eq("namespace")),
+                  Property(&DocumentGroupInfoProto::GroupEntryProto::uris,
+                           UnorderedElementsAre("uri")))));
   EXPECT_THAT(result_google::protobuf.next_expiration_timestamp_ms(), Eq(-1));
 
   GetResultProto expected_get_result_google::protobuf;
@@ -1421,38 +1427,26 @@ TEST_F(
   EXPECT_THAT(result_proto.num_expired_documents(), Eq(1));
   EXPECT_THAT(result_proto.num_propagated_deleted_documents(), Eq(2));
   EXPECT_THAT(
-      result_proto.deleted_documents(),
+      result_proto.deleted_document_group_info().groups(),
       UnorderedElementsAre(
-          AllOf(
-              Property(&HandleExpiredDocumentsResultProto::DocumentGroupInfo::
-                           name_space,
-                       Eq("namespace")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::schema,
-                  Eq("Person")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::uris,
-                  UnorderedElementsAre("person1"))),
-          AllOf(
-              Property(&HandleExpiredDocumentsResultProto::DocumentGroupInfo::
-                           name_space,
-                       Eq("namespace")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::schema,
-                  Eq("Email")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::uris,
-                  UnorderedElementsAre("email1"))),
-          AllOf(
-              Property(&HandleExpiredDocumentsResultProto::DocumentGroupInfo::
-                           name_space,
-                       Eq("namespace")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::schema,
-                  Eq("Label")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::uris,
-                  UnorderedElementsAre("label1")))));
+          AllOf(Property(&DocumentGroupInfoProto::GroupEntryProto::schema,
+                         Eq("Person")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::name_space,
+                         Eq("namespace")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::uris,
+                         UnorderedElementsAre("person1"))),
+          AllOf(Property(&DocumentGroupInfoProto::GroupEntryProto::schema,
+                         Eq("Email")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::name_space,
+                         Eq("namespace")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::uris,
+                         UnorderedElementsAre("email1"))),
+          AllOf(Property(&DocumentGroupInfoProto::GroupEntryProto::schema,
+                         Eq("Label")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::name_space,
+                         Eq("namespace")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::uris,
+                         UnorderedElementsAre("label1")))));
   EXPECT_THAT(result_proto.next_expiration_timestamp_ms(), Eq(3010));
 
   // Adjust the clock back to 500 ms and verify Get API for email, message and
@@ -1641,28 +1635,20 @@ TEST_F(
   EXPECT_THAT(result_proto.num_expired_documents(), Eq(2));
   EXPECT_THAT(result_proto.num_propagated_deleted_documents(), Eq(2));
   EXPECT_THAT(
-      result_proto.deleted_documents(),
+      result_proto.deleted_document_group_info().groups(),
       UnorderedElementsAre(
-          AllOf(
-              Property(&HandleExpiredDocumentsResultProto::DocumentGroupInfo::
-                           name_space,
-                       Eq("namespace")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::schema,
-                  Eq("Person")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::uris,
-                  UnorderedElementsAre("person1", "person3"))),
-          AllOf(
-              Property(&HandleExpiredDocumentsResultProto::DocumentGroupInfo::
-                           name_space,
-                       Eq("namespace")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::schema,
-                  Eq("Email")),
-              Property(
-                  &HandleExpiredDocumentsResultProto::DocumentGroupInfo::uris,
-                  UnorderedElementsAre("email1", "email3")))));
+          AllOf(Property(&DocumentGroupInfoProto::GroupEntryProto::schema,
+                         Eq("Person")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::name_space,
+                         Eq("namespace")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::uris,
+                         UnorderedElementsAre("person1", "person3"))),
+          AllOf(Property(&DocumentGroupInfoProto::GroupEntryProto::schema,
+                         Eq("Email")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::name_space,
+                         Eq("namespace")),
+                Property(&DocumentGroupInfoProto::GroupEntryProto::uris,
+                         UnorderedElementsAre("email1", "email3")))));
   EXPECT_THAT(result_proto.next_expiration_timestamp_ms(), Eq(1111));
 }
 
@@ -1839,6 +1825,439 @@ TEST_F(
   EXPECT_THAT(
       icing.Get("namespace", "email2", GetResultSpecProto::default_instance()),
       EqualsProto(expected_get_result_proto8));
+}
+
+
+IcingSearchEngineOptions GetOfflineObserverIcingOptions(
+    bool enable_offline_observers) {
+  IcingSearchEngineOptions icing_options = GetDefaultIcingOptions();
+  icing_options.set_enable_offline_observers(enable_offline_observers);
+  return icing_options;
+}
+
+std::string GetDeletionStoreDir() { return GetTestBaseDir() + "/deletion_dir"; }
+
+// Opens the DeletionStore that IcingSearchEngine created. IcingSearchEngine
+// must not be alive.
+libtextclassifier3::StatusOr<std::unique_ptr<DeletionStore>> OpenDeletionStore(
+    const Filesystem* filesystem) {
+  IcingSearchEngineOptions options = GetDefaultIcingOptions();
+  ICING_ASSIGN_OR_RETURN(
+      DeletionStore::CreateResult create_result,
+      DeletionStore::Create(filesystem, GetDeletionStoreDir(),
+                            options.compression_level(),
+                            options.compression_threshold_bytes(),
+                            options.compression_mem_level()));
+  return std::move(create_result.deletion_store);
+}
+
+TEST_F(IcingSearchEngineDeleteTest, DeletePutsDeletionEvents) {
+  SchemaProto schema =
+      SchemaBuilder().AddType(CreateMessageSchemaTypeConfig()).Build();
+  DocumentProto document1 =
+      DocumentBuilder()
+          .SetKey("namespace", "uri1")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body1")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .Build();
+  DocumentProto document2 =
+      DocumentBuilder()
+          .SetKey("namespace", "uri2")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body2")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .Build();
+
+  {
+    auto fake_clock = std::make_unique<FakeClock>();
+    FakeClock* fake_clock_ptr = fake_clock.get();
+    TestIcingSearchEngine icing(
+        GetOfflineObserverIcingOptions(/*enable_offline_observers=*/true),
+        std::make_unique<Filesystem>(), std::make_unique<IcingFilesystem>(),
+        std::move(fake_clock), GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(document1).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(document2).status(), ProtoIsOk());
+    // Replacing a document is not a deletion.
+    ASSERT_THAT(icing.Put(document2).status(), ProtoIsOk());
+
+    fake_clock_ptr->SetSystemTimeMilliseconds(5000);
+    ASSERT_THAT(icing.Delete("namespace", "uri1").status(), ProtoIsOk());
+    fake_clock_ptr->SetSystemTimeMilliseconds(6000);
+    ASSERT_THAT(icing.DeleteByNamespace("namespace").status(), ProtoIsOk());
+  }
+
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             OpenDeletionStore(filesystem()));
+  // Get only returns DeletionEvents of documents that existed as of
+  // timestamp_ms, so query as of a time after the documents were put (the fake
+  // clock starts at 0, so they get timestamps 1-3) and before they were
+  // deleted.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      std::vector<DeletionEvent> deletion_events,
+      deletion_store->Get(/*timestamp_ms=*/4000, /*schemas=*/{}));
+  ASSERT_THAT(deletion_events, SizeIs(2));
+  EXPECT_THAT(deletion_events[0].name_space(), Eq("namespace"));
+  EXPECT_THAT(deletion_events[0].uri(), Eq("uri1"));
+  EXPECT_THAT(deletion_events[0].schema(), Eq("Message"));
+  EXPECT_THAT(deletion_events[0].deletion_timestamp_ms(), Eq(5000));
+  EXPECT_THAT(deletion_events[1].name_space(), Eq("namespace"));
+  EXPECT_THAT(deletion_events[1].uri(), Eq("uri2"));
+  EXPECT_THAT(deletion_events[1].schema(), Eq("Message"));
+  EXPECT_THAT(deletion_events[1].deletion_timestamp_ms(), Eq(6000));
+}
+
+TEST_F(IcingSearchEngineDeleteTest,
+       DeletionStoreIsNotCreatedWhenOfflineObserversDisabled) {
+  SchemaProto schema =
+      SchemaBuilder().AddType(CreateMessageSchemaTypeConfig()).Build();
+  DocumentProto document =
+      DocumentBuilder()
+          .SetKey("namespace", "uri")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .Build();
+
+  IcingSearchEngine icing(
+      GetOfflineObserverIcingOptions(/*enable_offline_observers=*/false),
+      GetTestJniCache());
+  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+  ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+  ASSERT_THAT(icing.Put(document).status(), ProtoIsOk());
+  ASSERT_THAT(icing.Delete("namespace", "uri").status(), ProtoIsOk());
+
+  EXPECT_FALSE(filesystem()->DirectoryExists(GetDeletionStoreDir().c_str()));
+}
+
+TEST_F(IcingSearchEngineDeleteTest,
+       InitializeRecreatesDeletionStoreWhenCreateFails) {
+  SchemaProto schema =
+      SchemaBuilder().AddType(CreateMessageSchemaTypeConfig()).Build();
+  DocumentProto document1 =
+      DocumentBuilder()
+          .SetKey("namespace", "uri1")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body1")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .Build();
+  DocumentProto document2 =
+      DocumentBuilder()
+          .SetKey("namespace", "uri2")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body2")
+          .SetCreationTimestampMs(kDefaultCreationTimestampMs)
+          .Build();
+
+  {
+    auto fake_clock = std::make_unique<FakeClock>();
+    fake_clock->SetSystemTimeMilliseconds(1000);
+    TestIcingSearchEngine icing(
+        GetOfflineObserverIcingOptions(/*enable_offline_observers=*/true),
+        std::make_unique<Filesystem>(), std::make_unique<IcingFilesystem>(),
+        std::move(fake_clock), GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(document1).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(document2).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Delete("namespace", "uri1").status(), ProtoIsOk());
+  }
+
+  // Zero out the metadata of the DeletionEvent, which makes DeletionStore
+  // creation fail with DATA_LOSS.
+  std::string deletion_log_path = absl_ports::StrCat(
+      GetDeletionStoreDir(), "/", DeletionLogCreator::GetDeletionLogFilename());
+  uint32_t zero_metadata = 0;
+  ASSERT_TRUE(filesystem()->PWrite(
+      deletion_log_path.c_str(),
+      PortableFileBackedProtoLog<DeletionEvent>::kHeaderReservedBytes,
+      &zero_metadata, sizeof(zero_metadata)));
+  {
+    IcingSearchEngineOptions options = GetDefaultIcingOptions();
+    auto create_result_or = DeletionStore::Create(
+        filesystem(), GetDeletionStoreDir(), options.compression_level(),
+        options.compression_threshold_bytes(), options.compression_mem_level());
+    ASSERT_THAT(create_result_or,
+                StatusIs(libtextclassifier3::StatusCode::DATA_LOSS));
+  }
+
+  {
+    auto fake_clock = std::make_unique<FakeClock>();
+    fake_clock->SetSystemTimeMilliseconds(5000);
+    TestIcingSearchEngine icing(
+        GetOfflineObserverIcingOptions(/*enable_offline_observers=*/true),
+        std::make_unique<Filesystem>(), std::make_unique<IcingFilesystem>(),
+        std::move(fake_clock), GetTestJniCache());
+    // The DeletionStore is recreated empty, and the rest of Icing is
+    // unaffected.
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    EXPECT_THAT(
+        icing.Get("namespace", "uri1", GetResultSpecProto::default_instance())
+            .status(),
+        ProtoStatusIs(StatusProto::NOT_FOUND));
+    EXPECT_THAT(
+        icing.Get("namespace", "uri2", GetResultSpecProto::default_instance())
+            .status(),
+        ProtoIsOk());
+
+    // New deletions are recorded in the recreated DeletionStore.
+    ASSERT_THAT(icing.Delete("namespace", "uri2").status(), ProtoIsOk());
+  }
+
+  // Only the DeletionEvent put after recreation is in the DeletionStore.
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             OpenDeletionStore(filesystem()));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      std::vector<DeletionEvent> deletion_events,
+      deletion_store->Get(/*timestamp_ms=*/2000, /*schemas=*/{}));
+  ASSERT_THAT(deletion_events, SizeIs(1));
+  EXPECT_THAT(deletion_events[0].uri(), Eq("uri2"));
+}
+
+TEST_F(IcingSearchEngineDeleteTest, OptimizePutsDeletionEventsForExpiredDocs) {
+  SchemaProto schema =
+      SchemaBuilder().AddType(CreateMessageSchemaTypeConfig()).Build();
+  DocumentProto expired_document =
+      DocumentBuilder()
+          .SetKey("namespace", "expired")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body1")
+          .SetCreationTimestampMs(1000)
+          .SetTtlMs(1000)
+          .Build();
+  DocumentProto document =
+      DocumentBuilder()
+          .SetKey("namespace", "alive")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body2")
+          .SetCreationTimestampMs(1000)
+          .Build();
+
+  {
+    auto fake_clock = std::make_unique<FakeClock>();
+    FakeClock* fake_clock_ptr = fake_clock.get();
+    fake_clock_ptr->SetSystemTimeMilliseconds(1000);
+    TestIcingSearchEngine icing(
+        GetOfflineObserverIcingOptions(/*enable_offline_observers=*/true),
+        std::make_unique<Filesystem>(), std::make_unique<IcingFilesystem>(),
+        std::move(fake_clock), GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(expired_document).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(document).status(), ProtoIsOk());
+
+    fake_clock_ptr->SetSystemTimeMilliseconds(10000);
+    ASSERT_THAT(icing.Optimize().status(), ProtoIsOk());
+  }
+
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             OpenDeletionStore(filesystem()));
+  // Get only returns DeletionEvents of documents that existed as of
+  // timestamp_ms, so query as of a time after the documents were put (at 1000)
+  // and before the expired document was purged (at 10000).
+  ICING_ASSERT_OK_AND_ASSIGN(
+      std::vector<DeletionEvent> deletion_events,
+      deletion_store->Get(/*timestamp_ms=*/5000, /*schemas=*/{}));
+  ASSERT_THAT(deletion_events, SizeIs(1));
+  EXPECT_THAT(deletion_events[0].name_space(), Eq("namespace"));
+  EXPECT_THAT(deletion_events[0].uri(), Eq("expired"));
+  EXPECT_THAT(deletion_events[0].schema(), Eq("Message"));
+  EXPECT_THAT(deletion_events[0].deletion_timestamp_ms(), Eq(10000));
+}
+
+TEST_F(IcingSearchEngineDeleteTest,
+       OptimizeFailsAndUninitializesIfDeletionStoreCannotBeReinitialized) {
+  SchemaProto schema =
+      SchemaBuilder().AddType(CreateMessageSchemaTypeConfig()).Build();
+  DocumentProto document =
+      DocumentBuilder()
+          .SetKey("namespace", "uri")
+          .SetSchema("Message")
+          .AddStringProperty("body", "message body")
+          .SetCreationTimestampMs(1000)
+          .Build();
+  const std::string deletion_dir = GetDeletionStoreDir();
+  const std::string deletion_temp_dir = deletion_dir + "_optimize_tmp";
+  // Later than the time to live of DeletionEvents (30 days) after the deletion,
+  // so that optimizing the DeletionStore purges the DeletionEvent.
+  constexpr int64_t kOptimizeTimestampMs = int64_t{31} * 24 * 60 * 60 * 1000;
+
+  {
+    auto mock_filesystem = std::make_unique<MockFilesystem>();
+    MockFilesystem* mock_filesystem_ptr = mock_filesystem.get();
+    auto fake_clock = std::make_unique<FakeClock>();
+    FakeClock* fake_clock_ptr = fake_clock.get();
+    fake_clock_ptr->SetSystemTimeMilliseconds(1000);
+    TestIcingSearchEngine icing(
+        GetOfflineObserverIcingOptions(/*enable_offline_observers=*/true),
+        std::move(mock_filesystem), std::make_unique<IcingFilesystem>(),
+        std::move(fake_clock), GetTestJniCache());
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+    ASSERT_THAT(icing.Put(document).status(), ProtoIsOk());
+    fake_clock_ptr->SetSystemTimeMilliseconds(2000);
+    ASSERT_THAT(icing.Delete("namespace", "uri").status(), ProtoIsOk());
+
+    // Fail swapping the DeletionStore directory as if the deletion directory
+    // was moved away, then fail both restoring and recreating it, so that the
+    // DeletionStore can't be re-initialized. Other calls use the default
+    // action.
+    EXPECT_CALL(*mock_filesystem_ptr, SwapFiles).Times(AnyNumber());
+    EXPECT_CALL(*mock_filesystem_ptr,
+                SwapFiles(StrEq(deletion_temp_dir), StrEq(deletion_dir)))
+        .WillOnce(Return(false));
+    EXPECT_CALL(*mock_filesystem_ptr, DirectoryExists).Times(AnyNumber());
+    EXPECT_CALL(*mock_filesystem_ptr, DirectoryExists(StrEq(deletion_dir)))
+        .WillOnce(Return(false))
+        .WillRepeatedly(DoDefault());
+    EXPECT_CALL(*mock_filesystem_ptr, RenameFile).Times(AnyNumber());
+    EXPECT_CALL(*mock_filesystem_ptr,
+                RenameFile(StrEq(deletion_temp_dir), StrEq(deletion_dir)))
+        .WillOnce(Return(false));
+    EXPECT_CALL(*mock_filesystem_ptr, CreateDirectoryRecursively)
+        .Times(AnyNumber());
+    EXPECT_CALL(*mock_filesystem_ptr,
+                CreateDirectoryRecursively(StrEq(deletion_dir)))
+        .WillOnce(Return(false))
+        .WillRepeatedly(DoDefault());
+
+    fake_clock_ptr->SetSystemTimeMilliseconds(kOptimizeTimestampMs);
+    EXPECT_THAT(icing.Optimize().status(), ProtoStatusIs(StatusProto::INTERNAL));
+
+    // Icing is uninitialized, so it doesn't serve requests with the unusable
+    // DeletionStore.
+    EXPECT_THAT(icing.Put(document).status(),
+                ProtoStatusIs(StatusProto::FAILED_PRECONDITION));
+
+    // Initialize recreates the DeletionStore, after which Icing works again.
+    ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+    DocumentProto new_document = document;
+    new_document.set_creation_timestamp_ms(kOptimizeTimestampMs);
+    ASSERT_THAT(icing.Put(new_document).status(), ProtoIsOk());
+    fake_clock_ptr->SetSystemTimeMilliseconds(kOptimizeTimestampMs + 1000);
+    ASSERT_THAT(icing.Delete("namespace", "uri").status(), ProtoIsOk());
+  }
+
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeletionStore> deletion_store,
+                             OpenDeletionStore(filesystem()));
+  // The swap never happened, so the first DeletionEvent wasn't purged, and the
+  // recreated DeletionStore got the second DeletionEvent.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      std::vector<DeletionEvent> deletion_events,
+      deletion_store->Get(/*timestamp_ms=*/1500, /*schemas=*/{}));
+  ASSERT_THAT(deletion_events, SizeIs(2));
+  EXPECT_THAT(deletion_events[0].deletion_timestamp_ms(), Eq(2000));
+  EXPECT_THAT(deletion_events[1].deletion_timestamp_ms(),
+              Eq(kOptimizeTimestampMs + 1000));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      deletion_events,
+      deletion_store->Get(/*timestamp_ms=*/kOptimizeTimestampMs + 500,
+                          /*schemas=*/{}));
+  ASSERT_THAT(deletion_events, SizeIs(1));
+  EXPECT_THAT(deletion_events[0].deletion_timestamp_ms(),
+              Eq(kOptimizeTimestampMs + 1000));
+}
+
+TEST_F(IcingSearchEngineDeleteTest,
+       OptimizeKeepsIndexInSyncIfDeletionStoreCannotBeReinitialized) {
+  SchemaProto schema =
+      SchemaBuilder().AddType(CreateMessageSchemaTypeConfig()).Build();
+  // Each document has 10 distinct terms, so it adds 10 hits to the LiteIndex.
+  auto create_document = [](int i) {
+    std::string id = std::to_string(i);
+    return DocumentBuilder()
+        .SetKey("namespace", "uri" + id)
+        .SetSchema("Message")
+        .AddStringProperty("body",
+                           "uniqueterm" + id +
+                               " alpha bravo charlie delta echo foxtrot golf "
+                               "hotel india")
+        .SetCreationTimestampMs(1000)
+        .Build();
+  };
+  DocumentProto document0 = create_document(0);
+  DocumentProto document1 = create_document(1);
+  DocumentProto document2 = create_document(2);
+
+  IcingSearchEngineOptions options =
+      GetOfflineObserverIcingOptions(/*enable_offline_observers=*/true);
+  // Merge the LiteIndex into the MainIndex once it has 15 hits (each hit is 9
+  // bytes), i.e. after document1 is indexed. So document0 and document1 are in
+  // the MainIndex, and document2 is in the LiteIndex.
+  options.set_index_merge_size(9 * 15);
+
+  const std::string deletion_dir = GetDeletionStoreDir();
+  const std::string deletion_temp_dir = deletion_dir + "_optimize_tmp";
+  // Later than the time to live of DeletionEvents (30 days) after the deletion,
+  // so that optimizing the DeletionStore purges the DeletionEvent.
+  constexpr int64_t kOptimizeTimestampMs = int64_t{31} * 24 * 60 * 60 * 1000;
+
+  auto mock_filesystem = std::make_unique<MockFilesystem>();
+  MockFilesystem* mock_filesystem_ptr = mock_filesystem.get();
+  auto fake_clock = std::make_unique<FakeClock>();
+  FakeClock* fake_clock_ptr = fake_clock.get();
+  fake_clock_ptr->SetSystemTimeMilliseconds(1000);
+  TestIcingSearchEngine icing(options, std::move(mock_filesystem),
+                              std::make_unique<IcingFilesystem>(),
+                              std::move(fake_clock), GetTestJniCache());
+  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+  ASSERT_THAT(icing.SetSchema(schema).status(), ProtoIsOk());
+  ASSERT_THAT(icing.Put(document0).status(), ProtoIsOk());
+  ASSERT_THAT(icing.Put(document1).status(), ProtoIsOk());
+  ASSERT_THAT(icing.Put(document2).status(), ProtoIsOk());
+  fake_clock_ptr->SetSystemTimeMilliseconds(2000);
+  // Deleting document0 makes Optimize compact the DocumentStore, which remaps
+  // the DocumentIds of document1 and document2.
+  ASSERT_THAT(icing.Delete("namespace", "uri0").status(), ProtoIsOk());
+
+  // Fail optimizing the DeletionStore such that it can't be re-initialized
+  // (see OptimizeFailsAndUninitializesIfDeletionStoreCannotBeReinitialized).
+  EXPECT_CALL(*mock_filesystem_ptr, SwapFiles).Times(AnyNumber());
+  EXPECT_CALL(*mock_filesystem_ptr,
+              SwapFiles(StrEq(deletion_temp_dir), StrEq(deletion_dir)))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*mock_filesystem_ptr, DirectoryExists).Times(AnyNumber());
+  EXPECT_CALL(*mock_filesystem_ptr, DirectoryExists(StrEq(deletion_dir)))
+      .WillOnce(Return(false))
+      .WillRepeatedly(DoDefault());
+  EXPECT_CALL(*mock_filesystem_ptr, RenameFile).Times(AnyNumber());
+  EXPECT_CALL(*mock_filesystem_ptr,
+              RenameFile(StrEq(deletion_temp_dir), StrEq(deletion_dir)))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*mock_filesystem_ptr, CreateDirectoryRecursively)
+      .Times(AnyNumber());
+  EXPECT_CALL(*mock_filesystem_ptr,
+              CreateDirectoryRecursively(StrEq(deletion_dir)))
+      .WillOnce(Return(false))
+      .WillRepeatedly(DoDefault());
+
+  fake_clock_ptr->SetSystemTimeMilliseconds(kOptimizeTimestampMs);
+  EXPECT_THAT(icing.Optimize().status(), ProtoStatusIs(StatusProto::INTERNAL));
+
+  // The DocumentStore was already compacted when optimizing the DeletionStore
+  // failed. Initialize must still leave the indices in sync with it.
+  ASSERT_THAT(icing.Initialize().status(), ProtoIsOk());
+
+  auto search_uris = [&icing](const std::string& query) {
+    SearchSpecProto search_spec;
+    search_spec.set_query(query);
+    search_spec.set_term_match_type(TermMatchType::EXACT_ONLY);
+    SearchResultProto results =
+        icing.Search(search_spec, GetDefaultScoringSpec(),
+                     ResultSpecProto::default_instance());
+    EXPECT_THAT(results.status(), ProtoIsOk());
+    std::vector<std::string> uris;
+    for (const SearchResultProto::ResultProto& result : results.results()) {
+      uris.push_back(result.document().uri());
+    }
+    return uris;
+  };
+  EXPECT_THAT(search_uris("uniqueterm0"), IsEmpty());
+  EXPECT_THAT(search_uris("uniqueterm1"), UnorderedElementsAre("uri1"));
+  EXPECT_THAT(search_uris("uniqueterm2"), UnorderedElementsAre("uri2"));
+  EXPECT_THAT(search_uris("alpha"), UnorderedElementsAre("uri1", "uri2"));
 }
 
 }  // namespace

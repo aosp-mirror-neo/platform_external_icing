@@ -16,6 +16,7 @@ package com.google.android.icing;
 
 import com.google.android.icing.proto.BatchGetResultProto;
 import com.google.android.icing.proto.BatchPutResultProto;
+import com.google.android.icing.proto.BlobKeyProto;
 import com.google.android.icing.proto.BlobProto;
 import com.google.android.icing.proto.DebugInfoResultProto;
 import com.google.android.icing.proto.DebugInfoVerbosity;
@@ -23,8 +24,10 @@ import com.google.android.icing.proto.DeleteByNamespaceResultProto;
 import com.google.android.icing.proto.DeleteByQueryResultProto;
 import com.google.android.icing.proto.DeleteBySchemaTypeResultProto;
 import com.google.android.icing.proto.DeleteResultProto;
+import com.google.android.icing.proto.DocumentChangeResponseProto;
 import com.google.android.icing.proto.DocumentProto;
 import com.google.android.icing.proto.GetAllNamespacesResultProto;
+import com.google.android.icing.proto.GetDocumentChangesRequestProto;
 import com.google.android.icing.proto.GetNextPageRequestProto;
 import com.google.android.icing.proto.GetOptimizeInfoResultProto;
 import com.google.android.icing.proto.GetResultProto;
@@ -37,6 +40,7 @@ import com.google.android.icing.proto.InitializeResultProto;
 import com.google.android.icing.proto.LogSeverity;
 import com.google.android.icing.proto.MaintainAnnIndexOptions;
 import com.google.android.icing.proto.MaintainAnnIndexResultProto;
+import com.google.android.icing.proto.OptimizePrepareResultProto;
 import com.google.android.icing.proto.OptimizeResultProto;
 import com.google.android.icing.proto.PersistToDiskResultProto;
 import com.google.android.icing.proto.PersistType;
@@ -101,15 +105,18 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   @Override
   public @NonNull SetSchemaResultProto setSchema(
       @NonNull SchemaProto schema, boolean ignoreErrorsAndDeleteDocuments) {
+    byte[] schemaBytes = schema.toByteArray();
     return IcingSearchEngineUtils.byteArrayToSetSchemaResultProto(
-        icingSearchEngineImpl.setSchema(schema.toByteArray(), ignoreErrorsAndDeleteDocuments));
+        icingSearchEngineImpl.setSchema(schemaBytes, ignoreErrorsAndDeleteDocuments),
+        schemaBytes.length);
   }
 
   @Override
   public @NonNull SetSchemaResultProto setSchemaWithRequestProto(
       @NonNull SetSchemaRequestProto setSchemaRequest) {
+    byte[] requestBytes = setSchemaRequest.toByteArray();
     return IcingSearchEngineUtils.byteArrayToSetSchemaResultProto(
-        icingSearchEngineImpl.setSchemaWithRequestProto(setSchemaRequest.toByteArray()));
+        icingSearchEngineImpl.setSchemaWithRequestProto(requestBytes), requestBytes.length);
   }
 
   @Override
@@ -134,33 +141,38 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   // it call the batch version.
   @Override
   public @NonNull PutResultProto put(@NonNull DocumentProto document) {
+    byte[] documentBytes = document.toByteArray();
     return IcingSearchEngineUtils.byteArrayToPutResultProto(
-        icingSearchEngineImpl.put(document.toByteArray()));
+        icingSearchEngineImpl.put(documentBytes), documentBytes.length);
   }
 
   @Override
   public @NonNull BatchPutResultProto batchPut(@NonNull PutDocumentRequest documents) {
+    byte[] documentsBytes = documents.toByteArray();
     return IcingSearchEngineUtils.byteArrayToBatchPutResultProto(
-        icingSearchEngineImpl.batchPut(documents.toByteArray()));
+        icingSearchEngineImpl.batchPut(documentsBytes), documentsBytes.length);
   }
 
   @Override
   public @NonNull GetResultProto get(
       @NonNull String namespace, @NonNull String uri, @NonNull GetResultSpecProto getResultSpec) {
+    byte[] getResultSpecBytes = getResultSpec.toByteArray();
     return IcingSearchEngineUtils.byteArrayToGetResultProto(
-        icingSearchEngineImpl.get(namespace, uri, getResultSpec.toByteArray()));
+        icingSearchEngineImpl.get(namespace, uri, getResultSpecBytes), getResultSpecBytes.length);
   }
 
   @Override
   public @NonNull BatchGetResultProto batchGet(@NonNull GetResultSpecProto getResultSpec) {
+    byte[] getResultSpecBytes = getResultSpec.toByteArray();
     return IcingSearchEngineUtils.byteArrayToBatchGetResultProto(
-        icingSearchEngineImpl.batchGet(getResultSpec.toByteArray()));
+        icingSearchEngineImpl.batchGet(getResultSpecBytes), getResultSpecBytes.length);
   }
 
   @Override
   public @NonNull ReportUsageResultProto reportUsage(@NonNull UsageReport usageReport) {
+    byte[] usageReportBytes = usageReport.toByteArray();
     return IcingSearchEngineUtils.byteArrayToReportUsageResultProto(
-        icingSearchEngineImpl.reportUsage(usageReport.toByteArray()));
+        icingSearchEngineImpl.reportUsage(usageReportBytes), usageReportBytes.length);
   }
 
   @Override
@@ -170,26 +182,37 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   }
 
   @Override
+  public @NonNull DocumentChangeResponseProto getDocumentChanges(
+      @NonNull GetDocumentChangesRequestProto getDocumentChangesRequest) {
+    return IcingSearchEngineUtils.byteArrayToDocumentChangeResponseProto(
+        icingSearchEngineImpl.getDocumentChanges(getDocumentChangesRequest.toByteArray()));
+  }
+
+  @Override
   public @NonNull SearchResultProto search(
       @NonNull SearchSpecProto searchSpec,
       @NonNull ScoringSpecProto scoringSpec,
       @NonNull ResultSpecProto resultSpec) {
+    byte[] searchSpecBytes = searchSpec.toByteArray();
+    byte[] scoringSpecBytes = scoringSpec.toByteArray();
+    byte[] resultSpecBytes = resultSpec.toByteArray();
     return IcingSearchEngineUtils.byteArrayToSearchResultProto(
-        icingSearchEngineImpl.search(
-            searchSpec.toByteArray(), scoringSpec.toByteArray(), resultSpec.toByteArray()));
+        icingSearchEngineImpl.search(searchSpecBytes, scoringSpecBytes, resultSpecBytes),
+        searchSpecBytes.length + scoringSpecBytes.length + resultSpecBytes.length);
   }
 
   @Override
   public @NonNull SearchResultProto getNextPage(long nextPageToken) {
     return IcingSearchEngineUtils.byteArrayToSearchResultProto(
-        icingSearchEngineImpl.getNextPage(nextPageToken));
+        icingSearchEngineImpl.getNextPage(nextPageToken), /* requestSize= */ 0);
   }
 
   @Override
   public @NonNull SearchResultProto getNextPage(
       @NonNull GetNextPageRequestProto getNextPageRequest) {
+    byte[] requestBytes = getNextPageRequest.toByteArray();
     return IcingSearchEngineUtils.byteArrayToSearchResultProto(
-        icingSearchEngineImpl.getNextPageWithRequestProto(getNextPageRequest.toByteArray()));
+        icingSearchEngineImpl.getNextPageWithRequestProto(requestBytes), requestBytes.length);
   }
 
   @Override
@@ -206,8 +229,9 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   @Override
   public @NonNull MaintainAnnIndexResultProto maintainAnnIndex(
       @NonNull MaintainAnnIndexOptions options) {
+    byte[] optionsBytes = options.toByteArray();
     return IcingSearchEngineUtils.byteArrayToMaintainAnnIndexResultProto(
-        icingSearchEngineImpl.maintainAnnIndex(options.toByteArray()));
+        icingSearchEngineImpl.maintainAnnIndex(optionsBytes), optionsBytes.length);
   }
 
   @Override
@@ -235,6 +259,21 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   }
 
   @Override
+  public @NonNull BlobProto commitEncryptedBlob(
+      PropertyProto.@NonNull BlobHandleProto blobHandle,
+      @NonNull BlobKeyProto blobKey) {
+    return IcingSearchEngineUtils.byteArrayToBlobProto(
+        icingSearchEngineImpl.commitEncryptedBlob(
+            blobHandle.toByteArray(), blobKey.toByteArray()));
+  }
+
+  @Override
+  public @NonNull BlobProto getBlobKey(PropertyProto.@NonNull BlobHandleProto blobHandle) {
+    return IcingSearchEngineUtils.byteArrayToBlobProto(
+        icingSearchEngineImpl.getBlobKey(blobHandle.toByteArray()));
+  }
+
+  @Override
   public @NonNull BlobProto getAllBlobInfos() {
     return IcingSearchEngineUtils.byteArrayToBlobProto(icingSearchEngineImpl.getAllBlobInfos());
   }
@@ -254,8 +293,9 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   @Override
   public @NonNull SuggestionResponse searchSuggestions(
       @NonNull SuggestionSpecProto suggestionSpec) {
+    byte[] suggestionSpecBytes = suggestionSpec.toByteArray();
     return IcingSearchEngineUtils.byteArrayToSuggestionResponse(
-        icingSearchEngineImpl.searchSuggestions(suggestionSpec.toByteArray()));
+        icingSearchEngineImpl.searchSuggestions(suggestionSpecBytes), suggestionSpecBytes.length);
   }
 
   @Override
@@ -278,8 +318,10 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   @Override
   public @NonNull DeleteByQueryResultProto deleteByQuery(
       @NonNull SearchSpecProto searchSpec, boolean returnDeletedDocumentInfo) {
+    byte[] searchSpecBytes = searchSpec.toByteArray();
     return IcingSearchEngineUtils.byteArrayToDeleteByQueryResultProto(
-        icingSearchEngineImpl.deleteByQuery(searchSpec.toByteArray(), returnDeletedDocumentInfo));
+        icingSearchEngineImpl.deleteByQuery(searchSpecBytes, returnDeletedDocumentInfo),
+        searchSpecBytes.length);
   }
 
   @Override
@@ -292,6 +334,19 @@ public class IcingSearchEngine implements IcingSearchEngineInterface {
   @Override
   public @NonNull OptimizeResultProto optimize() {
     return IcingSearchEngineUtils.byteArrayToOptimizeResultProto(icingSearchEngineImpl.optimize());
+  }
+
+  @Override
+  public @NonNull OptimizePrepareResultProto optimizePrepareDestDirectory() {
+    return IcingSearchEngineUtils.byteArrayToOptimizePrepareResultProto(
+        icingSearchEngineImpl.optimizePrepareDestDirectory());
+  }
+
+  @Override
+  public @NonNull OptimizeResultProto optimizeSwapToDestDirectory(
+      @NonNull OptimizePrepareResultProto optimizePrepareResult) {
+    return IcingSearchEngineUtils.byteArrayToOptimizeResultProto(
+        icingSearchEngineImpl.optimizeSwapToDestDirectory(optimizePrepareResult.toByteArray()));
   }
 
   @Override

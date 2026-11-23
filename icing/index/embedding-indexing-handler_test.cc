@@ -62,6 +62,7 @@ namespace {
 using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::FloatNear;
+using ::testing::HasSubstr;
 using ::testing::IsEmpty;
 using ::testing::IsTrue;
 using ::testing::Pointwise;
@@ -118,7 +119,8 @@ static constexpr SectionId kSectionIdFullDocEmbedding = 7;
 
 constexpr float kEpsQuantized = 0.01f;
 
-class EmbeddingIndexingHandlerTest : public ::testing::Test {
+class EmbeddingIndexingHandlerTest : public ::testing::Test,
+                                     public EmbeddingIndexTestPeer {
  protected:
   void SetUp() override {
     feature_flags_ = std::make_unique<FeatureFlags>(GetTestFeatureFlags());
@@ -358,7 +360,7 @@ TEST_F(EmbeddingIndexingHandlerTest, HandleEmbeddingSection) {
   EXPECT_THAT(GetRawEmbeddingDataFromIndex(embedding_index_.get(), shard_id),
               ElementsAre(0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.1, 0.2, 0.3));
   // Check quantized embedding data
-  EXPECT_THAT(embedding_index_->GetTotalQuantizedVectorSize(shard_id),
+  EXPECT_THAT(GetTotalQuantizedVectorSize(embedding_index_.get(), shard_id),
               Eq(6 + 2 * sizeof(Quantizer)));
   EXPECT_THAT(
       GetAndRestoreQuantizedEmbeddingVectorFromIndex(
@@ -387,7 +389,7 @@ TEST_F(EmbeddingIndexingHandlerTest, HandleEmbeddingSection) {
   EXPECT_THAT(
       GetRawEmbeddingDataFromIndex(embedding_index_.get(), ann_shard_id),
       ElementsAre(0.1, 0.2, 0.3));
-  EXPECT_THAT(embedding_index_->GetTotalQuantizedVectorSize(ann_shard_id),
+  EXPECT_THAT(GetTotalQuantizedVectorSize(embedding_index_.get(), ann_shard_id),
               Eq(3 + sizeof(Quantizer)));
   EXPECT_THAT(
       GetAndRestoreQuantizedEmbeddingVectorFromIndex(
@@ -529,7 +531,7 @@ TEST_F(EmbeddingIndexingHandlerTest, HandleNestedEmbeddingSection) {
       GetRawEmbeddingDataFromIndex(embedding_index_.get(), shard_id),
       ElementsAre(0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.1, 0.2, 0.3, 2.1, 2.2, 2.3));
   // Check quantized embedding data
-  EXPECT_THAT(embedding_index_->GetTotalQuantizedVectorSize(shard_id),
+  EXPECT_THAT(GetTotalQuantizedVectorSize(embedding_index_.get(), shard_id),
               Eq(6 + 2 * sizeof(Quantizer)));
   EXPECT_THAT(
       GetAndRestoreQuantizedEmbeddingVectorFromIndex(
@@ -559,7 +561,7 @@ TEST_F(EmbeddingIndexingHandlerTest, HandleNestedEmbeddingSection) {
   EXPECT_THAT(
       GetRawEmbeddingDataFromIndex(embedding_index_.get(), ann_shard_id),
       ElementsAre(0.1, 0.2, 0.3));
-  EXPECT_THAT(embedding_index_->GetTotalQuantizedVectorSize(ann_shard_id),
+  EXPECT_THAT(GetTotalQuantizedVectorSize(embedding_index_.get(), ann_shard_id),
               Eq(3 + sizeof(Quantizer)));
   EXPECT_THAT(
       GetAndRestoreQuantizedEmbeddingVectorFromIndex(
@@ -632,7 +634,7 @@ TEST_F(EmbeddingIndexingHandlerTest,
   EXPECT_THAT(GetEmbeddingHitsFromIndex(embedding_index_.get(), /*dimension=*/3,
                                         /*model_signature=*/"model"),
               IsOkAndHolds(IsEmpty()));
-  EXPECT_TRUE(embedding_index_->is_empty());
+  EXPECT_TRUE(is_empty(embedding_index_.get()));
   EXPECT_THAT(GetRawEmbeddingDataFromIndex(embedding_index_.get(), shard_id),
               IsEmpty());
   EXPECT_THAT(GetEmbeddingHitsFromIndex(
@@ -656,7 +658,7 @@ TEST_F(EmbeddingIndexingHandlerTest,
   EXPECT_THAT(GetEmbeddingHitsFromIndex(embedding_index_.get(), /*dimension=*/3,
                                         /*model_signature=*/"model"),
               IsOkAndHolds(IsEmpty()));
-  EXPECT_TRUE(embedding_index_->is_empty());
+  EXPECT_TRUE(is_empty(embedding_index_.get()));
   EXPECT_THAT(GetRawEmbeddingDataFromIndex(embedding_index_.get(), shard_id),
               IsEmpty());
   EXPECT_THAT(GetEmbeddingHitsFromIndex(
@@ -727,7 +729,7 @@ TEST_F(EmbeddingIndexingHandlerTest,
   EXPECT_THAT(GetEmbeddingHitsFromIndex(embedding_index_.get(), /*dimension=*/3,
                                         /*model_signature=*/"model"),
               IsOkAndHolds(IsEmpty()));
-  EXPECT_TRUE(embedding_index_->is_empty());
+  EXPECT_TRUE(is_empty(embedding_index_.get()));
   EXPECT_THAT(GetRawEmbeddingDataFromIndex(embedding_index_.get(), shard_id),
               IsEmpty());
   EXPECT_THAT(GetEmbeddingHitsFromIndex(
@@ -754,7 +756,7 @@ TEST_F(EmbeddingIndexingHandlerTest,
   EXPECT_THAT(GetEmbeddingHitsFromIndex(embedding_index_.get(), /*dimension=*/3,
                                         /*model_signature=*/"model"),
               IsOkAndHolds(IsEmpty()));
-  EXPECT_TRUE(embedding_index_->is_empty());
+  EXPECT_TRUE(is_empty(embedding_index_.get()));
   EXPECT_THAT(GetRawEmbeddingDataFromIndex(embedding_index_.get(), shard_id),
               IsEmpty());
   EXPECT_THAT(GetEmbeddingHitsFromIndex(
@@ -873,7 +875,7 @@ TEST_F(EmbeddingIndexingHandlerTest,
   EXPECT_THAT(
       GetRawEmbeddingDataFromIndex(embedding_index_.get(), ann_shard_id),
       ElementsAre(0.1, 0.2, 0.3));
-  EXPECT_THAT(embedding_index_->GetTotalQuantizedVectorSize(ann_shard_id),
+  EXPECT_THAT(GetTotalQuantizedVectorSize(embedding_index_.get(), ann_shard_id),
               Eq(3 + sizeof(Quantizer)));
   EXPECT_THAT(
       GetAndRestoreQuantizedEmbeddingVectorFromIndex(
@@ -918,7 +920,7 @@ TEST_F(EmbeddingIndexingHandlerTest,
   EXPECT_THAT(
       GetRawEmbeddingDataFromIndex(embedding_index_.get(), ann_shard_id),
       ElementsAre(0.1, 0.2, 0.3));
-  EXPECT_THAT(embedding_index_->GetTotalQuantizedVectorSize(ann_shard_id),
+  EXPECT_THAT(GetTotalQuantizedVectorSize(embedding_index_.get(), ann_shard_id),
               Eq(3 + sizeof(Quantizer)));
   EXPECT_THAT(
       GetAndRestoreQuantizedEmbeddingVectorFromIndex(
@@ -962,7 +964,7 @@ TEST_F(EmbeddingIndexingHandlerTest,
   EXPECT_THAT(
       GetRawEmbeddingDataFromIndex(embedding_index_.get(), ann_shard_id),
       ElementsAre(0.1, 0.2, 0.3));
-  EXPECT_THAT(embedding_index_->GetTotalQuantizedVectorSize(ann_shard_id),
+  EXPECT_THAT(GetTotalQuantizedVectorSize(embedding_index_.get(), ann_shard_id),
               Eq(3 + sizeof(Quantizer)));
   EXPECT_THAT(
       GetAndRestoreQuantizedEmbeddingVectorFromIndex(
@@ -971,6 +973,50 @@ TEST_F(EmbeddingIndexingHandlerTest,
           /*schema_name=*/kFakeType,
           /*cluster_id=*/embedding_util::kIvfDeltaStoreClusterId),
       IsOkAndHolds(Pointwise(FloatNear(kEpsQuantized), {0.11, 0.22, 0.33})));
+}
+
+TEST_F(EmbeddingIndexingHandlerTest,
+       HandleUnsupportedEmbeddingIndexingTypeShouldReturnInvalidArgumentError) {
+  class TestTokenizedDocument : public TokenizedDocument {
+   public:
+    explicit TestTokenizedDocument(
+        std::unique_ptr<DocumentWrapper> document_wrapper,
+        std::vector<Section<PropertyProto::VectorProto>>&& vector_sections)
+        : TokenizedDocument(std::move(document_wrapper),
+                            /*tokenized_string_sections=*/{},
+                            /*integer_sections=*/{}, std::move(vector_sections),
+                            JoinablePropertyGroup()) {}
+  };
+
+  auto document_wrapper = std::make_unique<DocumentWrapper>();
+  *document_wrapper->mutable_document() = DocumentBuilder()
+                                              .SetKey("icing", "fake_type/1")
+                                              .SetSchema(std::string(kFakeType))
+                                              .Build();
+
+  SectionMetadata metadata(
+      /*id_in=*/kSectionIdBodyEmbedding, TYPE_VECTOR, TOKENIZER_NONE,
+      TERM_MATCH_UNKNOWN, NUMERIC_MATCH_UNKNOWN, EMBEDDING_INDEXING_UNKNOWN,
+      QUANTIZATION_TYPE_NONE, std::string(kPropertyBodyEmbedding));
+  std::vector<PropertyProto::VectorProto> vectors = {
+      CreateVector("model", {0.1, 0.2, 0.3})};
+  std::vector<Section<PropertyProto::VectorProto>> vector_sections;
+  vector_sections.push_back(Section<PropertyProto::VectorProto>(
+      std::move(metadata), std::move(vectors)));
+
+  TestTokenizedDocument tokenized_document(std::move(document_wrapper),
+                                           std::move(vector_sections));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<EmbeddingIndexingHandler> handler,
+      EmbeddingIndexingHandler::Create(&fake_clock_, embedding_index_.get()));
+
+  EXPECT_THAT(
+      handler->Handle(tokenized_document, /*document_id=*/0,
+                      /*old_document_id=*/kInvalidDocumentId,
+                      /*recovery_mode=*/false, /*put_document_stats=*/nullptr),
+      StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT,
+               HasSubstr("Unsupported embedding indexing type")));
 }
 
 }  // namespace lib
