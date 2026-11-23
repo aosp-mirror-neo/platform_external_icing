@@ -696,7 +696,8 @@ IcingSearchEngine::IcingSearchEngine(
                      options_.enable_pinyin_transliteration(),
                      options_.enable_term_index_flush_fix(),
                      options_.enable_offline_observers(),
-                     options_.enable_handle_zero_filled_magic_recovery()),
+                     options_.enable_handle_zero_filled_magic_recovery(),
+                     options_.enable_proto_log_compression_mem_level()),
       filesystem_(std::move(filesystem)),
       icing_filesystem_(std::move(icing_filesystem)),
       clock_(std::move(clock)),
@@ -1379,7 +1380,8 @@ libtextclassifier3::Status IcingSearchEngine::InitializeDeletionStore() {
 
   auto create_result_or = DeletionStore::Create(
       filesystem_.get(), deletion_dir, options_.compression_level(),
-      options_.compression_threshold_bytes(), options_.compression_mem_level());
+      options_.compression_threshold_bytes(), options_.compression_mem_level(),
+      feature_flags_.enable_proto_log_compression_mem_level());
   if (!create_result_or.ok()) {
     // The DeletionStore only holds DeletionEvents for offline observers, so
     // rather than failing Initialize() (which causes clients to reset all
@@ -1398,7 +1400,8 @@ libtextclassifier3::Status IcingSearchEngine::InitializeDeletionStore() {
     create_result_or = DeletionStore::Create(
         filesystem_.get(), deletion_dir, options_.compression_level(),
         options_.compression_threshold_bytes(),
-        options_.compression_mem_level());
+        options_.compression_mem_level(),
+        feature_flags_.enable_proto_log_compression_mem_level());
     if (!create_result_or.ok()) {
       // Never propagate DATA_LOSS here, for the reason above.
       return absl_ports::InternalError(absl_ports::StrCat(

@@ -188,7 +188,7 @@ message IcingSearchEngineMarkerProto {
 //       truth data requires migration.
 //     - In this case, a corresponding field in
 //       IcingSearchEngineFeatureInfoProto is required to be set.
-// Next tag: 69
+// Next tag: 70
 message IcingSearchEngineOptions {
   // [CONFIG_OPTION]
   // Directory to persist files for Icing. Required.
@@ -778,6 +778,15 @@ message IcingSearchEngineOptions {
   // document log at that offset, mark the data status as PARTIAL_LOSS, and
   // continue recovery with the valid documents prior to that point.
   optional bool enable_handle_zero_filled_magic_recovery = 68;
+
+  // [PURE_ROLLOUT_FLAG]
+  // Whether to pass compression_mem_level to GzipOutputStream when writing
+  // compressed protos in PortableFileBackedProtoLog.
+  //
+  // Previously compression_mem_level was validated and stored on
+  // PortableFileBackedProtoLog without being assigned to
+  // GzipOutputStream::Options, so writes defaulted to memLevel 8.
+  optional bool enable_proto_log_compression_mem_level = 69;
 
   reserved 2, 20, 25;
 }

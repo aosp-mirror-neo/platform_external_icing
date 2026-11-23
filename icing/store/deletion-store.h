@@ -71,7 +71,7 @@ class DeletionStore {
   static libtextclassifier3::StatusOr<DeletionStore::CreateResult> Create(
       const Filesystem* filesystem, const std::string& base_dir,
       int32_t compression_level, uint32_t compression_threshold_bytes,
-      int32_t compression_mem_level);
+      int32_t compression_mem_level, bool enable_compression_mem_level = false);
 
   // Not copyable.
   DeletionStore(const DeletionStore&) = delete;
@@ -202,7 +202,8 @@ class DeletionStore {
   explicit DeletionStore(const Filesystem* filesystem, std::string base_dir,
                          int32_t compression_level,
                          uint32_t compression_threshold_bytes,
-                         int32_t compression_mem_level);
+                         int32_t compression_mem_level,
+                         bool enable_compression_mem_level);
 
   struct InitializeResult {
     DataLoss data_loss;
@@ -313,6 +314,7 @@ class DeletionStore {
   const int32_t compression_level_;
   const uint32_t compression_threshold_bytes_;
   const int32_t compression_mem_level_;
+  const bool enable_compression_mem_level_;
 
   // Whether deletion_log_ and deletion_index_ are both valid. Public methods
   // return FAILED_PRECONDITION and the destructor skips persisting to disk if
