@@ -2957,6 +2957,94 @@ TEST_F(PortableFileBackedProtoLogTest,
   EXPECT_THAT(header.CalculateLegacyHeaderChecksum(), Eq(3049742880u));
 }
 
+TEST_F(PortableFileBackedProtoLogTest, WriteProtoRespectsCompressionMemLevel) {
+  std::string payload;
+  payload.reserve(32 * 1024);
+  for (int i = 0; i < 1024; ++i) {
+    payload += "icing_compression_mem_level_regression_payload_";
+    payload += std::to_string(i % 97);
+    payload += "_";
+  }
+  DocumentProto document = DocumentBuilder()
+                               .SetKey("namespace", "uri1")
+                               .SetSchema("schema")
+                               .AddStringProperty("body", payload)
+                               .Build();
+
+  std::string low_mem_enabled_path =
+      GetTestTempDir() + "/proto_log_mem_level_1_enabled";
+  std::string low_mem_disabled_path =
+      GetTestTempDir() + "/proto_log_mem_level_1_disabled";
+  std::string default_mem_path = GetTestTempDir() + "/proto_log_mem_level_8";
+  filesystem_.DeleteFile(low_mem_enabled_path.c_str());
+  filesystem_.DeleteFile(low_mem_disabled_path.c_str());
+  filesystem_.DeleteFile(default_mem_path.c_str());
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult
+          low_mem_enabled_result,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, low_mem_enabled_path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, compression_level_,
+              /*compression_threshold_bytes_in=*/0,
+              /*compression_mem_level_in=*/1,
+              /*enable_compression_mem_level_in=*/true)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult
+          low_mem_disabled_result,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, low_mem_disabled_path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, compression_level_,
+              /*compression_threshold_bytes_in=*/0,
+              /*compression_mem_level_in=*/1,
+              /*enable_compression_mem_level_in=*/false)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult
+          default_mem_result,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, default_mem_path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, compression_level_,
+              /*compression_threshold_bytes_in=*/0,
+              /*compression_mem_level_in=*/8,
+              /*enable_compression_mem_level_in=*/true)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t low_mem_enabled_pos,
+      low_mem_enabled_result.proto_log->WriteProto(document));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t low_mem_disabled_pos,
+      low_mem_disabled_result.proto_log->WriteProto(document));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t default_mem_pos,
+      default_mem_result.proto_log->WriteProto(document));
+  ICING_ASSERT_OK(low_mem_enabled_result.proto_log->PersistToDisk());
+  ICING_ASSERT_OK(low_mem_disabled_result.proto_log->PersistToDisk());
+  ICING_ASSERT_OK(default_mem_result.proto_log->PersistToDisk());
+
+  EXPECT_THAT(low_mem_enabled_result.proto_log->ReadProto(low_mem_enabled_pos),
+              IsOkAndHolds(EqualsProto(document)));
+  EXPECT_THAT(
+      low_mem_disabled_result.proto_log->ReadProto(low_mem_disabled_pos),
+      IsOkAndHolds(EqualsProto(document)));
+  EXPECT_THAT(default_mem_result.proto_log->ReadProto(default_mem_pos),
+              IsOkAndHolds(EqualsProto(document)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(Crc32 low_mem_enabled_checksum,
+                             low_mem_enabled_result.proto_log->GetChecksum());
+  ICING_ASSERT_OK_AND_ASSIGN(Crc32 low_mem_disabled_checksum,
+                             low_mem_disabled_result.proto_log->GetChecksum());
+  ICING_ASSERT_OK_AND_ASSIGN(Crc32 default_mem_checksum,
+                             default_mem_result.proto_log->GetChecksum());
+  // When disabled, mem_level falls back to default 8 and produces an identical
+  // compressed stream. When enabled, mem_level=1 flushes deflate blocks at
+  // different boundaries and produces a distinct stream.
+  EXPECT_THAT(low_mem_disabled_checksum, Eq(default_mem_checksum));
+  EXPECT_THAT(low_mem_enabled_checksum, Not(Eq(default_mem_checksum)));
+}
+
 }  // namespace
 }  // namespace lib
 }  // namespace icing

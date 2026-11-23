@@ -258,7 +258,8 @@ class BlobStore {
   explicit BlobStore(
       const Filesystem* filesystem, std::string base_dir, const Clock* clock,
       int64_t orphan_blob_time_to_live_ms, int32_t compression_level,
-      int32_t compression_mem_level, bool manage_blob_files,
+      int32_t compression_mem_level, bool enable_compression_mem_level,
+      bool manage_blob_files,
       std::unique_ptr<PortableFileBackedProtoLog<BlobInfoProto>> blob_info_log,
       std::unordered_map<std::string, int32_t> blob_handle_to_offset,
       std::unordered_set<std::string> known_file_names)
@@ -268,6 +269,7 @@ class BlobStore {
         orphan_blob_time_to_live_ms_(orphan_blob_time_to_live_ms),
         compression_level_(compression_level),
         compression_mem_level_(compression_mem_level),
+        enable_compression_mem_level_(enable_compression_mem_level),
         manage_blob_files_(manage_blob_files),
         blob_info_log_(std::move(blob_info_log)),
         blob_handle_to_offset_(std::move(blob_handle_to_offset)),
@@ -290,6 +292,7 @@ class BlobStore {
   int64_t orphan_blob_time_to_live_ms_;
   int32_t compression_level_;
   int32_t compression_mem_level_;
+  bool enable_compression_mem_level_;
   bool manage_blob_files_;
 
   // The ground truth blob info log file, which is used to read/write/erase

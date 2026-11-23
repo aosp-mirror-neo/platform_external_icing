@@ -41,7 +41,8 @@ class FeatureFlags {
                         bool enable_pinyin_transliteration,
                         bool enable_term_index_flush_fix,
                         bool enable_offline_observers,
-                        bool enable_handle_zero_filled_magic_recovery)
+                        bool enable_handle_zero_filled_magic_recovery,
+                        bool enable_proto_log_compression_mem_level = false)
       : allow_circular_schema_definitions_(allow_circular_schema_definitions),
         enable_repeated_field_joins_(enable_repeated_field_joins),
         enable_embedding_backup_generation_(enable_embedding_backup_generation),
@@ -68,7 +69,9 @@ class FeatureFlags {
         enable_term_index_flush_fix_(enable_term_index_flush_fix),
         enable_offline_observers_(enable_offline_observers),
         enable_handle_zero_filled_magic_recovery_(
-            enable_handle_zero_filled_magic_recovery) {}
+            enable_handle_zero_filled_magic_recovery),
+        enable_proto_log_compression_mem_level_(
+            enable_proto_log_compression_mem_level) {}
 
   bool allow_circular_schema_definitions() const {
     return allow_circular_schema_definitions_;
@@ -142,6 +145,10 @@ class FeatureFlags {
 
   bool enable_handle_zero_filled_magic_recovery() const {
     return enable_handle_zero_filled_magic_recovery_;
+  }
+
+  bool enable_proto_log_compression_mem_level() const {
+    return enable_proto_log_compression_mem_level_;
   }
 
  private:
@@ -236,6 +243,10 @@ class FeatureFlags {
   // reading an entry with zeroed-out metadata/magic during document store
   // recovery.
   bool enable_handle_zero_filled_magic_recovery_ = false;
+
+  // Whether to pass compression_mem_level to GzipOutputStream when writing
+  // compressed protos in PortableFileBackedProtoLog.
+  bool enable_proto_log_compression_mem_level_ = false;
 };
 
 class FeatureFlagsBuilder {
@@ -371,6 +382,13 @@ class FeatureFlagsBuilder {
       bool enable_handle_zero_filled_magic_recovery) {
     feature_flags_.enable_handle_zero_filled_magic_recovery_ =
         enable_handle_zero_filled_magic_recovery;
+    return *this;
+  }
+
+  FeatureFlagsBuilder& set_enable_proto_log_compression_mem_level(
+      bool enable_proto_log_compression_mem_level) {
+    feature_flags_.enable_proto_log_compression_mem_level_ =
+        enable_proto_log_compression_mem_level;
     return *this;
   }
 
