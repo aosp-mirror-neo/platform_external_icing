@@ -244,8 +244,9 @@ class FeatureFlags {
   // recovery.
   bool enable_handle_zero_filled_magic_recovery_ = false;
 
-  // Whether to pass compression_mem_level to GzipOutputStream when writing
-  // compressed protos in PortableFileBackedProtoLog.
+  // Whether to enable low-memory zlib compression (compression_mem_level,
+  // windowBits=14, and stored-frame bypass for uncompressed writes) in
+  // PortableFileBackedProtoLog.
   bool enable_proto_log_compression_mem_level_ = false;
 };
 

@@ -14,12 +14,14 @@
 
 #include "icing/file/portable-file-backed-proto-log.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "icing/text_classifier/lib3/utils/base/status.h"
 #include "icing/text_classifier/lib3/utils/base/statusor.h"
@@ -37,6 +39,7 @@
 #include "icing/util/crc32.h"
 #include "icing/util/data-loss.h"
 #include "icing/util/status-macros.h"
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
 namespace icing {
 namespace lib {
@@ -2975,10 +2978,14 @@ TEST_F(PortableFileBackedProtoLogTest, WriteProtoRespectsCompressionMemLevel) {
       GetTestTempDir() + "/proto_log_mem_level_1_enabled";
   std::string low_mem_disabled_path =
       GetTestTempDir() + "/proto_log_mem_level_1_disabled";
-  std::string default_mem_path = GetTestTempDir() + "/proto_log_mem_level_8";
+  std::string default_mem_enabled_path =
+      GetTestTempDir() + "/proto_log_mem_level_8_enabled";
+  std::string default_mem_disabled_path =
+      GetTestTempDir() + "/proto_log_mem_level_8_disabled";
   filesystem_.DeleteFile(low_mem_enabled_path.c_str());
   filesystem_.DeleteFile(low_mem_disabled_path.c_str());
-  filesystem_.DeleteFile(default_mem_path.c_str());
+  filesystem_.DeleteFile(default_mem_enabled_path.c_str());
+  filesystem_.DeleteFile(default_mem_disabled_path.c_str());
 
   ICING_ASSERT_OK_AND_ASSIGN(
       PortableFileBackedProtoLog<DocumentProto>::CreateResult
@@ -3002,14 +3009,24 @@ TEST_F(PortableFileBackedProtoLogTest, WriteProtoRespectsCompressionMemLevel) {
               /*enable_compression_mem_level_in=*/false)));
   ICING_ASSERT_OK_AND_ASSIGN(
       PortableFileBackedProtoLog<DocumentProto>::CreateResult
-          default_mem_result,
+          default_mem_enabled_result,
       PortableFileBackedProtoLog<DocumentProto>::Create(
-          &filesystem_, default_mem_path,
+          &filesystem_, default_mem_enabled_path,
           PortableFileBackedProtoLog<DocumentProto>::Options(
               /*compress_in=*/true, max_proto_size_, compression_level_,
               /*compression_threshold_bytes_in=*/0,
               /*compression_mem_level_in=*/8,
               /*enable_compression_mem_level_in=*/true)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult
+          default_mem_disabled_result,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, default_mem_disabled_path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, compression_level_,
+              /*compression_threshold_bytes_in=*/0,
+              /*compression_mem_level_in=*/8,
+              /*enable_compression_mem_level_in=*/false)));
 
   ICING_ASSERT_OK_AND_ASSIGN(
       int64_t low_mem_enabled_pos,
@@ -3018,31 +3035,393 @@ TEST_F(PortableFileBackedProtoLogTest, WriteProtoRespectsCompressionMemLevel) {
       int64_t low_mem_disabled_pos,
       low_mem_disabled_result.proto_log->WriteProto(document));
   ICING_ASSERT_OK_AND_ASSIGN(
-      int64_t default_mem_pos,
-      default_mem_result.proto_log->WriteProto(document));
+      int64_t default_mem_enabled_pos,
+      default_mem_enabled_result.proto_log->WriteProto(document));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t default_mem_disabled_pos,
+      default_mem_disabled_result.proto_log->WriteProto(document));
   ICING_ASSERT_OK(low_mem_enabled_result.proto_log->PersistToDisk());
   ICING_ASSERT_OK(low_mem_disabled_result.proto_log->PersistToDisk());
-  ICING_ASSERT_OK(default_mem_result.proto_log->PersistToDisk());
+  ICING_ASSERT_OK(default_mem_enabled_result.proto_log->PersistToDisk());
+  ICING_ASSERT_OK(default_mem_disabled_result.proto_log->PersistToDisk());
 
   EXPECT_THAT(low_mem_enabled_result.proto_log->ReadProto(low_mem_enabled_pos),
               IsOkAndHolds(EqualsProto(document)));
   EXPECT_THAT(
       low_mem_disabled_result.proto_log->ReadProto(low_mem_disabled_pos),
       IsOkAndHolds(EqualsProto(document)));
-  EXPECT_THAT(default_mem_result.proto_log->ReadProto(default_mem_pos),
+  EXPECT_THAT(
+      default_mem_enabled_result.proto_log->ReadProto(default_mem_enabled_pos),
+      IsOkAndHolds(EqualsProto(document)));
+  EXPECT_THAT(default_mem_disabled_result.proto_log->ReadProto(
+                  default_mem_disabled_pos),
               IsOkAndHolds(EqualsProto(document)));
 
   ICING_ASSERT_OK_AND_ASSIGN(Crc32 low_mem_enabled_checksum,
                              low_mem_enabled_result.proto_log->GetChecksum());
   ICING_ASSERT_OK_AND_ASSIGN(Crc32 low_mem_disabled_checksum,
                              low_mem_disabled_result.proto_log->GetChecksum());
-  ICING_ASSERT_OK_AND_ASSIGN(Crc32 default_mem_checksum,
-                             default_mem_result.proto_log->GetChecksum());
-  // When disabled, mem_level falls back to default 8 and produces an identical
-  // compressed stream. When enabled, mem_level=1 flushes deflate blocks at
-  // different boundaries and produces a distinct stream.
-  EXPECT_THAT(low_mem_disabled_checksum, Eq(default_mem_checksum));
-  EXPECT_THAT(low_mem_enabled_checksum, Not(Eq(default_mem_checksum)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      Crc32 default_mem_enabled_checksum,
+      default_mem_enabled_result.proto_log->GetChecksum());
+  ICING_ASSERT_OK_AND_ASSIGN(
+      Crc32 default_mem_disabled_checksum,
+      default_mem_disabled_result.proto_log->GetChecksum());
+  // When disabled, mem_level falls back to default 8 and windowBits stays 15,
+  // producing an identical compressed stream regardless of configured
+  // compression_mem_level. When enabled, mem_level=1 flushes deflate blocks at
+  // different boundaries from mem_level=8 (both at windowBits=14).
+  EXPECT_THAT(low_mem_disabled_checksum, Eq(default_mem_disabled_checksum));
+  EXPECT_THAT(low_mem_enabled_checksum, Not(Eq(default_mem_enabled_checksum)));
+  EXPECT_THAT(low_mem_enabled_checksum, Not(Eq(low_mem_disabled_checksum)));
+}
+
+TEST_F(PortableFileBackedProtoLogTest,
+       ReusedCompressorWritesSameBytesAsNewCompressor) {
+  constexpr uint32_t kCompressionThresholdBytes = 1000;
+  constexpr int32_t kCompressionLevel = 3;
+  constexpr int32_t kCompressionMemLevel = 1;
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult create_result,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, file_path_,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, kCompressionLevel,
+              kCompressionThresholdBytes, kCompressionMemLevel,
+              /*enable_compression_mem_level_in=*/false)));
+  auto proto_log = std::move(create_result.proto_log);
+
+  // Mix of protos below the threshold (compression level 0) and above it
+  // (compression level 3), with sizes below and above the 64 KiB buffer size.
+  std::vector<DocumentProto> documents;
+  for (int body_size : {10, 5000, 20, 100 * 1024, 300, 2000, 0, 70 * 1024}) {
+    std::string body;
+    for (int i = 0; body.size() < static_cast<size_t>(body_size); ++i) {
+      body += "reused_compressor_" + std::to_string(i % 89) + "_";
+    }
+    body.resize(body_size);
+    documents.push_back(
+        DocumentBuilder()
+            .SetKey("namespace", "uri" + std::to_string(documents.size()))
+            .SetSchema("schema")
+            .AddStringProperty("body", body)
+            .Build());
+  }
+
+  std::vector<int64_t> offsets;
+  for (size_t i = 0; i < documents.size(); ++i) {
+    ICING_ASSERT_OK_AND_ASSIGN(int64_t offset,
+                               proto_log->WriteProto(documents[i]));
+    offsets.push_back(offset);
+    // Exercise compressor release on PersistToDisk() and subsequent re-creation
+    // mid-sequence.
+    if (i == 3) {
+      ICING_ASSERT_OK(proto_log->PersistToDisk());
+    }
+  }
+  ICING_ASSERT_OK(proto_log->PersistToDisk());
+  int64_t file_size = filesystem_.GetFileSize(file_path_.c_str());
+
+  for (size_t i = 0; i < documents.size(); ++i) {
+    std::string serialized = documents[i].SerializeAsString();
+    protobuf_ports::GzipOutputStream::Options options;
+    options.format = protobuf_ports::GzipOutputStream::ZLIB;
+    options.compression_level =
+        serialized.size() >= kCompressionThresholdBytes ? kCompressionLevel : 0;
+    options.mem_level = protobuf_ports::kDefaultMemLevel;
+    options.buffer_size = static_cast<int>(
+        std::min(serialized.size(), protobuf_ports::kDefaultBufferSize));
+    std::string expected;
+    {
+      google::protobuf::io::StringOutputStream string_stream(&expected);
+      protobuf_ports::GzipOutputStream compressing_stream(&string_stream,
+                                                          options);
+      ASSERT_TRUE(documents[i].SerializeToZeroCopyStream(&compressing_stream));
+      ASSERT_TRUE(compressing_stream.Close());
+    }
+
+    int64_t start = offsets[i] + static_cast<int64_t>(sizeof(int32_t));
+    int64_t end = i + 1 < offsets.size() ? offsets[i + 1] : file_size;
+    std::string actual(static_cast<size_t>(end - start), '\0');
+    ASSERT_THAT(filesystem_.PRead(file_path_.c_str(), actual.data(),
+                                  actual.size(), start),
+                Eq(static_cast<ssize_t>(actual.size())));
+    EXPECT_THAT(actual, Eq(expected)) << "document #" << i;
+  }
+
+  // Reads reuse the cached decompressor.
+  for (int round = 0; round < 2; ++round) {
+    for (size_t i = documents.size(); i > 0; --i) {
+      EXPECT_THAT(proto_log->ReadProto(offsets[i - 1]),
+                  IsOkAndHolds(EqualsProto(documents[i - 1])));
+    }
+  }
+}
+
+TEST_F(PortableFileBackedProtoLogTest,
+       DisabledFlagMatchesReusedZlibStateAtDefaultMemLevel) {
+  constexpr uint32_t kCompressionThresholdBytes = 1000;
+  constexpr int32_t kCompressionLevel = 3;
+  std::string legacy_path = file_path_ + "_legacy";
+  std::string reused_path = file_path_ + "_reused";
+  auto cleanup = [&]() {
+    filesystem_.DeleteFile(legacy_path.c_str());
+    filesystem_.DeleteFile(reused_path.c_str());
+  };
+  cleanup();
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      auto legacy_create,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, legacy_path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, kCompressionLevel,
+              kCompressionThresholdBytes, protobuf_ports::kDefaultMemLevel,
+              /*enable_compression_mem_level_in=*/false)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      auto reused_create,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, reused_path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, kCompressionLevel,
+              kCompressionThresholdBytes, protobuf_ports::kDefaultMemLevel,
+              /*enable_compression_mem_level_in=*/true)));
+
+  std::vector<int64_t> legacy_offsets;
+  std::vector<int64_t> reused_offsets;
+  std::vector<DocumentProto> documents;
+  for (int body_size : {10, 5000, 200, 8000}) {
+    std::string body(static_cast<size_t>(body_size), 'x');
+    for (size_t i = 0; i < body.size(); ++i) {
+      body[i] = static_cast<char>('a' + (i % 23));
+    }
+    documents.push_back(
+        DocumentBuilder()
+            .SetKey("namespace", "uri" + std::to_string(documents.size()))
+            .SetSchema("schema")
+            .AddStringProperty("body", body)
+            .Build());
+    ICING_ASSERT_OK_AND_ASSIGN(
+        int64_t lo, legacy_create.proto_log->WriteProto(documents.back()));
+    ICING_ASSERT_OK_AND_ASSIGN(
+        int64_t ro, reused_create.proto_log->WriteProto(documents.back()));
+    legacy_offsets.push_back(lo);
+    reused_offsets.push_back(ro);
+  }
+  ICING_ASSERT_OK(legacy_create.proto_log->PersistToDisk());
+  ICING_ASSERT_OK(reused_create.proto_log->PersistToDisk());
+
+  // Verify entries match on round-trip for both paths (enable=true writes
+  // windowBits=14 headers / stored frames, which differ from windowBits=15).
+
+  for (size_t i = 0; i < documents.size(); ++i) {
+    EXPECT_THAT(legacy_create.proto_log->ReadProto(legacy_offsets[i]),
+                IsOkAndHolds(EqualsProto(documents[i])));
+    EXPECT_THAT(reused_create.proto_log->ReadProto(reused_offsets[i]),
+                IsOkAndHolds(EqualsProto(documents[i])));
+  }
+  cleanup();
+}
+
+
+TEST_F(PortableFileBackedProtoLogTest,
+       WriteProtoLowMemoryZlibStoredFrameAndWindowBits14RoundTrip) {
+  std::string path = GetTestTempDir() + "/proto_log_low_mem_zlib";
+  filesystem_.DeleteFile(path.c_str());
+
+  // Use a high threshold (256 KiB) first to exercise empty, small, and exact
+  // single-block boundary (65535 B) RFC 1950 stored frames without
+  // deflateInit2, plus 65536 B falling through to GzipOutputStream.
+  auto make_exact_size_doc = [](const std::string& uri, size_t target_size,
+                                char fill) {
+    DocumentProto base = DocumentBuilder()
+                             .SetKey("ns", uri)
+                             .SetSchema("schema")
+                             .AddStringProperty("body", "")
+                             .Build();
+    size_t body_len = target_size - base.ByteSizeLong();
+    DocumentProto doc;
+    while (true) {
+      doc = DocumentBuilder()
+                .SetKey("ns", uri)
+                .SetSchema("schema")
+                .AddStringProperty("body", std::string(body_len, fill))
+                .Build();
+      size_t sz = doc.ByteSizeLong();
+      if (sz == target_size) {
+        return doc;
+      }
+      body_len -= (sz - target_size);
+    }
+  };
+
+  DocumentProto empty_doc;
+  DocumentProto small_doc = DocumentBuilder()
+                                .SetKey("ns", "small")
+                                .SetSchema("schema")
+                                .AddStringProperty("body", "hello stored frame")
+                                .Build();
+  DocumentProto boundary_65535_doc =
+      make_exact_size_doc("exact_65535", 65535, 'B');
+  ASSERT_THAT(boundary_65535_doc.ByteSizeLong(), Eq(65535u));
+  DocumentProto boundary_65536_doc =
+      make_exact_size_doc("exact_65536", 65536, 'C');
+  ASSERT_THAT(boundary_65536_doc.ByteSizeLong(), Eq(65536u));
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult stored_writer,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, compression_level_,
+              /*compression_threshold_bytes_in=*/256 * 1024,
+              /*compression_mem_level_in=*/1,
+              /*enable_compression_mem_level_in=*/true)));
+
+  ICING_ASSERT_OK_AND_ASSIGN(int64_t pos_empty,
+                             stored_writer.proto_log->WriteProto(empty_doc));
+  ICING_ASSERT_OK_AND_ASSIGN(int64_t pos_small,
+                             stored_writer.proto_log->WriteProto(small_doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t pos_65535,
+      stored_writer.proto_log->WriteProto(boundary_65535_doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t pos_65536,
+      stored_writer.proto_log->WriteProto(boundary_65536_doc));
+  ICING_ASSERT_OK(stored_writer.proto_log->PersistToDisk());
+  stored_writer.proto_log.reset();
+
+  // Verify parity with the legacy zlib path
+  // (enable_compression_mem_level=false) when 11-byte RFC 1950 framing overhead
+  // pushes final_size > max_proto_size.
+  const int32_t tight_max_size = static_cast<int32_t>(small_doc.ByteSizeLong());
+  for (bool enable_low_mem : {false, true}) {
+    std::string tight_max_path = GetTestTempDir() + "/proto_log_tight_max";
+    filesystem_.DeleteFile(tight_max_path.c_str());
+    ICING_ASSERT_OK_AND_ASSIGN(
+        PortableFileBackedProtoLog<DocumentProto>::CreateResult tight_writer,
+        PortableFileBackedProtoLog<DocumentProto>::Create(
+            &filesystem_, tight_max_path,
+            PortableFileBackedProtoLog<DocumentProto>::Options(
+                /*compress_in=*/true, tight_max_size, compression_level_,
+                /*compression_threshold_bytes_in=*/1024,
+                /*compression_mem_level_in=*/1,
+                /*enable_compression_mem_level_in=*/enable_low_mem)));
+    EXPECT_THAT(tight_writer.proto_log->WriteProto(small_doc),
+                StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
+  }
+
+  // Reopen with compression_level=0 and threshold=0 to verify explicit level-0
+  // writes also take the stored-frame bypass.
+  DocumentProto level0_doc =
+      DocumentBuilder()
+          .SetKey("ns", "level0")
+          .SetSchema("schema")
+          .AddStringProperty("body", std::string(2048, 'L'))
+          .Build();
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult level0_writer,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, /*compression_level_in=*/0,
+              /*compression_threshold_bytes_in=*/0,
+              /*compression_mem_level_in=*/1,
+              /*enable_compression_mem_level_in=*/true)));
+  ICING_ASSERT_OK_AND_ASSIGN(int64_t pos_level0,
+                             level0_writer.proto_log->WriteProto(level0_doc));
+  ICING_ASSERT_OK(level0_writer.proto_log->PersistToDisk());
+  level0_writer.proto_log.reset();
+
+  // Reopen with threshold=1000 and enable_compression_mem_level=true to
+  // exercise interleaved stored-frame and reused windowBits=14 compressed
+  // writes.
+  std::string compressible_payload;
+  compressible_payload.reserve(40 * 1024);
+  for (int i = 0; i < 1024; ++i) {
+    compressible_payload += "window_bits_14_test_payload_";
+    compressible_payload += std::to_string(i % 73);
+    compressible_payload += '_';
+  }
+  DocumentProto compressed_doc1 =
+      DocumentBuilder()
+          .SetKey("ns", "win14_1")
+          .SetSchema("schema")
+          .AddStringProperty("body", compressible_payload)
+          .Build();
+  DocumentProto compressed_doc2 =
+      DocumentBuilder()
+          .SetKey("ns", "win14_2")
+          .SetSchema("schema")
+          .AddStringProperty("body", compressible_payload + "second")
+          .Build();
+
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult win14_writer,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, compression_level_,
+              /*compression_threshold_bytes_in=*/1000,
+              /*compression_mem_level_in=*/1,
+              /*enable_compression_mem_level_in=*/true)));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t pos_win14_1, win14_writer.proto_log->WriteProto(compressed_doc1));
+  ICING_ASSERT_OK_AND_ASSIGN(int64_t pos_interleaved_small,
+                             win14_writer.proto_log->WriteProto(small_doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      int64_t pos_win14_2, win14_writer.proto_log->WriteProto(compressed_doc2));
+  ICING_ASSERT_OK(win14_writer.proto_log->PersistToDisk());
+  win14_writer.proto_log.reset();
+
+  // Verify stock reader (enable_compression_mem_level=false) reads all entries
+  // back identically.
+  ICING_ASSERT_OK_AND_ASSIGN(
+      PortableFileBackedProtoLog<DocumentProto>::CreateResult stock_reader,
+      PortableFileBackedProtoLog<DocumentProto>::Create(
+          &filesystem_, path,
+          PortableFileBackedProtoLog<DocumentProto>::Options(
+              /*compress_in=*/true, max_proto_size_, compression_level_,
+              /*compression_threshold_bytes_in=*/0,
+              /*compression_mem_level_in=*/8,
+              /*enable_compression_mem_level_in=*/false)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_empty),
+              IsOkAndHolds(EqualsProto(empty_doc)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_small),
+              IsOkAndHolds(EqualsProto(small_doc)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_65535),
+              IsOkAndHolds(EqualsProto(boundary_65535_doc)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_65536),
+              IsOkAndHolds(EqualsProto(boundary_65536_doc)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_level0),
+              IsOkAndHolds(EqualsProto(level0_doc)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_win14_1),
+              IsOkAndHolds(EqualsProto(compressed_doc1)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_interleaved_small),
+              IsOkAndHolds(EqualsProto(small_doc)));
+  EXPECT_THAT(stock_reader.proto_log->ReadProto(pos_win14_2),
+              IsOkAndHolds(EqualsProto(compressed_doc2)));
+
+  // Verify on-disk zlib headers: stored-frame fast-path entries (<= 65535 B)
+  // start with 0x78 0x01 and GzipOutputStream windowBits=14 entries (including
+  // the 65536 B level-0 fallback) start with CMF=0x68 (CINFO=6).
+  uint8_t header_bytes[2] = {};
+  for (int64_t stored_pos :
+       {pos_empty, pos_small, pos_65535, pos_level0, pos_interleaved_small}) {
+    ASSERT_THAT(
+        filesystem_.PRead(path.c_str(), header_bytes, 2,
+                          stored_pos + static_cast<int64_t>(sizeof(int32_t))),
+        Eq(2));
+    EXPECT_THAT(header_bytes[0], Eq(0x78));
+    EXPECT_THAT(header_bytes[1], Eq(0x01));
+  }
+  for (int64_t win14_pos : {pos_65536, pos_win14_1, pos_win14_2}) {
+    ASSERT_THAT(
+        filesystem_.PRead(path.c_str(), header_bytes, 2,
+                          win14_pos + static_cast<int64_t>(sizeof(int32_t))),
+        Eq(2));
+    EXPECT_THAT(header_bytes[0], Eq(0x68));
+  }
 }
 
 }  // namespace
