@@ -16,6 +16,7 @@
 #define ICING_STORE_DOCUMENT_STORE_H_
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,8 +30,10 @@
 #include "icing/file/file-backed-vector.h"
 #include "icing/file/filesystem.h"
 #include "icing/file/memory-mapped-file-backed-proto-log.h"
+#include "icing/file/persistent-id-to-string-mapper.h"
 #include "icing/file/portable-file-backed-proto-log.h"
 #include "icing/proto/debug.pb.h"
+#include "icing/proto/deletion.pb.h"
 #include "icing/proto/document.pb.h"
 #include "icing/proto/document_wrapper.pb.h"
 #include "icing/proto/internal/scorable_property_set.pb.h"
@@ -43,8 +46,11 @@
 #include "icing/schema/schema-store.h"
 #include "icing/store/corpus-associated-scoring-data.h"
 #include "icing/store/corpus-id.h"
+#include "icing/store/deletion-store.h"
 #include "icing/store/document-associated-score-data.h"
+#include "icing/store/document-change.h"
 #include "icing/store/document-filter-data.h"
+#include "icing/store/document-group-info.h"
 #include "icing/store/document-id.h"
 #include "icing/store/key-mapper.h"
 #include "icing/store/namespace-id-fingerprint.h"
@@ -66,8 +72,8 @@ class DocumentStore {
  public:
   struct Header {
     // Previously used magic numbers, please avoid reusing those:
-    // [0x1b99c8b0, 0x3e005b5e]
-    static constexpr int32_t kMagic = 0x8a32cd1f;
+    // [0x1b99c8b0, 0x3e005b5e, 0x8a32cd1f, 0x2eea71de, 0x142f84cd]
+    static constexpr int32_t kMagic = 0x59178048;
 
     // Holds the magic as a quick sanity check against file corruption.
     int32_t magic;
@@ -135,8 +141,14 @@ class DocumentStore {
   // If initialize_stats is present, the fields related to DocumentStore will be
   // populated.
   //
-  // Does not take any ownership, and all pointers except initialize_stats must
-  // refer to valid objects that outlive the one constructed.
+  // If deletion_store is non-null and offline observers are enabled, a
+  // DeletionEvent is put into deletion_store whenever a document is deleted
+  // (see Delete() and ForceDelete()). Deleting the old version of a document
+  // when it is replaced by Put() is not a deletion.
+  //
+  // Does not take any ownership, and all pointers except initialize_stats and
+  // deletion_store must refer to valid objects that outlive the one
+  // constructed. If non-null, deletion_store must also outlive it.
   //
   // TODO(cassiewang): Consider returning a status indicating that derived files
   // were regenerated. This may be helpful in logs.
@@ -151,7 +163,9 @@ class DocumentStore {
       const FeatureFlags* feature_flags,
       bool force_recovery_and_revalidate_documents, bool pre_mapping_fbv,
       bool use_persistent_hash_map, int32_t compression_level,
-      InitializeStatsProto* initialize_stats);
+      uint32_t compression_threshold_bytes, int32_t compression_mem_level,
+      InitializeStatsProto* initialize_stats,
+      DeletionStore* deletion_store = nullptr);
 
   // Discards all derived data in the document store.
   //
@@ -176,7 +190,38 @@ class DocumentStore {
   // of deleted or expired documents.
   int num_documents() const { return document_id_mapper_->num_elements(); }
 
-  // Puts the document into document store.
+  // Issues the next timestamp for an event in this document store (e.g. a
+  // document being put). Issued timestamps are strictly increasing: the result
+  // is max(current system time, last_issued_timestamp_ms() + 1), so it follows
+  // the system clock while the clock advances, and advances by 1 per call if
+  // the clock stalls or moves backwards.
+  //
+  // The returned value is recorded as the new last issued timestamp.
+  int64_t IssueTimestampMs();
+
+  // Returns the largest timestamp issued so far by IssueTimestampMs(), or 0 if
+  // none has been issued.
+  int64_t last_issued_timestamp_ms() const { return last_issued_timestamp_ms_; }
+
+  // Sets the timestamps that DocumentStore owns on a document that is about to
+  // be put:
+  //   - last_update_timestamp_ms is set to a newly issued timestamp.
+  //   - original_creation_timestamp_ms is copied from the existing document
+  //     with the same namespace and uri if it is alive, and set to the newly
+  //     issued timestamp otherwise.
+  // The issued timestamp is also set in the document log header, so it is
+  // persisted together with the document by the next Put().
+  //
+  // Must be called before the document is put, and only for documents put by
+  // clients (e.g. not for documents copied by OptimizeInto()).
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::Status SetDocumentOperationTimestamps(
+      DocumentProto* document);
+
+  // Puts a single document into document store.
   //
   // If put_document_stats is present, the fields related to DocumentStore will
   // be populated.
@@ -193,16 +238,11 @@ class DocumentStore {
   struct PutResult {
     DocumentId old_document_id = kInvalidDocumentId;
     DocumentId new_document_id = kInvalidDocumentId;
-
-    bool was_replacement() const {
-      return old_document_id != kInvalidDocumentId;
-    }
+    int64_t expiration_timestamp_ms = std::numeric_limits<int64_t>::max();
+    bool was_replacement = false;
   };
   libtextclassifier3::StatusOr<PutResult> Put(
-      const DocumentProto& document, int32_t num_tokens = 0,
-      PutDocumentStatsProto* put_document_stats = nullptr);
-  libtextclassifier3::StatusOr<PutResult> Put(
-      DocumentProto&& document, int32_t num_tokens = 0,
+      const DocumentWrapper& document_wrapper,
       PutDocumentStatsProto* put_document_stats = nullptr);
 
   // Finds and returns the document identified by the given key (namespace +
@@ -247,8 +287,11 @@ class DocumentStore {
   // or expired). Order of namespaces is undefined.
   std::vector<std::string> GetAllNamespaces() const;
 
-  // Deletes the document identified by the given namespace and uri. The
-  // document proto will be erased immediately.
+  // TODO(b/384947619): migrate Delete APIs to return DocumentGroupInfo or
+  // DocumentMetadata.
+
+  // Deletes the document identified by the given namespace and uri, only if it
+  // is still alive. The document proto will be erased immediately.
   //
   // NOTE:
   //    Space is not reclaimed for deleted documents until Optimize() is
@@ -262,8 +305,11 @@ class DocumentStore {
                                     std::string_view uri,
                                     int64_t current_time_ms);
 
-  // Deletes the document identified by the given document_id. The document
-  // proto will be erased immediately.
+  // Deletes the document identified by the given document_id, only if it is
+  // still alive. The document proto will be erased immediately.
+  //
+  // If deletion events are enabled (see Create()), also puts a DeletionEvent
+  // for the document into the DeletionStore.
   //
   // NOTE:
   //    Space is not reclaimed for deleted documents until Optimize() is
@@ -272,10 +318,47 @@ class DocumentStore {
   // Returns:
   //   OK on success
   //   NOT_FOUND if the document doesn't exist (i.e. deleted or expired)
-  //   INTERNAL_ERROR on IO error
+  //   INTERNAL_ERROR on IO error, including failing to put the DeletionEvent
+  //     after the document was deleted
   //   INVALID_ARGUMENT if document_id is invalid.
   libtextclassifier3::Status Delete(DocumentId document_id,
                                     int64_t current_time_ms);
+
+  // Deletes the document identified by the given document_id. The document
+  // proto will be erased immediately.
+  //
+  // Different from Delete(), this method promises that the document proto will
+  // be erased even if the document is expired.
+  //
+  // If deletion events are enabled (see Create()), also puts a DeletionEvent
+  // for the document into the DeletionStore, unless the document has already
+  // been replaced by a newer document with the same namespace and uri.
+  //
+  // NOTE:
+  //    Space is not reclaimed for deleted documents until Optimize() is
+  //    called.
+  //
+  // Returns:
+  //   DocumentMetadata of the deleted document on success
+  //   NOT_FOUND_ERROR if the document doesn't exist or has been deleted
+  //   INTERNAL_ERROR on IO error, including failing to put the DeletionEvent
+  //     after the document was deleted
+  //   INVALID_ARGUMENT_ERROR if document_id is invalid.
+  libtextclassifier3::StatusOr<DocumentMetadata> ForceDelete(
+      DocumentId document_id);
+
+  // Puts the DeletionEvents of the expired documents that OptimizeInto() didn't
+  // copy (see OptimizeResult::expired_document_deletion_events) into the
+  // DeletionStore, in order, issuing a deletion timestamp for each. Should be
+  // called on the new document store once the caller has switched to it.
+  //
+  // No-op if deletion events are not enabled (see Create()).
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::Status PutExpiredDocumentDeletionEvents(
+      std::vector<DeletionEvent> expired_document_deletion_events);
 
   // Returns the NamespaceId of the string namespace
   //
@@ -289,9 +372,10 @@ class DocumentStore {
   // Helper method to find a DocumentId that is associated with the given
   // namespace and uri.
   //
-  // NOTE: The DocumentId may refer to a invalid document (deleted
-  // or expired). Callers can call DoesDocumentExist(document_id) to ensure it
-  // refers to a valid Document.
+  // NOTE: if succeeded, it always returns a valid DocumentId, but this
+  // DocumentId may refer to a invalid document (deleted or expired). Callers
+  // can call GetAliveDocumentFilterData(document_id, current_time_ms) and check
+  // the return value to ensure it refers to an alive Document.
   //
   // Returns:
   //   A DocumentId on success
@@ -303,9 +387,10 @@ class DocumentStore {
   // Helper method to find a DocumentId that is associated with the given
   // NamespaceIdFingerprint.
   //
-  // NOTE: The DocumentId may refer to a invalid document (deleted
-  // or expired). Callers can call DoesDocumentExist(document_id) to ensure it
-  // refers to a valid Document.
+  // NOTE: if succeeded, it always returns a valid DocumentId, but this
+  // DocumentId may refer to a invalid document (deleted or expired). Callers
+  // can call GetAliveDocumentFilterData(document_id, current_time_ms) and check
+  // the return value to ensure it refers to an alive Document.
   //
   // Returns:
   //   A DocumentId on success
@@ -313,6 +398,57 @@ class DocumentStore {
   //   INTERNAL_ERROR on IO error
   libtextclassifier3::StatusOr<DocumentId> GetDocumentId(
       const NamespaceIdFingerprint& doc_namespace_id_uri_fingerprint) const;
+
+  // Helper method to find the URI that is associated with the given DocumentId.
+  //
+  // NOTE: This does not check if the document has expired and will return the
+  // URI of the document even if it has expired. Callers can call
+  // GetAliveDocumentFilterData(document_id, current_time_ms) to ensure it
+  // refers to an alive Document.
+  //
+  // NOTE: The URI is returned as an owned std::string copied out of the
+  // underlying mmapped storage, so it remains valid after subsequent Put /
+  // Delete calls on this DocumentStore, and after the DocumentStore is
+  // destroyed.
+  //
+  // Returns:
+  //   The URI on success
+  //   INVALID_ARGUMENT if document_id is less than 0 or greater than the
+  //                    maximum value
+  //   NOT_FOUND if the document doesn't exist or has been deleted
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::StatusOr<std::string> GetUri(
+      DocumentId document_id) const;
+
+  // Returns the alive (not deleted and not expired) documents that were added
+  // or updated after timestamp_ms, i.e. whose effective last update timestamp
+  // is strictly greater than timestamp_ms, as DocumentChanges sorted by
+  // operation timestamp. A document that was updated multiple times after
+  // timestamp_ms is only returned once, for its latest version. Deleted
+  // documents are not returned, including documents that were added and then
+  // deleted after timestamp_ms.
+  //
+  // If schemas is non-empty, only documents whose schema type is in schemas
+  // are returned. Schema types in schemas that don't exist are ignored. If
+  // schemas is empty, documents of all schema types are returned.
+  //
+  // At most max_changes changes are returned, so none are returned if
+  // max_changes is 0. If there are more changes after the returned ones,
+  // next_change_timestamp_ms is set to the operation timestamp of the first
+  // one. See DocumentChangeResult for how to fetch the next page.
+  //
+  // REQUIRES: effective last update timestamps in the score cache are
+  //   non-decreasing in document id order. This is used to binary search for
+  //   the first document updated after timestamp_ms.
+  //
+  // Returns:
+  //   A DocumentChangeResult on success
+  //   INVALID_ARGUMENT if max_changes is negative
+  //   FAILED_PRECONDITION if offline observers are not enabled
+  //   INTERNAL_ERROR on IO error or inconsistent derived data
+  libtextclassifier3::StatusOr<DocumentChangeResult> GetAddedOrUpdatedDocuments(
+      int64_t timestamp_ms, const std::unordered_set<std::string>& schemas,
+      int max_changes, int64_t current_time_ms) const;
 
   // Returns the CorpusId associated with the given namespace and schema.
   //
@@ -322,36 +458,6 @@ class DocumentStore {
   //   INTERNAL_ERROR on IO error
   libtextclassifier3::StatusOr<CorpusId> GetCorpusId(
       const std::string_view name_space, const std::string_view schema) const;
-
-  // Returns the ResultGroupingEntryId associated with the given namespace
-  // and schema.
-  //
-  // NOTE: ResultGroupingEntryIds that are generated by calls with different
-  // ResultGroupingTypes should not be compared. Returned ResultGroupingEntryIds
-  // are only guarenteed to be unique within their own ResultGroupingType.
-  //
-  // Returns:
-  //   A ResultGroupingEntryId on success
-  //   NOT_FOUND if the key doesn't exist
-  //   INTERNAL_ERROR on IO error
-  libtextclassifier3::StatusOr<int32_t> GetResultGroupingEntryId(
-      ResultSpecProto::ResultGroupingType result_group_type,
-      const std::string_view name_space, const std::string_view schema) const;
-
-  // Returns the ResultGrouping Entry Id associated with the given NamespaceId
-  // and SchemaTypeId
-  //
-  // NOTE: ResultGroupingEntryIds that are generated by calls with different
-  // ResultGroupingTypes should not be compared. Returned ResultGroupingEntryIds
-  // are only guarenteed to be unique within their own ResultGroupingType.
-  //
-  // Returns:
-  //   A ResultGroupingEntryId on success
-  //   NOT_FOUND if the key doesn't exist
-  //   INTERNAL_ERROR on IO error
-  libtextclassifier3::StatusOr<int32_t> GetResultGroupingEntryId(
-      ResultSpecProto::ResultGroupingType result_group_type,
-      const NamespaceId namespace_id, const SchemaTypeId schema_type_id) const;
 
   // Returns the DocumentAssociatedScoreData of the document specified by the
   // DocumentId.
@@ -396,6 +502,31 @@ class DocumentStore {
   //   False                    if the given document has been deleted.
   std::optional<DocumentFilterData> GetNonDeletedDocumentFilterData(
       DocumentId document_id) const;
+
+  // Checks if the document (given document_id) is alive or not.
+  bool IsDocumentAlive(DocumentId document_id, int64_t current_time_ms) const;
+
+  // Checks if the document (given namespace, uri) is alive or not.
+  bool IsDocumentAlive(std::string_view name_space, std::string_view uri,
+                       int64_t current_time_ms) const;
+
+  // Purges all expired documents given the current time.
+  //
+  // Note: documents that expire before
+  //   current_time_ms + feature_flags_.expired_document_purge_threshold_ms()
+  //   will also be purged.
+  //
+  // Returns:
+  //   A DocumentGroupInfo that contains the information about the purged
+  //     expired document metadata on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::StatusOr<DocumentGroupInfo> PurgeExpiredDocuments(
+      int64_t current_time_ms);
+
+  // Returns the expiration timestamp (in milliseconds) of the document that
+  // will expire next, relative to current_time_ms. If there are no more expired
+  // documents, returns -1.
+  int64_t GetNextExpiredDocumentTimestampMs(int64_t current_time_ms);
 
   // Gets the SchemaTypeId of a document.
   //
@@ -461,7 +592,9 @@ class DocumentStore {
   // Returns:
   //   OK on success
   //   INTERNAL on I/O error
-  libtextclassifier3::Status PersistToDisk(PersistType::Code persist_type);
+  libtextclassifier3::Status PersistToDisk(
+      PersistType::Code persist_type,
+      PersistToDiskStatsProto* persist_stats = nullptr);
 
   // Calculates the StorageInfo for the Document Store.
   //
@@ -469,6 +602,23 @@ class DocumentStore {
   // that field will be set to -1.
   DocumentStorageInfoProto GetStorageInfo() const;
 
+  struct UpdateSchemaStoreResult {
+    // Grouped metadata of deleted documents due to (force) schema changes.
+    //
+    // Note: this field is only populated if
+    //   feature_flags_.enable_delete_propagation_from() is true. If populated,
+    //   deleted_doc_group_info.GetTotalNumDocs() will be equal to
+    //   deleted_document_count.
+    DocumentGroupInfo deleted_doc_group_info;
+
+    // # of deleted documents due to (force) schema changes.
+    // TODO(b/446719537): remove this field once deleted_doc_group_info is fully
+    // released.
+    int deleted_document_count = 0;
+
+    // Whether any document store derived files have been changed.
+    bool derived_files_changed = false;
+  };
   // Update any derived data off of the SchemaStore with the new SchemaStore.
   // This may include pointers, SchemaTypeIds, etc.
   //
@@ -482,18 +632,24 @@ class DocumentStore {
   // OptimizedUpdateSchemaStore.
   //
   // Returns;
-  //   OK on success
+  //   UpdateSchemaStoreResult on success
   //   INTERNAL_ERROR on IO error
-  libtextclassifier3::Status UpdateSchemaStore(const SchemaStore* schema_store);
+  libtextclassifier3::StatusOr<UpdateSchemaStoreResult> UpdateSchemaStore(
+      const SchemaStore* schema_store);
 
-  // Performs the same funtionality as UpdateSchemaStore, but this can be more
+  // Performs the same functionality as UpdateSchemaStore, but this can be more
   // optimized in terms of less disk reads and less work if we know exactly
   // what's changed between the old and new SchemaStore.
   //
+  // NOTE: This function may delete documents. A document may be invalidated by
+  // the new SchemaStore, such as failing validation or having its schema type
+  // deleted from the schema.
+  //
   // Returns;
-  //   OK on success
+  //   UpdateSchemaStoreResult on success
   //   INTERNAL_ERROR on IO error
-  libtextclassifier3::Status OptimizedUpdateSchemaStore(
+  libtextclassifier3::StatusOr<UpdateSchemaStoreResult>
+  OptimizedUpdateSchemaStore(
       const SchemaStore* schema_store,
       const SchemaStore::SetSchemaResult& set_schema_result);
 
@@ -533,6 +689,16 @@ class DocumentStore {
 
     // A set of blob handles that are dead and need to be removed.
     std::unordered_set<std::string> dead_blob_handles;
+
+    // DeletionEvents for the expired documents that weren't copied into the
+    // new directory, in order of document id. Their deletion timestamps are
+    // not set, since the deletion only happens once the caller switches to the
+    // new document store; see PutExpiredDocumentDeletionEvents(). Expired
+    // documents that have been replaced by a newer document with the same
+    // namespace and uri are skipped (see IsReplaced()).
+    //
+    // Only populated if deletion events are enabled (see Create()).
+    std::vector<DeletionEvent> expired_document_deletion_events;
   };
   // Copy data from current base directory into a new directory. Any outdated or
   // deleted data won't be copied. During the process, document/namespace ids
@@ -598,12 +764,20 @@ class DocumentStore {
                          const SchemaStore* schema_store,
                          const FeatureFlags* feature_flags,
                          bool pre_mapping_fbv, bool use_persistent_hash_map,
-                         int32_t compression_level);
+                         int32_t compression_level,
+                         uint32_t compression_threshold_bytes,
+                         int32_t compression_mem_level,
+                         DeletionStore* deletion_store);
 
   const Filesystem* const filesystem_;
   const std::string base_dir_;
   const Clock& clock_;
   const FeatureFlags& feature_flags_;  // Does not own.
+
+  // Stores a DeletionEvent for every deleted document. Does not own. May be
+  // null, in which case (or if offline observers are disabled) no
+  // DeletionEvents are put.
+  DeletionStore* const deletion_store_;
 
   // Handles the ground truth schema and all of the derived data off of the
   // schema
@@ -622,6 +796,10 @@ class DocumentStore {
   bool use_persistent_hash_map_;
 
   const int32_t compression_level_;
+  const uint32_t compression_threshold_bytes_;
+
+  // Level of memory usage for compression.
+  const int32_t compression_mem_level_;
 
   // A log used to store all documents, it serves as a ground truth of doc
   // store. key_mapper_ and document_id_mapper_ can be regenerated from it.
@@ -634,6 +812,10 @@ class DocumentStore {
 
   // DocumentId to file offset mapping
   std::unique_ptr<FileBackedVector<int64_t>> document_id_mapper_;
+
+  // DocumentId to URI mapping
+  std::unique_ptr<PersistentIdToStringMapper<DocumentId>>
+      document_id_to_uri_mapper_;
 
   // A cache of document associated scores. The ground truth of the scores is
   // DocumentProto stored in document_log_. This cache contains:
@@ -669,7 +851,7 @@ class DocumentStore {
   std::unique_ptr<KeyMapper<NamespaceId>> namespace_mapper_;
 
   // Maps a corpus, i.e. a (namespace, schema type) pair, to a densely-assigned
-  // unique id. A coprus is assigned an
+  // unique id. A corpus is assigned an
   // id when the first document belonging to that corpus is added to the
   // DocumentStore. Corpus ids may be removed from the mapper during compaction.
   std::unique_ptr<
@@ -680,6 +862,11 @@ class DocumentStore {
   // considered as ground truth. Usage scores are associated with document ids
   // so they need to be updated when document ids change.
   std::unique_ptr<UsageStore> usage_store_;
+
+  // The largest timestamp issued by IssueTimestampMs() so far. Used to keep
+  // issued timestamps strictly increasing even if the system clock moves
+  // backwards. 0 if none has been issued.
+  int64_t last_issued_timestamp_ms_ = 0;
 
   // Used internally to indicate whether the class has been initialized. This is
   // to guard against cases where the object has been created, but Initialize
@@ -723,7 +910,96 @@ class DocumentStore {
   //   document_id
   //      mapper.
   //   3. Create header and store the updated combined checksum
+  //
+  // Returns:
+  //   OK on success.
+  //   DATA_LOSS if data was lost during regeneration (e.g. due to truncating
+  //             zero-filled entries).
+  //   Error on failure.
   libtextclassifier3::Status RegenerateDerivedFiles(bool revalidate_documents);
+
+  // Fills the effective_last_update_timestamp_ms of score cache entries that
+  // are 0 (documents put without a timestamp, and erased documents), so that
+  // the score cache is non-decreasing by document id.
+  //
+  // Does nothing if no timestamp has been issued yet, i.e. the document log
+  // header value is 0 and every entry is 0. Otherwise every 0 entry is filled:
+  //   - Entries followed by a non-zero entry get the timestamp of the next
+  //     non-zero entry.
+  //   - Trailing entries get max(current system time, largest + 1), where
+  //     largest is the max of the last non-zero entry and the document log
+  //     header value, and the value is recorded in the document log header.
+  // No document entries in the document log are modified.
+  libtextclassifier3::Status FillMissingEffectiveLastUpdateTimestamps();
+
+  // Sets last_issued_timestamp_ms_ to the largest of the value stored in the
+  // document log header and the largest effective_last_update_timestamp_ms in
+  // the score cache. The header value can be behind or reset (e.g. after a
+  // header checksum mismatch or by an older version of the code), and the
+  // score cache covers every document that is still in the log.
+  void RestoreLastIssuedTimestamp();
+
+  // Returns whether DeletionEvents should be put into deletion_store_.
+  bool ShouldPutDeletionEvents() const {
+    return feature_flags_.enable_offline_observers() &&
+           deletion_store_ != nullptr;
+  }
+
+  // Returns whether document, which has document_id, has been replaced by a
+  // newer document with the same namespace and uri.
+  //
+  // An expired document isn't deleted when a newer document with the same
+  // namespace and uri is put, so it can still be removed (e.g. force deleted or
+  // purged by optimize) afterwards. Its namespace and uri then refer to the
+  // newer document, which still exists, so the removal isn't a deletion from
+  // the client's perspective and shouldn't get a DeletionEvent.
+  //
+  // Returns:
+  //   Whether the document has been replaced on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::StatusOr<bool> IsReplaced(
+      DocumentId document_id, const DocumentProto& document) const;
+
+  // Creates a DeletionEvent, without a deletion timestamp, for document, which
+  // has document_id. The last update timestamp is read from the score cache, so
+  // this must be called before the document's derived data is cleared.
+  //
+  // Returns:
+  //   The DeletionEvent on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::StatusOr<DeletionEvent> CreateDeletionEvent(
+      DocumentId document_id, const DocumentProto& document) const;
+
+  // Reads the expired document with document_id from the DocumentLog, creates
+  // its DeletionEvent with CreateDeletionEvent, and appends it to
+  // deletion_events. Nothing is appended if the document has been replaced
+  // (see IsReplaced()).
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::Status AppendDeletionEvent(
+      DocumentId document_id,
+      std::vector<DeletionEvent>* deletion_events) const;
+
+  // Issues a deletion timestamp for deletion_event and puts it into
+  // deletion_store_.
+  //
+  // REQUIRES: ShouldPutDeletionEvents() is true.
+  //
+  // Returns:
+  //   OK on success
+  //   INTERNAL_ERROR on IO error
+  libtextclassifier3::Status PutDeletionEvent(DeletionEvent deletion_event);
+
+  // Implementation of Delete(document_id, current_time_ms). is_replacement is
+  // true when the document is deleted because a newer document with the same
+  // namespace and uri replaced it (see InternalPut()). Unless is_replacement is
+  // true, also puts a DeletionEvent for the document if
+  // ShouldPutDeletionEvents() is true.
+  libtextclassifier3::Status InternalDelete(DocumentId document_id,
+                                            int64_t current_time_ms,
+                                            bool is_replacement);
 
   // Resets the unique_ptr to the document_key_mapper, deletes the underlying
   // file, and re-creates a new instance of the document_key_mapper .
@@ -736,6 +1012,13 @@ class DocumentStore {
   //
   // Returns OK or any IO errors.
   libtextclassifier3::Status ResetDocumentIdMapper();
+
+  // Resets the unique_ptr to the document_id_to_uri_mapper, deletes the
+  // underlying files, and re-creates a new instance of the
+  // document_id_to_uri_mapper.
+  //
+  // Returns OK or any IO errors.
+  libtextclassifier3::Status ResetDocumentIdToUriMapper();
 
   // Resets the unique_ptr to the score_cache, deletes the underlying file, and
   // re-creates a new instance of the score_cache.
@@ -778,7 +1061,7 @@ class DocumentStore {
   bool HeaderExists();
 
   libtextclassifier3::StatusOr<PutResult> InternalPut(
-      DocumentProto&& document,
+      const DocumentWrapper& document_wrapper,
       PutDocumentStatsProto* put_document_stats = nullptr);
 
   // Helper function to do batch deletes. Documents with the given
@@ -811,32 +1094,16 @@ class DocumentStore {
   libtextclassifier3::StatusOr<CorpusAssociatedScoreData>
   GetCorpusAssociatedScoreDataToUpdate(CorpusId corpus_id) const;
 
-  // Check if a document exists. Existence means it hasn't been deleted and it
-  // hasn't expired yet.
-  //
-  // Returns:
-  //   OK if the document exists
-  //   INVALID_ARGUMENT if document_id is less than 0 or greater than the
-  //                    maximum value
-  //   NOT_FOUND if the document doesn't exist (i.e. deleted or expired)
-  //   INTERNAL_ERROR on IO error
-  libtextclassifier3::Status DoesDocumentExistWithStatus(
-      DocumentId document_id) const;
-
-  // Checks if a document has been deleted
+  // Checks if a document has been deleted.
   //
   // This is for internal-use only because we assume that the document_id is
-  // already valid. If you're unsure if the document_id is valid, use
-  // DoesDocumentExist(document_id) instead, which will perform those additional
-  // checks.
+  // already valid.
   bool IsDeleted(DocumentId document_id) const;
 
   // Checks if a document has expired.
   //
   // This is for internal-use only because we assume that the document_id is
-  // already valid. If you're unsure if the document_id is valid, use
-  // DoesDocumentExist(document_id) instead, which will perform those additional
-  // checks.
+  // already valid.
 
   // Returns:
   //   True:DocumentFilterData  if the given document isn't expired.
@@ -856,8 +1123,15 @@ class DocumentStore {
   libtextclassifier3::Status UpdateFilterCache(
       DocumentId document_id, const DocumentFilterData& filter_data);
 
-  // Helper method to clear the derived data of a document
+  // Helper method to clear the derived data of a deleted document. The
+  // document's existing entry in the score cache must exist.
   libtextclassifier3::Status ClearDerivedData(DocumentId document_id);
+
+  // Helper method to write the derived data of document_id as a deleted
+  // document, with the given effective_last_update_timestamp_ms in the score
+  // cache.
+  libtextclassifier3::Status ResetDerivedData(
+      DocumentId document_id, int64_t effective_last_update_timestamp_ms);
 
   // Sets usage scores for the given document.
   libtextclassifier3::Status SetUsageScores(

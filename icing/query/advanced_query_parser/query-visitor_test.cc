@@ -14,6 +14,7 @@
 
 #include "icing/query/advanced_query_parser/query-visitor.h"
 
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <iterator>
@@ -35,16 +36,18 @@
 #include "icing/file/filesystem.h"
 #include "icing/file/portable-file-backed-proto-log.h"
 #include "icing/index/embed/embedding-index.h"
+#include "icing/index/embed/embedding-query-results.h"
 #include "icing/index/hit/hit.h"
 #include "icing/index/index.h"
-#include "icing/index/iterator/doc-hit-info-iterator-filter.h"
 #include "icing/index/iterator/doc-hit-info-iterator-test-util.h"
 #include "icing/index/iterator/doc-hit-info-iterator.h"
+#include "icing/index/iterator/document-filter-predicate.h"
 #include "icing/index/numeric/dummy-numeric-index.h"
 #include "icing/index/numeric/numeric-index.h"
 #include "icing/index/property-existence-indexing-handler.h"
 #include "icing/jni/jni-cache.h"
 #include "icing/legacy/index/icing-filesystem.h"
+#include "icing/portable/gzip_stream.h"
 #include "icing/portable/platform.h"
 #include "icing/proto/search.pb.h"
 #include "icing/query/advanced_query_parser/abstract-syntax-tree.h"
@@ -52,9 +55,11 @@
 #include "icing/query/advanced_query_parser/parser.h"
 #include "icing/query/query-features.h"
 #include "icing/query/query-results.h"
+#include "icing/query/query-utils.h"
 #include "icing/schema-builder.h"
 #include "icing/schema/schema-store.h"
 #include "icing/schema/section.h"
+#include "icing/scoring/advanced_scoring/double-list.h"
 #include "icing/store/document-id.h"
 #include "icing/store/document-store.h"
 #include "icing/store/namespace-id.h"
@@ -72,6 +77,7 @@
 #include "icing/transform/normalizer-options.h"
 #include "icing/transform/normalizer.h"
 #include "icing/util/clock.h"
+#include "icing/util/document-util.h"
 #include "icing/util/icu-data-file-helper.h"
 #include "icing/util/status-macros.h"
 #include "unicode/uloc.h"
@@ -86,7 +92,7 @@ using ::testing::DoubleNear;
 using ::testing::ElementsAre;
 using ::testing::IsEmpty;
 using ::testing::IsNull;
-using ::testing::Pointee;
+using ::testing::SizeIs;
 using ::testing::UnorderedElementsAre;
 
 constexpr float kEps = 0.000001;
@@ -163,15 +169,52 @@ SearchSpecProto CreateSearchSpec(std::string query,
       /*embedding_query_vectors=*/{}, EMBEDDING_METRIC_UNKNOWN);
 }
 
+bool ContainsMatchInfoEntry(EmbeddingQueryResults& embedding_query_results,
+                            const EmbeddingMatchInfos* match_info, double score,
+                            int position_in_section, SectionId section_id) {
+  if (match_info == nullptr ||
+      embedding_query_results.global_section_infos->empty()) {
+    return false;
+  }
+
+  DoubleList matched_scores =
+      embedding_query_results.GetMatchedScoresFromEmbeddingMatchInfos(
+          *match_info);
+
+  for (int i = 0; i < matched_scores.size(); ++i) {
+    const EmbeddingMatchInfos::EmbeddingMatchSectionInfo& section_info =
+        embedding_query_results.global_section_infos->at(
+            i + match_info->score_start_index);
+    if (std::fabs(matched_scores.data()[i] - score) < kEps &&
+        section_info.position == position_in_section &&
+        section_info.section_id == section_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
 enum class QueryType {
   kPlain,
   kSearch,
 };
 
-class QueryVisitorTest : public ::testing::TestWithParam<QueryType> {
+struct QueryVisitorTestParams {
+  QueryType query_type;
+  bool get_embedding_match_info;
+
+  explicit QueryVisitorTestParams(QueryType query_type,
+                                  bool get_embedding_match_info)
+      : query_type(query_type),
+        get_embedding_match_info(get_embedding_match_info) {}
+};
+
+class QueryVisitorTest
+    : public ::testing::TestWithParam<QueryVisitorTestParams> {
  protected:
   void SetUp() override {
     feature_flags_ = std::make_unique<FeatureFlags>(GetTestFeatureFlags());
+
     test_dir_ = GetTestTempDir() + "/icing";
     index_dir_ = test_dir_ + "/index";
     numeric_index_dir_ = test_dir_ + "/numeric_index";
@@ -203,22 +246,26 @@ class QueryVisitorTest : public ::testing::TestWithParam<QueryType> {
 
     ICING_ASSERT_OK_AND_ASSIGN(
         DocumentStore::CreateResult create_result,
-        DocumentStore::Create(&filesystem_, store_dir_, &clock_,
-                              schema_store_.get(), feature_flags_.get(),
-                              /*force_recovery_and_revalidate_documents=*/false,
-                              /*pre_mapping_fbv=*/false,
-                              /*use_persistent_hash_map=*/true,
-                              PortableFileBackedProtoLog<
-                                  DocumentWrapper>::kDefaultCompressionLevel,
-                              /*initialize_stats=*/nullptr));
+        DocumentStore::Create(
+            &filesystem_, store_dir_, &clock_, schema_store_.get(),
+            feature_flags_.get(),
+            /*force_recovery_and_revalidate_documents=*/false,
+            /*pre_mapping_fbv=*/false,
+            /*use_persistent_hash_map=*/true,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionLevel,
+            PortableFileBackedProtoLog<
+                DocumentWrapper>::kDefaultCompressionThresholdBytes,
+            protobuf_ports::kDefaultMemLevel,
+            /*initialize_stats=*/nullptr));
     document_store_ = std::move(create_result.document_store);
 
     Index::Options options(index_dir_.c_str(),
                            /*index_merge_size=*/1024 * 1024,
-                           /*lite_index_sort_at_indexing=*/true,
                            /*lite_index_sort_size=*/1024 * 8);
     ICING_ASSERT_OK_AND_ASSIGN(
-        index_, Index::Create(options, &filesystem_, &icing_filesystem_));
+        index_, Index::Create(options, &filesystem_, &icing_filesystem_,
+                              feature_flags_.get()));
 
     ICING_ASSERT_OK_AND_ASSIGN(
         numeric_index_,
@@ -227,7 +274,8 @@ class QueryVisitorTest : public ::testing::TestWithParam<QueryType> {
     ICING_ASSERT_OK_AND_ASSIGN(
         embedding_index_,
         EmbeddingIndex::Create(&filesystem_, embedding_index_dir_, &clock_,
-                               feature_flags_.get()));
+                               feature_flags_.get(),
+                               /*num_shards=*/32));
 
     NormalizerOptions normalizer_options(
         /*max_term_byte_size=*/std::numeric_limits<int32_t>::max());
@@ -244,6 +292,10 @@ class QueryVisitorTest : public ::testing::TestWithParam<QueryType> {
                                tokenizer_factory::CreateIndexingTokenizer(
                                    StringIndexingConfig::TokenizerType::PLAIN,
                                    language_segmenter_.get()));
+
+    document_filter_predicate_ = GetFilterPredicateBySchemaAndNamespace(
+        SearchSpecProto::default_instance(), *document_store_, *schema_store_,
+        clock_.GetSystemTimeMilliseconds());
   }
 
   libtextclassifier3::StatusOr<std::unique_ptr<Node>> ParseQueryHelper(
@@ -257,13 +309,14 @@ class QueryVisitorTest : public ::testing::TestWithParam<QueryType> {
 
   libtextclassifier3::StatusOr<QueryResults> ProcessQuery(
       const SearchSpecProto& search_spec, const Node* root_node) {
+    bool get_embedding_match_info = GetParam().get_embedding_match_info;
     QueryVisitor query_visitor(
         index_.get(), numeric_index_.get(), embedding_index_.get(),
         document_store_.get(), schema_store_.get(), normalizer_.get(),
         tokenizer_.get(), /*join_children_fetcher=*/nullptr, search_spec,
-        DocHitInfoIteratorFilter::Options(),
-        /*needs_term_frequency_info=*/true, feature_flags_.get(),
-        clock_.GetSystemTimeMilliseconds());
+        document_filter_predicate_.get(),
+        /*needs_term_frequency_info=*/true, get_embedding_match_info,
+        feature_flags_.get(), clock_.GetSystemTimeMilliseconds());
     root_node->Accept(&query_visitor);
     return std::move(query_visitor).ConsumeResults();
   }
@@ -290,7 +343,7 @@ class QueryVisitorTest : public ::testing::TestWithParam<QueryType> {
 
   std::string CreateQuery(std::string query,
                           std::string property_restrict = "") {
-    switch (GetParam()) {
+    switch (GetParam().query_type) {
       case QueryType::kPlain:
         if (property_restrict.empty()) {
           // CreateQuery("foo bar") returns `foo bar`
@@ -330,6 +383,7 @@ class QueryVisitorTest : public ::testing::TestWithParam<QueryType> {
   std::unique_ptr<Normalizer> normalizer_;
   std::unique_ptr<LanguageSegmenter> language_segmenter_;
   std::unique_ptr<Tokenizer> tokenizer_;
+  std::unique_ptr<DocumentFilterPredicate> document_filter_predicate_;
   std::unique_ptr<const JniCache> jni_cache_;
 };
 
@@ -351,7 +405,7 @@ TEST_P(QueryVisitorTest, SimpleLessThan) {
 
   std::string query = CreateQuery("price < 2");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -386,7 +440,7 @@ TEST_P(QueryVisitorTest, SimpleLessThanEq) {
   std::string query = CreateQuery("price <= 1");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -421,7 +475,7 @@ TEST_P(QueryVisitorTest, SimpleEqual) {
   std::string query = CreateQuery("price == 2");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -456,7 +510,7 @@ TEST_P(QueryVisitorTest, SimpleGreaterThanEq) {
   std::string query = CreateQuery("price >= 1");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -491,7 +545,7 @@ TEST_P(QueryVisitorTest, SimpleGreaterThan) {
   std::string query = CreateQuery("price > 1");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -527,7 +581,7 @@ TEST_P(QueryVisitorTest, IntMinLessThanEqual) {
   std::string query = CreateQuery("price <= " + std::to_string(int_min));
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -563,7 +617,7 @@ TEST_P(QueryVisitorTest, IntMaxGreaterThanEqual) {
   std::string query = CreateQuery("price >= " + std::to_string(int_max));
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -600,7 +654,7 @@ TEST_P(QueryVisitorTest, NestedPropertyLessThan) {
   std::string query = CreateQuery("subscription.price < 2");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -716,7 +770,7 @@ TEST_P(QueryVisitorTest, LessThanNonExistentPropertyNotFound) {
 
   std::string query = CreateQuery("time < 25");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -735,9 +789,9 @@ TEST_P(QueryVisitorTest, NeverVisitedReturnsInvalid) {
       index_.get(), numeric_index_.get(), embedding_index_.get(),
       document_store_.get(), schema_store_.get(), normalizer_.get(),
       tokenizer_.get(), /*join_children_fetcher=*/nullptr, search_spec,
-      DocHitInfoIteratorFilter::Options(),
-      /*needs_term_frequency_info=*/true, feature_flags_.get(),
-      clock_.GetSystemTimeMilliseconds());
+      document_filter_predicate_.get(),
+      /*needs_term_frequency_info=*/true, /*get_embedding_match_info=*/false,
+      feature_flags_.get(), clock_.GetSystemTimeMilliseconds());
   EXPECT_THAT(std::move(query_visitor).ConsumeResults(),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
@@ -804,8 +858,8 @@ TEST_P(QueryVisitorTest, NumericComparatorDoesntAffectLaterTerms) {
   // - Doc0: ["-2", "-1", "1", "2"] and [-2, -1, 1, 2]
   // - Doc1: [-1]
   // - Doc2: ["2"] and [-1]
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   std::unique_ptr<NumericIndex<int64_t>::Editor> editor =
       numeric_index_->Edit("price", kDocumentId0, kSectionId0);
   ICING_ASSERT_OK(editor->BufferKey(-2));
@@ -821,14 +875,14 @@ TEST_P(QueryVisitorTest, NumericComparatorDoesntAffectLaterTerms) {
   ICING_ASSERT_OK(term_editor.BufferTerm("2", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(term_editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = numeric_index_->Edit("price", kDocumentId1, kSectionId0);
   ICING_ASSERT_OK(editor->BufferKey(-1));
   ICING_ASSERT_OK(std::move(*editor).IndexAllBufferedKeys());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = numeric_index_->Edit("price", kDocumentId2, kSectionId0);
   ICING_ASSERT_OK(editor->BufferKey(-1));
   ICING_ASSERT_OK(std::move(*editor).IndexAllBufferedKeys());
@@ -845,7 +899,7 @@ TEST_P(QueryVisitorTest, NumericComparatorDoesntAffectLaterTerms) {
   // match.
   std::string query = CreateQuery("price == -1 -2");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kNumericSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -932,9 +986,9 @@ TEST_P(QueryVisitorTest, SingleTermTermFrequencyDisabled) {
       index_.get(), numeric_index_.get(), embedding_index_.get(),
       document_store_.get(), schema_store_.get(), normalizer_.get(),
       tokenizer_.get(), /*join_children_fetcher=*/nullptr, search_spec,
-      DocHitInfoIteratorFilter::Options(),
-      /*needs_term_frequency_info=*/false, feature_flags_.get(),
-      clock_.GetSystemTimeMilliseconds());
+      document_filter_predicate_.get(),
+      /*needs_term_frequency_info=*/false, /*get_embedding_match_info=*/false,
+      feature_flags_.get(), clock_.GetSystemTimeMilliseconds());
   root_node->Accept(&query_visitor);
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
                              std::move(query_visitor).ConsumeResults());
@@ -1097,7 +1151,7 @@ TEST_P(QueryVisitorTest, SingleVerbatimTerm) {
 
   std::string query = CreateQuery("\"foo:bar(baz)\"");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1183,7 +1237,7 @@ TEST_P(QueryVisitorTest, VerbatimTermEscapingQuote) {
   // `foobar\"`
   std::string query = CreateQuery(R"(("foobar\""))");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1226,7 +1280,7 @@ TEST_P(QueryVisitorTest, VerbatimTermEscapingEscape) {
   // Issue a query for the verbatim token `foobar\`.
   std::string query = CreateQuery(R"(("foobar\\"))");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1271,7 +1325,7 @@ TEST_P(QueryVisitorTest, VerbatimTermEscapingNonSpecialChar) {
   // Issue a query for the verbatim token `foobary`.
   std::string query = CreateQuery(R"(("foobar\y"))");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1290,7 +1344,7 @@ TEST_P(QueryVisitorTest, VerbatimTermEscapingNonSpecialChar) {
   // Issue a query for the verbatim token `foobar\y`.
   query = CreateQuery(R"(("foobar\\y"))");
   ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1336,7 +1390,7 @@ TEST_P(QueryVisitorTest, VerbatimTermNewLine) {
   // Issue a query for the verbatim token `foobar` + '\n'.
   std::string query = CreateQuery("\"foobar\n\"");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1355,7 +1409,7 @@ TEST_P(QueryVisitorTest, VerbatimTermNewLine) {
   query = CreateQuery(R"(("foobar\\n"))");
   ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(query));
 
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1395,7 +1449,7 @@ TEST_P(QueryVisitorTest, VerbatimTermEscapingComplex) {
   // Issue a query for the verbatim token `foo\"bar\nbaz"`.
   std::string query = CreateQuery(R"(("foo\\\"bar\\nbaz\""))");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kVerbatimSearchFeature,
                                      kListFilterQueryLanguageFeature));
@@ -1421,22 +1475,22 @@ TEST_P(QueryVisitorTest, SingleMinusTerm) {
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -1446,7 +1500,7 @@ TEST_P(QueryVisitorTest, SingleMinusTerm) {
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
   EXPECT_THAT(ExtractKeys(query_results.query_terms), IsEmpty());
   EXPECT_THAT(query_results.query_term_iterators, IsEmpty());
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1465,22 +1519,22 @@ TEST_P(QueryVisitorTest, SingleNotTerm) {
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -1505,8 +1559,8 @@ TEST_P(QueryVisitorTest, NestedNotTerms) {
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -1514,16 +1568,16 @@ TEST_P(QueryVisitorTest, NestedNotTerms) {
   ICING_ASSERT_OK(editor.BufferTerm("baz", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.BufferTerm("baz", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -1553,8 +1607,8 @@ TEST_P(QueryVisitorTest, DeeplyNestedNotTerms) {
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -1562,16 +1616,16 @@ TEST_P(QueryVisitorTest, DeeplyNestedNotTerms) {
   ICING_ASSERT_OK(editor.BufferTerm("baz", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.BufferTerm("baz", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -1622,7 +1676,7 @@ TEST_P(QueryVisitorTest, ImplicitAndTerms) {
 
   std::string query = CreateQuery("foo bar");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1656,7 +1710,7 @@ TEST_P(QueryVisitorTest, ExplicitAndTerms) {
 
   std::string query = CreateQuery("foo AND bar");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1690,7 +1744,7 @@ TEST_P(QueryVisitorTest, OrTerms) {
 
   std::string query = CreateQuery("foo OR bar");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1726,7 +1780,7 @@ TEST_P(QueryVisitorTest, AndOrTermPrecedence) {
   // Should be interpreted like `foo (bar OR baz)`
   std::string query = CreateQuery("foo bar OR baz");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1743,7 +1797,7 @@ TEST_P(QueryVisitorTest, AndOrTermPrecedence) {
   // Should be interpreted like `(bar OR baz) foo`
   query = CreateQuery("bar OR baz foo");
   ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1759,7 +1813,7 @@ TEST_P(QueryVisitorTest, AndOrTermPrecedence) {
 
   query = CreateQuery("(bar OR baz) foo");
   ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1785,23 +1839,23 @@ TEST_P(QueryVisitorTest, AndOrNotPrecedence) {
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -1855,22 +1909,22 @@ TEST_P(QueryVisitorTest, PropertyFilter) {
   SectionId prop1_section_id = 0;
   SectionId prop2_section_id = 1;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -1883,7 +1937,7 @@ TEST_P(QueryVisitorTest, PropertyFilter) {
   EXPECT_THAT(query_results.query_terms["prop1"], UnorderedElementsAre("foo"));
   EXPECT_THAT(ExtractKeys(query_results.query_term_iterators),
               UnorderedElementsAre("foo"));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -1893,7 +1947,7 @@ TEST_P(QueryVisitorTest, PropertyFilter) {
               ElementsAre(kDocumentId1, kDocumentId0));
 }
 
-TEST_F(QueryVisitorTest, MultiPropertyFilter) {
+TEST_P(QueryVisitorTest, MultiPropertyFilter) {
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
           .AddType(SchemaTypeConfigBuilder()
@@ -1921,22 +1975,22 @@ TEST_F(QueryVisitorTest, MultiPropertyFilter) {
   SectionId prop2_section_id = 1;
   SectionId prop3_section_id = 2;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop3_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2001,22 +2055,22 @@ TEST_P(QueryVisitorTest, PropertyFilterNonNormalized) {
   SectionId prop1_section_id = 0;
   SectionId prop2_section_id = 1;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2029,7 +2083,7 @@ TEST_P(QueryVisitorTest, PropertyFilterNonNormalized) {
   EXPECT_THAT(query_results.query_terms["PROP1"], UnorderedElementsAre("foo"));
   EXPECT_THAT(ExtractKeys(query_results.query_term_iterators),
               UnorderedElementsAre("foo"));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -2061,22 +2115,22 @@ TEST_P(QueryVisitorTest, PropertyFilterWithGrouping) {
   SectionId prop1_section_id = 0;
   SectionId prop2_section_id = 1;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2119,22 +2173,22 @@ TEST_P(QueryVisitorTest, ValidNestedPropertyFilter) {
   SectionId prop1_section_id = 0;
   SectionId prop2_section_id = 1;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2188,22 +2242,22 @@ TEST_P(QueryVisitorTest, InvalidNestedPropertyFilter) {
   SectionId prop1_section_id = 0;
   SectionId prop2_section_id = 1;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2253,22 +2307,22 @@ TEST_P(QueryVisitorTest, NotWithPropertyFilter) {
   SectionId prop1_section_id = 0;
   SectionId prop2_section_id = 1;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2333,22 +2387,22 @@ TEST_P(QueryVisitorTest, PropertyFilterWithNot) {
   //   Doc2:
   //     prop1: ""
   //     prop2: "foo"
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2418,8 +2472,8 @@ TEST_P(QueryVisitorTest, SegmentationTest) {
   // ICU segmentation will break this into "每天" and "上班".
   // CFStringTokenizer (ios) will break this into "每", "天" and "上班"
   std::string query = CreateQuery("每天上班");
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("上班", TERM_MATCH_PREFIX));
@@ -2434,15 +2488,15 @@ TEST_P(QueryVisitorTest, SegmentationTest) {
   }
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("上班", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop2_section_id,
                         /*namespace_id=*/0);
   if (IsCfStringTokenization()) {
@@ -2454,7 +2508,7 @@ TEST_P(QueryVisitorTest, SegmentationTest) {
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -2503,8 +2557,9 @@ TEST_P(QueryVisitorTest, PropertyRestrictsPopCorrectly) {
   // - Doc 0: Contains 'val0', 'val1', 'val2' in 'prop0'. Shouldn't match.
   DocumentProto doc =
       DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result0,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result0,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid0 = put_result0.new_document_id;
   Index::Editor editor = index_->Edit(docid0, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2514,8 +2569,9 @@ TEST_P(QueryVisitorTest, PropertyRestrictsPopCorrectly) {
 
   // - Doc 1: Contains 'val0', 'val1', 'val2' in 'prop1'. Should match.
   doc = DocumentBuilder(doc).SetUri("uri1").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result1,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result1,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid1 = put_result1.new_document_id;
   editor = index_->Edit(docid1, prop1_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2525,8 +2581,9 @@ TEST_P(QueryVisitorTest, PropertyRestrictsPopCorrectly) {
 
   // - Doc 2: Contains 'val0', 'val1', 'val2' in 'prop2'. Shouldn't match.
   doc = DocumentBuilder(doc).SetUri("uri2").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result2,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result2,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid2 = put_result2.new_document_id;
   editor = index_->Edit(docid2, prop2_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2536,8 +2593,9 @@ TEST_P(QueryVisitorTest, PropertyRestrictsPopCorrectly) {
 
   // - Doc 3: Contains 'val0' in 'prop0', 'val1' in 'prop1' etc. Should match.
   doc = DocumentBuilder(doc).SetUri("uri3").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result3,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result3,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid3 = put_result3.new_document_id;
   editor = index_->Edit(docid3, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2552,8 +2610,9 @@ TEST_P(QueryVisitorTest, PropertyRestrictsPopCorrectly) {
   // - Doc 4: Contains 'val1' in 'prop0', 'val2' in 'prop1', 'val0' in 'prop2'.
   //          Shouldn't match.
   doc = DocumentBuilder(doc).SetUri("uri4").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result4,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result4,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid4 = put_result4.new_document_id;
   editor = index_->Edit(docid4, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val1", TERM_MATCH_PREFIX));
@@ -2573,7 +2632,7 @@ TEST_P(QueryVisitorTest, PropertyRestrictsPopCorrectly) {
   std::string query = absl_ports::StrCat(
       "val0 ", CreateQuery("val1", /*property_restrict=*/"prop1"), " val2");
   ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results, ProcessQuery(query));
-  if (GetParam() == QueryType::kSearch) {
+  if (GetParam().query_type == QueryType::kSearch) {
     EXPECT_THAT(query_results.features_in_use,
                 UnorderedElementsAre(kListFilterQueryLanguageFeature));
   } else {
@@ -2617,8 +2676,9 @@ TEST_P(QueryVisitorTest, UnsatisfiablePropertyRestrictsPopCorrectly) {
   // - Doc 0: Contains 'val0', 'val1', 'val2' in 'prop0'. Should match.
   DocumentProto doc =
       DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result0,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result0,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid0 = put_result0.new_document_id;
   Index::Editor editor = index_->Edit(docid0, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2628,8 +2688,9 @@ TEST_P(QueryVisitorTest, UnsatisfiablePropertyRestrictsPopCorrectly) {
 
   // - Doc 1: Contains 'val0', 'val1', 'val2' in 'prop1'. Shouldn't match.
   doc = DocumentBuilder(doc).SetUri("uri1").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result1,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result1,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid1 = put_result1.new_document_id;
   editor = index_->Edit(docid1, prop1_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2639,8 +2700,9 @@ TEST_P(QueryVisitorTest, UnsatisfiablePropertyRestrictsPopCorrectly) {
 
   // - Doc 2: Contains 'val0', 'val1', 'val2' in 'prop2'. Should match.
   doc = DocumentBuilder(doc).SetUri("uri2").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result2,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result2,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid2 = put_result2.new_document_id;
   editor = index_->Edit(docid2, prop2_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2650,8 +2712,9 @@ TEST_P(QueryVisitorTest, UnsatisfiablePropertyRestrictsPopCorrectly) {
 
   // - Doc 3: Contains 'val0' in 'prop0', 'val1' in 'prop1' etc. Should match.
   doc = DocumentBuilder(doc).SetUri("uri3").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result3,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result3,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid3 = put_result3.new_document_id;
   editor = index_->Edit(docid3, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val0", TERM_MATCH_PREFIX));
@@ -2666,8 +2729,9 @@ TEST_P(QueryVisitorTest, UnsatisfiablePropertyRestrictsPopCorrectly) {
   // - Doc 4: Contains 'val1' in 'prop0', 'val2' in 'prop1', 'val0' in 'prop2'.
   //          Shouldn't match.
   doc = DocumentBuilder(doc).SetUri("uri4").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result4,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result4,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid4 = put_result4.new_document_id;
   editor = index_->Edit(docid4, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("val1", TERM_MATCH_PREFIX));
@@ -2701,25 +2765,25 @@ TEST_P(QueryVisitorTest, UnsatisfiablePropertyRestrictsPopCorrectly) {
               ElementsAre(docid3, docid2, docid0));
 }
 
-TEST_F(QueryVisitorTest, UnsupportedFunctionReturnsInvalidArgument) {
+TEST_P(QueryVisitorTest, UnsupportedFunctionReturnsInvalidArgument) {
   std::string query = "unsupportedFunction()";
   EXPECT_THAT(ProcessQuery(query),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest, SearchFunctionTooFewArgumentsReturnsInvalidArgument) {
+TEST_P(QueryVisitorTest, SearchFunctionTooFewArgumentsReturnsInvalidArgument) {
   std::string query = "search()";
   EXPECT_THAT(ProcessQuery(query),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest, SearchFunctionTooManyArgumentsReturnsInvalidArgument) {
+TEST_P(QueryVisitorTest, SearchFunctionTooManyArgumentsReturnsInvalidArgument) {
   std::string query = R"(search("foo", createList("subject"), "bar"))";
   EXPECT_THAT(ProcessQuery(query),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SearchFunctionWrongFirstArgumentTypeReturnsInvalidArgument) {
   // First argument type=TEXT, expected STRING.
   std::string query = "search(7)";
@@ -2732,7 +2796,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SearchFunctionWrongSecondArgumentTypeReturnsInvalidArgument) {
   // Second argument type=STRING, expected string list.
   std::string query = R"(search("foo", "bar"))";
@@ -2745,14 +2809,14 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SearchFunctionCreateListZeroPropertiesReturnsInvalidArgument) {
   std::string query = R"(search("foo", createList()))";
   EXPECT_THAT(ProcessQuery(query),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest, SearchFunctionNestedFunctionCalls) {
+TEST_P(QueryVisitorTest, SearchFunctionNestedFunctionCalls) {
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
           .AddType(SchemaTypeConfigBuilder()
@@ -2773,22 +2837,22 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedFunctionCalls) {
   // Section ids are assigned alphabetically.
   SectionId prop1_section_id = 0;
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, prop1_section_id,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId1, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("type").Build())));
   editor = index_->Edit(kDocumentId2, prop1_section_id,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2846,7 +2910,7 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedFunctionCalls) {
 
 // This test will nest `search` calls together with the set of restricts
 // narrowing at each level so that the set of docs matching the query shrinks.
-TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
+TEST_P(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
   PropertyConfigProto prop =
       PropertyConfigBuilder()
           .SetName("prop0")
@@ -2882,8 +2946,9 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
   NamespaceId ns_id = 0;
   DocumentProto doc =
       DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result0,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result0,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid0 = put_result0.new_document_id;
   Index::Editor editor = index_->Edit(kDocumentId0, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2891,7 +2956,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result1,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri1").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri1").Build())));
   DocumentId docid1 = put_result1.new_document_id;
   editor = index_->Edit(docid1, prop1_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2899,7 +2965,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result2,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri2").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri2").Build())));
   DocumentId docid2 = put_result2.new_document_id;
   editor = index_->Edit(docid2, prop2_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2907,7 +2974,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result3,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri3").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri3").Build())));
   DocumentId docid3 = put_result3.new_document_id;
   editor = index_->Edit(docid3, prop3_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2915,7 +2983,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result4,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri4").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri4").Build())));
   DocumentId docid4 = put_result4.new_document_id;
   editor = index_->Edit(docid4, prop4_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2923,7 +2992,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result5,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri5").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri5").Build())));
   DocumentId docid5 = put_result5.new_document_id;
   editor = index_->Edit(docid5, prop5_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2931,7 +3001,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result6,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri6").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri6").Build())));
   DocumentId docid6 = put_result6.new_document_id;
   editor = index_->Edit(docid6, prop6_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -2939,7 +3010,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result7,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri7").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri7").Build())));
   DocumentId docid7 = put_result7.new_document_id;
   editor = index_->Edit(docid7, prop7_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3006,7 +3078,7 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsNarrowing) {
 
 // This test will nest `search` calls together with the set of restricts
 // narrowing at each level so that the set of docs matching the query shrinks.
-TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
+TEST_P(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
   PropertyConfigProto prop =
       PropertyConfigBuilder()
           .SetName("prop0")
@@ -3042,8 +3114,9 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
   NamespaceId ns_id = 0;
   DocumentProto doc =
       DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result0,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result0,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid0 = put_result0.new_document_id;
   Index::Editor editor = index_->Edit(kDocumentId0, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3051,7 +3124,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result1,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri1").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri1").Build())));
   DocumentId docid1 = put_result1.new_document_id;
   editor = index_->Edit(docid1, prop1_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3059,7 +3133,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result2,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri2").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri2").Build())));
   DocumentId docid2 = put_result2.new_document_id;
   editor = index_->Edit(docid2, prop2_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3067,7 +3142,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result3,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri3").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri3").Build())));
   DocumentId docid3 = put_result3.new_document_id;
   editor = index_->Edit(docid3, prop3_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3075,7 +3151,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result4,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri4").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri4").Build())));
   DocumentId docid4 = put_result4.new_document_id;
   editor = index_->Edit(docid4, prop4_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3083,7 +3160,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result5,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri5").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri5").Build())));
   DocumentId docid5 = put_result5.new_document_id;
   editor = index_->Edit(docid5, prop5_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3091,7 +3169,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result6,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri6").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri6").Build())));
   DocumentId docid6 = put_result6.new_document_id;
   editor = index_->Edit(docid6, prop6_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3099,7 +3178,8 @@ TEST_F(QueryVisitorTest, SearchFunctionNestedPropertyRestrictsExpanding) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result7,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri7").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri7").Build())));
   DocumentId docid7 = put_result7.new_document_id;
   editor = index_->Edit(docid7, prop7_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3174,8 +3254,9 @@ TEST_P(QueryVisitorTest, QueryStringParameterHandlesPunctuation) {
   NamespaceId ns_id = 0;
   DocumentProto doc =
       DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result0,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result0,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid0 = put_result0.new_document_id;
   Index::Editor editor = index_->Edit(kDocumentId0, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3184,7 +3265,8 @@ TEST_P(QueryVisitorTest, QueryStringParameterHandlesPunctuation) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result1,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri1").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri1").Build())));
   DocumentId docid1 = put_result1.new_document_id;
   editor = index_->Edit(docid1, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -3192,7 +3274,8 @@ TEST_P(QueryVisitorTest, QueryStringParameterHandlesPunctuation) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result2,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri2").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri2").Build())));
   DocumentId docid2 = put_result2.new_document_id;
   editor = index_->Edit(docid2, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3293,8 +3376,9 @@ TEST_P(QueryVisitorTest, QueryStringParameterPropertyRestricts) {
   NamespaceId ns_id = 0;
   DocumentProto doc =
       DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build();
-  ICING_ASSERT_OK_AND_ASSIGN(DocumentStore::PutResult put_result0,
-                             document_store_->Put(doc));
+  ICING_ASSERT_OK_AND_ASSIGN(
+      DocumentStore::PutResult put_result0,
+      document_store_->Put(document_util::CreateDocumentWrapper(doc)));
   DocumentId docid0 = put_result0.new_document_id;
   Index::Editor editor = index_->Edit(docid0, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3303,7 +3387,8 @@ TEST_P(QueryVisitorTest, QueryStringParameterPropertyRestricts) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result1,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri1").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri1").Build())));
   DocumentId docid1 = put_result1.new_document_id;
   editor = index_->Edit(docid1, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -3314,7 +3399,8 @@ TEST_P(QueryVisitorTest, QueryStringParameterPropertyRestricts) {
 
   ICING_ASSERT_OK_AND_ASSIGN(
       DocumentStore::PutResult put_result2,
-      document_store_->Put(DocumentBuilder(doc).SetUri("uri2").Build()));
+      document_store_->Put(document_util::CreateDocumentWrapper(
+          DocumentBuilder(doc).SetUri("uri2").Build())));
   DocumentId docid2 = put_result2.new_document_id;
   editor = index_->Edit(docid2, prop0_id, ns_id);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -3440,14 +3526,14 @@ TEST_P(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        PropertyDefinedFunctionWithNoArgumentReturnsInvalidArgument) {
   std::string query = "propertyDefined()";
   EXPECT_THAT(ProcessQuery(query),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(
+TEST_P(
     QueryVisitorTest,
     PropertyDefinedFunctionWithMoreThanOneTextArgumentReturnsInvalidArgument) {
   std::string query = "propertyDefined(\"foo\", \"bar\")";
@@ -3455,7 +3541,7 @@ TEST_F(
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        PropertyDefinedFunctionWithTextArgumentReturnsInvalidArgument) {
   // The argument type is TEXT, not STRING here.
   std::string query = "propertyDefined(foo)";
@@ -3463,7 +3549,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        PropertyDefinedFunctionWithNonTextArgumentReturnsInvalidArgument) {
   std::string query = "propertyDefined(1 < 2)";
   EXPECT_THAT(ProcessQuery(query),
@@ -3486,17 +3572,21 @@ TEST_P(QueryVisitorTest, PropertyDefinedFunctionReturnsMatchingDocuments) {
 
   // Document 0 has the term "foo" and its schema has the url property.
   ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("typeWithUrl").Build()));
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri0")
+                                               .SetSchema("typeWithUrl")
+                                               .Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
   // Document 1 has the term "foo" and its schema DOESN'T have the url property.
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri1")
-                                           .SetSchema("typeWithoutUrl")
-                                           .Build()));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri1")
+                                               .SetSchema("typeWithoutUrl")
+                                               .Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3504,7 +3594,10 @@ TEST_P(QueryVisitorTest, PropertyDefinedFunctionReturnsMatchingDocuments) {
 
   // Document 2 has the term "bar" and its schema has the url property.
   ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("typeWithUrl").Build()));
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri2")
+                                               .SetSchema("typeWithUrl")
+                                               .Build())));
   editor = index_->Edit(kDocumentId2, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -3535,17 +3628,21 @@ TEST_P(QueryVisitorTest,
 
   // Document 0 has the term "foo" and its schema has the url property.
   ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("typeWithUrl").Build()));
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri0")
+                                               .SetSchema("typeWithUrl")
+                                               .Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
   // Document 1 has the term "foo" and its schema DOESN'T have the url property.
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri1")
-                                           .SetSchema("typeWithoutUrl")
-                                           .Build()));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri1")
+                                               .SetSchema("typeWithoutUrl")
+                                               .Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3576,17 +3673,21 @@ TEST_P(QueryVisitorTest,
 
   // Document 0 has the term "foo" and its schema has the url property.
   ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("typeWithUrl").Build()));
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri0")
+                                               .SetSchema("typeWithUrl")
+                                               .Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
   // Document 1 has the term "foo" and its schema DOESN'T have the url property.
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri1")
-                                           .SetSchema("typeWithoutUrl")
-                                           .Build()));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri1")
+                                               .SetSchema("typeWithoutUrl")
+                                               .Build())));
   editor = index_->Edit(kDocumentId1, kSectionId1,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3600,21 +3701,21 @@ TEST_P(QueryVisitorTest,
               UnorderedElementsAre(kDocumentId1));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        HasPropertyFunctionWithNoArgumentReturnsInvalidArgument) {
   std::string query = "hasProperty()";
   EXPECT_THAT(ProcessQuery(query),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        HasPropertyFunctionWithMoreThanOneStringArgumentReturnsInvalidArgument) {
   std::string query = "hasProperty(\"foo\", \"bar\")";
   EXPECT_THAT(ProcessQuery(query),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        HasPropertyFunctionWithTextArgumentReturnsInvalidArgument) {
   // The argument type is TEXT, not STRING here.
   std::string query = "hasProperty(foo)";
@@ -3622,7 +3723,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        HasPropertyFunctionWithNonStringArgumentReturnsInvalidArgument) {
   std::string query = "hasProperty(1 < 2)";
   EXPECT_THAT(ProcessQuery(query),
@@ -3646,8 +3747,8 @@ TEST_P(QueryVisitorTest, HasPropertyFunctionReturnsMatchingDocuments) {
       /*ignore_errors_and_delete_documents=*/false));
 
   // Document 0 has the term "foo" and has the "price" property.
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("Simple").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("Simple").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId0,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3657,16 +3758,16 @@ TEST_P(QueryVisitorTest, HasPropertyFunctionReturnsMatchingDocuments) {
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
   // Document 1 has the term "foo" and doesn't have the "price" property.
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("Simple").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("Simple").Build())));
   editor = index_->Edit(kDocumentId1, kSectionId0,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
   // Document 2 has the term "bar" and has the "price" property.
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri2").SetSchema("Simple").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri2").SetSchema("Simple").Build())));
   editor = index_->Edit(kDocumentId2, kSectionId0,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("bar", TERM_MATCH_PREFIX));
@@ -3713,8 +3814,8 @@ TEST_P(QueryVisitorTest,
       /*ignore_errors_and_delete_documents=*/false));
 
   // Document 0 has the term "foo" and has the "price" property.
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("Simple").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("Simple").Build())));
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId0,
                                       /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3724,8 +3825,8 @@ TEST_P(QueryVisitorTest,
   ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
 
   // Document 1 has the term "foo" and doesn't have the "price" property.
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("Simple").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("Simple").Build())));
   editor = index_->Edit(kDocumentId1, kSectionId0,
                         /*namespace_id=*/0);
   ICING_ASSERT_OK(editor.BufferTerm("foo", TERM_MATCH_PREFIX));
@@ -3741,7 +3842,7 @@ TEST_P(QueryVisitorTest,
   EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), IsEmpty());
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithNoArgumentReturnsInvalidArgument) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3758,7 +3859,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithIncorrectArgumentTypeReturnsInvalidArgument) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3775,7 +3876,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithExtraArgumentReturnsInvalidArgument) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3793,7 +3894,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        GetEmbeddingParameterFunctionWithExtraArgumentReturnsInvalidArgument) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3801,7 +3902,8 @@ TEST_F(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query index is invalid, since there are only 2 queries.
-  std::string query = "semanticSearch(getEmbeddingParameter(0, 1))";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0, 1))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3811,10 +3913,10 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithNoVectorParamsIndexReturnsOutOfRange) {
   // The embedding query index is invalid, since there are no query embeddings.
-  std::string query = "semanticSearch(getEmbeddingParameter(0))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec = CreateSearchSpec(query, TERM_MATCH_PREFIX);
@@ -3822,7 +3924,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::OUT_OF_RANGE));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithNegativeIndexReturnsOutOfRange) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3830,7 +3932,7 @@ TEST_F(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query index is invalid, since there are only 2 queries.
-  std::string query = "semanticSearch(getEmbeddingParameter(-1))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(-1))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3840,7 +3942,126 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::OUT_OF_RANGE));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest, SemanticSearchANNFunctionAllPhases) {
+  // 1. Setup Delta Store and initial tests before index building.
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder().SetType("type").AddProperty(
+              PropertyConfigBuilder()
+                  .SetName("prop1")
+                  .SetDataTypeVector(
+                      EMBEDDING_INDEXING_APPROXIMATE_NEAREST_NEIGHBOR)
+                  .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build(),
+      /*ignore_errors_and_delete_documents=*/false));
+
+  // Fill docs.
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbeddingIvf(
+      BasicHit(kSectionId0, kDocumentId0), CreateVector("model", {1, 0, 0}),
+      QUANTIZATION_TYPE_NONE, "type"));
+
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbeddingIvf(
+      BasicHit(kSectionId0, kDocumentId1), CreateVector("model", {0, 1, 0}),
+      QUANTIZATION_TYPE_NONE, "type"));
+
+  ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
+
+  std::vector<PropertyProto::VectorProto> query_vectors = {
+      CreateVector("model", {0.9, 0.1, 0})};
+
+  // Phase 1: Test with Delta Store (No clusters built yet).
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
+                             ParseQueryHelper(query));
+  SearchSpecProto search_spec = CreateSearchSpec(
+      query, TERM_MATCH_PREFIX, query_vectors, EMBEDDING_METRIC_DOT_PRODUCT);
+  search_spec.set_embedding_query_nprobe(5);
+
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                               ProcessQuery(search_spec, root_node.get()));
+
+    DocHitInfoIterator* itr = query_results.root_iterator.get();
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId1, std::vector<SectionId>{kSectionId0}));
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{kSectionId0}));
+    EXPECT_FALSE(itr->Advance().ok());
+
+    EXPECT_THAT(query_results.root_iterator->GetCallStats()
+                    .embedding_stats.num_ann_embeddings_scored,
+                testing::Eq(2));
+  }
+  // 2. Perform IVF clustering and testing with built clusters.
+  MaintainAnnIndexOptions maintain_options;
+  maintain_options.set_min_size_for_ivf(2);
+  maintain_options.set_rebuild_threshold(0.0);
+  ICING_ASSERT_OK(embedding_index_->MaintainAllIvf(
+      *document_store_, *schema_store_, maintain_options));
+
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                               ProcessQuery(search_spec, root_node.get()));
+    DocHitInfoIterator* itr = query_results.root_iterator.get();
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId1, std::vector<SectionId>{kSectionId0}));
+    ICING_ASSERT_OK(itr->Advance());
+    EXPECT_THAT(
+        itr->doc_hit_info(),
+        EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{kSectionId0}));
+    EXPECT_FALSE(itr->Advance().ok());
+
+    EXPECT_THAT(query_results.root_iterator->GetCallStats()
+                    .embedding_stats.num_ann_embeddings_scored,
+                testing::Eq(2));
+  }
+
+  // 3. Stress test with multiple vectors.
+  for (int i = 2; i < 100; ++i) {
+    ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+        DocumentBuilder()
+            .SetKey("ns", absl_ports::StrCat("uri", std::to_string(i)))
+            .SetSchema("type")
+            .Build())));
+    ICING_ASSERT_OK(embedding_index_->BufferEmbeddingIvf(
+        BasicHit(kSectionId0, i),
+        CreateVector("model",
+                     {0, static_cast<float>(i), static_cast<float>(i)}),
+        QUANTIZATION_TYPE_NONE, "type"));
+  }
+  ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
+  ICING_ASSERT_OK(embedding_index_->MaintainAllIvf(
+      *document_store_, *schema_store_, maintain_options));
+
+  std::string StressQuery =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, 1000)");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> stress_node,
+                             ParseQueryHelper(StressQuery));
+  search_spec = CreateSearchSpec(StressQuery, TERM_MATCH_PREFIX, query_vectors,
+                                 EMBEDDING_METRIC_DOT_PRODUCT);
+  search_spec.set_embedding_query_nprobe(200);
+  {
+    ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                               ProcessQuery(search_spec, stress_node.get()));
+    EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), SizeIs(100));
+
+    EXPECT_THAT(query_results.root_iterator->GetCallStats()
+                    .embedding_stats.num_ann_embeddings_scored,
+                testing::Eq(100));
+  }
+}
+
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithTooHighIndexReturnsOutOfRange) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3848,7 +4069,7 @@ TEST_F(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query index is invalid, since there are only 2 queries.
-  std::string query = "semanticSearch(getEmbeddingParameter(10))";
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(10))");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3858,7 +4079,7 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::OUT_OF_RANGE));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithInvalidMetricReturnsInvalidArgument) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3866,8 +4087,8 @@ TEST_F(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The embedding query metric is invalid.
-  std::string query =
-      "semanticSearch(getEmbeddingParameter(0), -10, 10, \"UNKNOWN\")";
+  std::string query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), -10, 10, \"UNKNOWN\")");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3878,7 +4099,7 @@ TEST_F(QueryVisitorTest,
 
   // Passing an unknown default metric type without overriding it in the query
   // expression is also considered invalid.
-  query = "semanticSearch(getEmbeddingParameter(0), -10, 10)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -10, 10)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   search_spec =
       CreateSearchSpec(query, TERM_MATCH_PREFIX, embedding_query_vectors,
@@ -3887,7 +4108,34 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest, SemanticSearchFunctionEmptyIndexReturnsEmpty) {
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder().SetType("type").AddProperty(
+              PropertyConfigBuilder()
+                  .SetName("prop1")
+                  .SetDataTypeVector(EMBEDDING_INDEXING_LINEAR_SEARCH)
+                  .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build(),
+      /*ignore_errors_and_delete_documents=*/false));
+
+  std::vector<PropertyProto::VectorProto> query_vectors = {
+      CreateVector("model", {0.9, 0.1, 0})};
+
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 1)");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
+                             ParseQueryHelper(query));
+  SearchSpecProto search_spec = CreateSearchSpec(
+      query, TERM_MATCH_PREFIX, query_vectors, EMBEDDING_METRIC_DOT_PRODUCT);
+
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), IsEmpty());
+}
+
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionWithInvalidRangeReturnsInvalidArgument) {
   // Create two embedding queries.
   std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
@@ -3895,7 +4143,8 @@ TEST_F(QueryVisitorTest,
       CreateVector("my_model2", {-1, 2, -3, 4})};
 
   // The expression is invalid, since low > high.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 10, -10)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 10, -10)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3905,18 +4154,18 @@ TEST_F(QueryVisitorTest,
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 
   // Floating point values are also checked.
-  query = "semanticSearch(getEmbeddingParameter(0), 10.2, 10.1)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), 10.2, 10.1)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   EXPECT_THAT(ProcessQuery(search_spec, root_node.get()),
               StatusIs(libtextclassifier3::StatusCode::INVALID_ARGUMENT));
 
   // low == high is allowed.
-  query = "semanticSearch(getEmbeddingParameter(0), 10.1, 10.1)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), 10.1, 10.1)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   EXPECT_THAT(ProcessQuery(search_spec, root_node.get()), IsOk());
 }
 
-TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
+TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
   // Set up
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
@@ -3934,10 +4183,10 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
                                         .SetCardinality(CARDINALITY_OPTIONAL)))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
 
   // Index two embedding vectors.
   PropertyProto::VectorProto vector0 =
@@ -3945,9 +4194,11 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
   PropertyProto::VectorProto vector1 =
       CreateVector("my_model", {-0.1, -0.2, -0.3});
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
-      BasicHit(kSectionId0, kDocumentId0), vector0, QUANTIZATION_TYPE_NONE));
+      BasicHit(kSectionId0, kDocumentId0), vector0, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
-      BasicHit(kSectionId0, kDocumentId1), vector1, QUANTIZATION_TYPE_NONE));
+      BasicHit(kSectionId0, kDocumentId1), vector1, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
 
   // Create an embedding query that has a semantic score of 1 with vector0 and
@@ -3956,7 +4207,8 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
       CreateVector("my_model", {0.1, 0.2, 0.3})};
 
   // The query should match vector0 only.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 0.5)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 0.5)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -3973,10 +4225,23 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0),
-      Pointee(UnorderedElementsAre(DoubleNear(1, kEps))));
+      UnorderedElementsAre(DoubleNear(1, kEps)));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/1,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // The query should match both vector0 and vector1.
-  query = "semanticSearch(getEmbeddingParameter(0), -1.5)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -1.5)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -3989,15 +4254,37 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0),
-      Pointee(UnorderedElementsAre(DoubleNear(1, kEps))));
+      UnorderedElementsAre(DoubleNear(1, kEps)));
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId1),
-      Pointee(UnorderedElementsAre(DoubleNear(-1, kEps))));
+      UnorderedElementsAre(DoubleNear(-1, kEps)));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/1,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+
+    // Check section match info for document 1.
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-1,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // The query should match nothing, since there is no vector with a
   // score >= 1.01.
-  query = "semanticSearch(getEmbeddingParameter(0), 1.01)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), 1.01)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4006,9 +4293,23 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleLowerBound) {
   EXPECT_THAT(query_results.features_in_use,
               UnorderedElementsAre(kListFilterQueryLanguageFeature));
   EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), IsEmpty());
+
+  // Nested search() containing semanticSearch() at depth 2.
+  query =
+      "search(\"search(\\\"semanticSearch(getEmbeddingParameter(0), "
+      "0.5)\\\")\")";
+  ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
+  ICING_ASSERT_OK_AND_ASSIGN(query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId0));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0),
+      UnorderedElementsAre(DoubleNear(1, kEps)));
 }
 
-TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
+TEST_P(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
   // Set up
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
@@ -4026,10 +4327,10 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
                                         .SetCardinality(CARDINALITY_OPTIONAL)))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
 
   // Index two embedding vectors.
   PropertyProto::VectorProto vector0 =
@@ -4037,9 +4338,11 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
   PropertyProto::VectorProto vector1 =
       CreateVector("my_model", {-0.1, -0.2, -0.3});
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
-      BasicHit(kSectionId0, kDocumentId0), vector0, QUANTIZATION_TYPE_NONE));
+      BasicHit(kSectionId0, kDocumentId0), vector0, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
-      BasicHit(kSectionId0, kDocumentId1), vector1, QUANTIZATION_TYPE_NONE));
+      BasicHit(kSectionId0, kDocumentId1), vector1, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
 
   // Create an embedding query that has a semantic score of 1 with vector0 and
@@ -4048,7 +4351,8 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
       CreateVector("my_model", {0.1, 0.2, 0.3})};
 
   // The query should match vector1 only.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), -100, 0.5)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, 0.5)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4065,10 +4369,23 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId1),
-      Pointee(UnorderedElementsAre(DoubleNear(-1, kEps))));
+      UnorderedElementsAre(DoubleNear(-1, kEps)));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 1.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-1,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // The query should match both vector0 and vector1.
-  query = "semanticSearch(getEmbeddingParameter(0), -100, 1.5)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, 1.5)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4081,15 +4398,38 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0),
-      Pointee(UnorderedElementsAre(DoubleNear(1, kEps))));
+      UnorderedElementsAre(DoubleNear(1, kEps)));
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId1),
-      Pointee(UnorderedElementsAre(DoubleNear(-1, kEps))));
+      UnorderedElementsAre(DoubleNear(-1, kEps)));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/1,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+
+    // Check section match info for document 1.
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-1,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // The query should match nothing, since there is no vector with a
   // score <= -1.01.
-  query = "semanticSearch(getEmbeddingParameter(0), -100, -1.01)";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -100, -1.01)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4100,7 +4440,7 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSimpleUpperBound) {
   EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), IsEmpty());
 }
 
-TEST_F(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
+TEST_P(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
   // Set up
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
@@ -4118,13 +4458,14 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
                                         .SetCardinality(CARDINALITY_OPTIONAL)))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
 
   // Index a embedding vector.
   PropertyProto::VectorProto vector = CreateVector("my_model", {0.1, 0.2, 0.3});
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
-      BasicHit(kSectionId0, kDocumentId0), vector, QUANTIZATION_TYPE_NONE));
+      BasicHit(kSectionId0, kDocumentId0), vector, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
 
   // Create an embedding query that has:
@@ -4135,8 +4476,8 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
       CreateVector("my_model", {0.1, 0.2, 0.3})};
 
   // Create a query that overrides the metric to COSINE.
-  std::string query =
-      "semanticSearch(getEmbeddingParameter(0), 0.95, 1.05, \"COSINE\")";
+  std::string query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), 0.95, 1.05, \"COSINE\")");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   // The default metric to be overridden
@@ -4154,10 +4495,24 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0),
-      Pointee(UnorderedElementsAre(DoubleNear(1, kEps))));
+      UnorderedElementsAre(DoubleNear(1, kEps)));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_COSINE, kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/1,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // Create a query that overrides the metric to DOT_PRODUCT.
-  query = "semanticSearch(getEmbeddingParameter(0), 0.1, 0.2, \"DOT_PRODUCT\")";
+  query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), 0.1, 0.2, \"DOT_PRODUCT\")");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4170,11 +4525,26 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(DoubleNear(0.14, kEps))));
+      UnorderedElementsAre(DoubleNear(0.14, kEps)));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/0.14,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    // Check section match info for document 0.
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // Create a query that overrides the metric to EUCLIDEAN.
-  query =
-      "semanticSearch(getEmbeddingParameter(0), -0.05, 0.05, \"EUCLIDEAN\")";
+  query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), -0.05, 0.05, \"EUCLIDEAN\")");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4187,10 +4557,250 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMetricOverride) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_EUCLIDEAN, kDocumentId0),
-      Pointee(UnorderedElementsAre(DoubleNear(0, kEps))));
+      UnorderedElementsAre(DoubleNear(0, kEps)));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_EUCLIDEAN, kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/0,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 }
 
-TEST_F(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
+TEST_P(QueryVisitorTest, SemanticSearchFunctionRepeatedProperty) {
+  // Set up
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder()
+                       .SetType("type")
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("prop1")
+                                        .SetDataTypeVector(
+                                            EMBEDDING_INDEXING_LINEAR_SEARCH)
+                                        .SetCardinality(CARDINALITY_REPEATED))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("prop2")
+                                        .SetDataTypeVector(
+                                            EMBEDDING_INDEXING_LINEAR_SEARCH)
+                                        .SetCardinality(CARDINALITY_REPEATED)))
+          .Build(),
+      /*ignore_errors_and_delete_documents=*/false));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
+
+  // Index vectors for document 0.
+  // Section 0
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId0),
+      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId0),
+      CreateVector("my_model2", {1, -2, 3, -4}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId0),
+      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId0),
+      CreateVector("my_model1", {1, -2, -4}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  // Section 1
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId1, kDocumentId0),
+      CreateVector("my_model1", {-1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId1, kDocumentId0),
+      CreateVector("my_model1", {-1, 2, 4}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+
+  // Index embedding vectors for document 1.
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId1),
+      CreateVector("my_model1", {1, -2, 6}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId1),
+      CreateVector("my_model2", {1, -2, 3, 4}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId1),
+      CreateVector("my_model1", {-1, -2, -6}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId1),
+      CreateVector("my_model2", {-1, -2, -3, -4}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+
+  ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
+
+  // Create two embedding queries.
+  std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
+      // Semantic scores for this query:
+      // - document 0:
+      //   - section 0: -2, 6, -3
+      //   - section 1: 0, 3
+      // - document 1:
+      //   - section 0: 7, -3
+      CreateVector("my_model1", {-1, -1, 1}),
+      // Semantic scores for this query:
+      // - document 0:
+      //   - section 0: -2
+      // - document 1:
+      //   - section 0: -10, 6
+      CreateVector("my_model2", {-1, 1, -1, -1})};
+
+  // The should match both documents:
+  // Document 0:
+  // - The "semanticSearch(getEmbeddingParameter(0), -5, 1)" part should match
+  //   scores {-2 (section0, index0), 0(section1, index0), -3(section0,
+  //   index2)}.
+  // - The "semanticSearch(getEmbeddingParameter(0), 3)" part should match
+  //   semantic scores {6 (section0, index1), 3 (section1, index1)}.
+  // - The "semanticSearch(getEmbeddingParameter(1), -2)" part should match
+  //   semantic scores {-2 (section0, index0)}.
+  // Document 1:
+  // - The "semanticSearch(getEmbeddingParameter(0), -5, 1)" part should match
+  //   semantic scores {-3 (section0, index2)}.
+  // - The "semanticSearch(getEmbeddingParameter(0), 3)" part should match
+  //   semantic scores {7 (section0, index0)}.
+  // - The "semanticSearch(getEmbeddingParameter(1), -2)" part should match
+  //   semantic scores {6 (section0, index1)}.
+  std::string query = CreateQuery(
+      "semanticSearch(getEmbeddingParameter(0), -5, 1) OR "
+      "semanticSearch(getEmbeddingParameter(0), 3) OR "
+      "semanticSearch(getEmbeddingParameter(1), -2)");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
+                             ParseQueryHelper(query));
+  SearchSpecProto search_spec =
+      CreateSearchSpec(query, TERM_MATCH_PREFIX, embedding_query_vectors,
+                       EMBEDDING_METRIC_DOT_PRODUCT);
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+  EXPECT_THAT(ExtractKeys(query_results.query_term_iterators), IsEmpty());
+  EXPECT_THAT(query_results.query_terms, IsEmpty());
+  EXPECT_THAT(query_results.features_in_use,
+              UnorderedElementsAre(kListFilterQueryLanguageFeature));
+
+  DocHitInfoIterator* itr = query_results.root_iterator.get();
+  // Check results for document 1.
+  ICING_ASSERT_OK(itr->Advance());
+  EXPECT_THAT(
+      itr->doc_hit_info(),
+      EqualsDocHitInfo(kDocumentId1, std::vector<SectionId>{kSectionId0}));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
+      UnorderedElementsAre(-3, 7));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
+      UnorderedElementsAre(6));
+
+  // Check results for document 0.
+  ICING_ASSERT_OK(itr->Advance());
+  EXPECT_THAT(itr->doc_hit_info(),
+              EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{
+                                                 kSectionId0, kSectionId1}));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
+      UnorderedElementsAre(-2, 0, -3, 6, 3));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
+      UnorderedElementsAre(-2));
+  EXPECT_THAT(itr->Advance(),
+              StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
+
+  if (GetParam().get_embedding_match_info) {
+    // Check match info for document 0.
+    // Document 0 expected match info:
+    // - Query 0:
+    //   - {score=-2, position=0, section_id=0}
+    //   - {score=-3, position=2, section_id=0}
+    //   - {score=6, position=1, section_id=0}
+    //   - {score=0, position=0, section_id=1}
+    //   - {score=3, position=1, section_id=1}
+    // - Query 1:
+    //   - {score=-2, position=0, section_id=1}
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-2,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-3,
+                                       /*position_in_section=*/2,
+                                       /*section_id=*/kSectionId0));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/6,
+                                       /*position_in_section=*/1,
+                                       /*section_id=*/kSectionId0));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/0,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId1));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/3,
+                                       /*position_in_section=*/1,
+                                       /*section_id=*/kSectionId1));
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-2,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+
+    // Check match info for document 1.
+    // Document 1 expected match info:
+    // - Query 0:
+    //   - {score=-3, position=1, section_id=0}
+    //   - {score=7, position=0, section_id=0}
+    // - Query 1:
+    //   - {score=6, position=1, section_id=0}
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-3,
+                                       /*position_in_section=*/1,
+                                       /*section_id=*/kSectionId0));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/7,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/6,
+                                       /*position_in_section=*/1,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
+}
+
+TEST_P(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
   // Set up
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
@@ -4213,28 +4823,33 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
                                         .SetCardinality(CARDINALITY_OPTIONAL)))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
 
   // Index 3 embedding vectors for document 0.
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId0),
-      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId1, kDocumentId0),
-      CreateVector("my_model1", {-1, -2, -3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {-1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId2, kDocumentId0),
-      CreateVector("my_model2", {-1, 2, 3, -4}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model2", {-1, 2, 3, -4}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   // Index 2 embedding vectors for document 1.
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId1),
-      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId1, kDocumentId1),
-      CreateVector("my_model2", {1, -2, 3, -4}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model2", {1, -2, 3, -4}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
 
   // Create two embedding queries.
@@ -4253,9 +4868,9 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
   //   semantic scores {-2, 0}.
   // - The "semanticSearch(getEmbeddingParameter(1), 0)" part should match
   //   semantic scores {4}.
-  std::string query =
+  std::string query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), -5) AND "
-      "semanticSearch(getEmbeddingParameter(1), 0)";
+      "semanticSearch(getEmbeddingParameter(1), 0)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4277,28 +4892,54 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(-2, 0)));
+      UnorderedElementsAre(-2, 0));
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(4)));
+      UnorderedElementsAre(4));
   EXPECT_THAT(itr->Advance(),
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-2,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/0,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId1));
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/4,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId2));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // The query can match both document 0 and document 1:
   // For document 0:
   // - The "semanticSearch(getEmbeddingParameter(0), 1)" part should return
   //   semantic scores {}.
   // - The "semanticSearch(getEmbeddingParameter(1), 0.1)" part should return
-  //   semantic scores {4}.
+  //   semantic scores {4 (section2)}.
   // For document 1:
   // - The "semanticSearch(getEmbeddingParameter(0), 1)" part should return
-  //   semantic scores {6}.
+  //   semantic scores {6 (section0)}.
   // - The "semanticSearch(getEmbeddingParameter(1), 0.1)" part should return
   //   semantic scores {}.
-  query =
+  query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), 1) OR "
-      "semanticSearch(getEmbeddingParameter(1), 0.1)";
+      "semanticSearch(getEmbeddingParameter(1), 0.1)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4315,11 +4956,11 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
-      Pointee(UnorderedElementsAre(6)));
+      UnorderedElementsAre(6));
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
-      IsNull());
+      IsEmpty());
   // Check results for document 0.
   ICING_ASSERT_OK(itr->Advance());
   EXPECT_THAT(
@@ -4328,16 +4969,50 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionMultipleQueries) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      IsNull());
+      IsEmpty());
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(4)));
+      UnorderedElementsAre(4));
   EXPECT_THAT(itr->Advance(),
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_THAT(match_infos, IsNull());
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/4,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId2));
+
+    // Check section match info for document 1.
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/6,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId1);
+    EXPECT_THAT(match_infos, IsNull());
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest,
        SemanticSearchFunctionMultipleQueriesScoresMergedRepeat) {
   // Set up
   ICING_ASSERT_OK(schema_store_->SetSchema(
@@ -4356,22 +5031,25 @@ TEST_F(QueryVisitorTest,
                                         .SetCardinality(CARDINALITY_OPTIONAL)))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
 
   // Index 3 embedding vectors for document 0.
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId0),
-      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId1, kDocumentId0),
-      CreateVector("my_model1", {-1, -2, -3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {-1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   // Index 2 embedding vectors for document 1.
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId1),
-      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
 
   // Create two embedding queries.
@@ -4383,9 +5061,9 @@ TEST_F(QueryVisitorTest,
 
   // The query should match both document 0 and document 1, since the overall
   // range is [-10, 10]. The scores in the results should be merged.
-  std::string query =
+  std::string query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), -10, 0) OR "
-      "semanticSearch(getEmbeddingParameter(0), 0.0001, 10)";
+      "semanticSearch(getEmbeddingParameter(0), 0.0001, 10)");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4406,7 +5084,7 @@ TEST_F(QueryVisitorTest,
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
-      Pointee(UnorderedElementsAre(6)));
+      UnorderedElementsAre(6));
   // Check results for document 0.
   ICING_ASSERT_OK(itr->Advance());
   EXPECT_THAT(itr->doc_hit_info(),
@@ -4415,15 +5093,53 @@ TEST_F(QueryVisitorTest,
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(-2, 0)));
+      UnorderedElementsAre(-2, 0));
   EXPECT_THAT(itr->Advance(),
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-2,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/0,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId1));
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_THAT(match_infos, IsNull());
+
+    // Check section match info for document 1.
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/6,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/1, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_THAT(match_infos, IsNull());
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // The same query appears twice, in which case all the scores in the results
   // should repeat twice.
-  query =
+  query = CreateQuery(
       "semanticSearch(getEmbeddingParameter(0), -10, 10) OR "
-      "semanticSearch(getEmbeddingParameter(0), -10, 10)";
+      "semanticSearch(getEmbeddingParameter(0), -10, 10)");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4440,7 +5156,7 @@ TEST_F(QueryVisitorTest,
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
-      Pointee(UnorderedElementsAre(6, 6)));
+      UnorderedElementsAre(6, 6));
   // Check results for document 0.
   ICING_ASSERT_OK(itr->Advance());
   EXPECT_THAT(itr->doc_hit_info(),
@@ -4449,12 +5165,12 @@ TEST_F(QueryVisitorTest,
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(-2, 0, -2, 0)));
+      UnorderedElementsAre(-2, 0, -2, 0));
   EXPECT_THAT(itr->Advance(),
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
 }
 
-TEST_F(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
+TEST_P(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   // Set up
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
@@ -4472,10 +5188,10 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
                                         .SetCardinality(CARDINALITY_OPTIONAL)))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
 
   // Index terms
   Index::Editor editor = index_->Edit(kDocumentId0, kSectionId1,
@@ -4490,10 +5206,12 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   // Index embedding vectors
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId0),
-      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId1),
-      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
 
   // Create an embedding query with semantic scores:
@@ -4506,7 +5224,8 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   // - The "semanticSearch(getEmbeddingParameter(0), 0)" part only matches
   //   document 1.
   // - The "foo" part only matches document 0.
-  std::string query = "semanticSearch(getEmbeddingParameter(0), 0) OR foo";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 0) OR foo");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4529,7 +5248,7 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
-      Pointee(UnorderedElementsAre(6)));
+      UnorderedElementsAre(6));
   // Check results for document 0.
   ICING_ASSERT_OK(itr->Advance());
   EXPECT_THAT(
@@ -4538,16 +5257,37 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      IsNull());
+      IsEmpty());
   EXPECT_THAT(itr->Advance(),
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_THAT(match_infos, IsNull());
+
+    // Check section match info for document 1.
+    match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId1);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/6,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 
   // Perform another hybrid search:
   // - The "semanticSearch(getEmbeddingParameter(0), -5)" part matches both
   //   document 0 and 1.
   // - The "foo" part only matches document 0.
   // As a result, only document 0 will be returned.
-  query = "semanticSearch(getEmbeddingParameter(0), -5) AND foo";
+  query = CreateQuery("semanticSearch(getEmbeddingParameter(0), -5) AND foo");
   ICING_ASSERT_OK_AND_ASSIGN(root_node, ParseQueryHelper(query));
   ICING_ASSERT_OK_AND_ASSIGN(query_results,
                              ProcessQuery(search_spec, root_node.get()));
@@ -4566,12 +5306,27 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionHybridQueries) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(-2)));
+      UnorderedElementsAre(-2));
   EXPECT_THAT(itr->Advance(),
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
+
+  if (GetParam().get_embedding_match_info) {
+    // Check section match info for document 0.
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/-2,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kSectionId0));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
 }
 
-TEST_F(QueryVisitorTest, SemanticSearchFunctionSectionRestriction) {
+TEST_P(QueryVisitorTest, SemanticSearchFunctionSectionRestriction) {
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
           .AddType(SchemaTypeConfigBuilder()
@@ -4590,23 +5345,27 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSectionRestriction) {
       /*ignore_errors_and_delete_documents=*/false));
 
   // Create two documents.
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build()));
-  ICING_ASSERT_OK(document_store_->Put(
-      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build()));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
   // Add embedding vectors into different sections for the two documents.
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId0),
-      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {1, -2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId1, kDocumentId0),
-      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {-1, -2, 3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId0, kDocumentId1),
-      CreateVector("my_model1", {-1, 2, 3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {-1, 2, 3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
       BasicHit(kSectionId1, kDocumentId1),
-      CreateVector("my_model1", {1, 2, -3}), QUANTIZATION_TYPE_NONE));
+      CreateVector("my_model1", {1, 2, -3}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
   ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
 
   // Create an embedding query with semantic scores:
@@ -4617,7 +5376,8 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSectionRestriction) {
 
   // An embedding query with section restriction. The scores returned should
   // only be limited to the section restricted.
-  std::string query = "prop1:semanticSearch(getEmbeddingParameter(0), -100)";
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -100)", "prop1");
   ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
                              ParseQueryHelper(query));
   SearchSpecProto search_spec =
@@ -4638,7 +5398,7 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSectionRestriction) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
-      Pointee(UnorderedElementsAre(2)));
+      UnorderedElementsAre(2));
   ICING_ASSERT_OK(itr->Advance());
   EXPECT_THAT(
       itr->doc_hit_info(),
@@ -4646,12 +5406,262 @@ TEST_F(QueryVisitorTest, SemanticSearchFunctionSectionRestriction) {
   EXPECT_THAT(
       query_results.embedding_query_results.GetMatchedScoresForDocument(
           /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
-      Pointee(UnorderedElementsAre(-2)));
+      UnorderedElementsAre(-2));
   EXPECT_THAT(itr->Advance(),
               StatusIs(libtextclassifier3::StatusCode::RESOURCE_EXHAUSTED));
 }
 
-TEST_F(QueryVisitorTest,
+TEST_P(QueryVisitorTest, SemanticSearchFunctionDeletedDocument) {
+  // Set up schema
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder().SetType("type").AddProperty(
+              PropertyConfigBuilder()
+                  .SetName("prop1")
+                  .SetDataTypeVector(EMBEDDING_INDEXING_LINEAR_SEARCH)
+                  .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build(),
+      /*ignore_errors_and_delete_documents=*/false));
+
+  // Add two documents
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
+
+  // Index embedding vectors for both documents
+  PropertyProto::VectorProto vector0 =
+      CreateVector("my_model", {0.1, 0.2, 0.3});
+  PropertyProto::VectorProto vector1 =
+      CreateVector("my_model", {0.4, 0.5, 0.6});
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId0), vector0, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId1), vector1, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
+
+  // Delete kDocumentId0
+  ICING_ASSERT_OK(document_store_->Delete("ns", "uri0",
+                                          clock_.GetSystemTimeMilliseconds()));
+
+  // Create an embedding query that would match both documents if kDocumentId0
+  // was not deleted.
+  std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
+      CreateVector("my_model", {1.0, 1.0, 1.0})};
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), -1)");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
+                             ParseQueryHelper(query));
+  SearchSpecProto search_spec =
+      CreateSearchSpec(query, TERM_MATCH_PREFIX, embedding_query_vectors,
+                       EMBEDDING_METRIC_DOT_PRODUCT);
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+
+  EXPECT_THAT(ExtractKeys(query_results.query_term_iterators), IsEmpty());
+  EXPECT_THAT(query_results.query_terms, IsEmpty());
+  EXPECT_THAT(query_results.features_in_use,
+              UnorderedElementsAre(kListFilterQueryLanguageFeature));
+
+  // Only kDocumentId1 should be returned
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId1));
+
+  // Check that scores for kDocumentId1 are present and kDocumentId0 are not.
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
+      UnorderedElementsAre(DoubleNear(0.4 + 0.5 + 0.6, kEps)));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
+      IsEmpty());
+}
+
+TEST_P(QueryVisitorTest, SemanticSearchFunctionCallStats) {
+  // Set up
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      SchemaBuilder()
+          .AddType(SchemaTypeConfigBuilder()
+                       .SetType("type")
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("prop1")
+                                        .SetDataTypeVector(
+                                            EMBEDDING_INDEXING_LINEAR_SEARCH)
+                                        .SetCardinality(CARDINALITY_OPTIONAL))
+                       .AddProperty(PropertyConfigBuilder()
+                                        .SetName("prop2")
+                                        .SetDataTypeVector(
+                                            EMBEDDING_INDEXING_LINEAR_SEARCH,
+                                            QUANTIZATION_TYPE_QUANTIZE_8_BIT)
+                                        .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build(),
+      /*ignore_errors_and_delete_documents=*/false));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
+
+  // Index 2 unquantized embedding vectors, and 1 quantized embedding vector.
+  PropertyProto::VectorProto vector0 =
+      CreateVector("my_model", {1., 1., 1.});  // Size: 12 bytes
+  PropertyProto::VectorProto vector1 =
+      CreateVector("my_model", {-1., -1., -1.});  // Size: 12 bytes
+  PropertyProto::VectorProto vector2 = CreateVector(
+      "my_model", {0., 0., 0.});  // Size: 3 + sizeof(Quantizer) = 11 bytes.
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId0), vector0, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId0, kDocumentId1), vector1, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kSectionId1, kDocumentId1), vector2,
+      QUANTIZATION_TYPE_QUANTIZE_8_BIT,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
+
+  // Create a query that matches all embeddings.
+  std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
+      CreateVector("my_model", {1., 1., 1.})};
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
+                             ParseQueryHelper(query));
+  SearchSpecProto search_spec =
+      CreateSearchSpec(query, TERM_MATCH_PREFIX, embedding_query_vectors,
+                       EMBEDDING_METRIC_DOT_PRODUCT);
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+  EXPECT_THAT(ExtractKeys(query_results.query_term_iterators), IsEmpty());
+  EXPECT_THAT(query_results.query_terms, IsEmpty());
+  EXPECT_THAT(query_results.features_in_use,
+              UnorderedElementsAre(kListFilterQueryLanguageFeature));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId1, kDocumentId0));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
+      UnorderedElementsAre(DoubleNear(3., kEps)));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
+      UnorderedElementsAre(DoubleNear(-3., kEps), DoubleNear(0, kEps)));
+
+  // Check call stats.
+  // We should see 2 unquantized embeddings scored and 1 quantized embedding
+  // scored. The size read should be 12 + 12 + 11 = 35 bytes.
+  EXPECT_THAT(query_results.root_iterator->GetCallStats(),
+              EqualsDocHitInfoIteratorCallStats(
+                  /*num_leaf_advance_calls_lite_index=*/2,
+                  /*num_leaf_advance_calls_main_index=*/0,
+                  /*num_leaf_advance_calls_integer_index=*/0,
+                  /*num_leaf_advance_calls_no_index=*/0,
+                  /*num_blocks_inspected=*/0,
+                  DocHitInfoIterator::CallStats::EmbeddingStats{
+                      .num_unquantized_embeddings_scored = 2,
+                      .num_quantized_embeddings_scored = 1,
+                      .unquantized_shards_read = {5},
+                      .quantized_shards_read = {5},
+                      .num_embedding_bytes_read = 35,
+                      .num_ann_embeddings_scored = 0}));
+}
+
+TEST_P(QueryVisitorTest, SemanticSearchFunctionCallStats_Ann) {
+  // Set up
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      SchemaBuilder()
+          .AddType(
+              SchemaTypeConfigBuilder()
+                  .SetType("type")
+                  .AddProperty(
+                      PropertyConfigBuilder()
+                          .SetName("prop1")
+                          .SetDataTypeVector(
+                              EMBEDDING_INDEXING_APPROXIMATE_NEAREST_NEIGHBOR)
+                          .SetCardinality(CARDINALITY_OPTIONAL))
+                  .AddProperty(
+                      PropertyConfigBuilder()
+                          .SetName("prop2")
+                          .SetDataTypeVector(
+                              EMBEDDING_INDEXING_APPROXIMATE_NEAREST_NEIGHBOR,
+                              QUANTIZATION_TYPE_QUANTIZE_8_BIT)
+                          .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build(),
+      /*ignore_errors_and_delete_documents=*/false));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri1").SetSchema("type").Build())));
+
+  // Index 2 unquantized embedding vectors, and 1 quantized embedding vector.
+  PropertyProto::VectorProto vector0 =
+      CreateVector("my_model", {1., 1., 1.});  // Size: 12 bytes
+  PropertyProto::VectorProto vector1 =
+      CreateVector("my_model", {-1., -1., -1.});  // Size: 12 bytes
+  PropertyProto::VectorProto vector2 = CreateVector(
+      "my_model", {0., 0., 0.});  // Size: 3 + sizeof(Quantizer) = 11 bytes.
+  ICING_ASSERT_OK(embedding_index_->BufferEmbeddingIvf(
+      BasicHit(kSectionId0, kDocumentId0), vector0, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbeddingIvf(
+      BasicHit(kSectionId0, kDocumentId1), vector1, QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbeddingIvf(
+      BasicHit(kSectionId1, kDocumentId1), vector2,
+      QUANTIZATION_TYPE_QUANTIZE_8_BIT,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
+
+  // Create a query that matches all embeddings.
+  std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
+      CreateVector("my_model", {1., 1., 1.})};
+  std::string query = CreateQuery("semanticSearch(getEmbeddingParameter(0))");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
+                             ParseQueryHelper(query));
+  SearchSpecProto search_spec =
+      CreateSearchSpec(query, TERM_MATCH_PREFIX, embedding_query_vectors,
+                       EMBEDDING_METRIC_DOT_PRODUCT);
+  search_spec.set_embedding_query_nprobe(5);
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+  EXPECT_THAT(ExtractKeys(query_results.query_term_iterators), IsEmpty());
+  EXPECT_THAT(query_results.query_terms, IsEmpty());
+  EXPECT_THAT(query_results.features_in_use,
+              UnorderedElementsAre(kListFilterQueryLanguageFeature));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId1, kDocumentId0));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId0),
+      UnorderedElementsAre(DoubleNear(3., kEps)));
+  EXPECT_THAT(
+      query_results.embedding_query_results.GetMatchedScoresForDocument(
+          /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT, kDocumentId1),
+      UnorderedElementsAre(DoubleNear(-3., kEps), DoubleNear(0, kEps)));
+
+  // Check call stats.
+  // We should see 2 unquantized embeddings scored and 1 quantized embedding
+  // scored. The size read should be 12 + 12 + 11 = 35 bytes.
+  // And num_ann_embeddings_scored should be 3.
+  EXPECT_THAT(query_results.root_iterator->GetCallStats(),
+              EqualsDocHitInfoIteratorCallStats(
+                  /*num_leaf_advance_calls_lite_index=*/2,
+                  /*num_leaf_advance_calls_main_index=*/0,
+                  /*num_leaf_advance_calls_integer_index=*/0,
+                  /*num_leaf_advance_calls_no_index=*/0,
+                  /*num_blocks_inspected=*/0,
+                  DocHitInfoIterator::CallStats::EmbeddingStats{
+                      .num_unquantized_embeddings_scored = 2,
+                      .num_quantized_embeddings_scored = 1,
+                      .unquantized_shards_read = {14},
+                      .quantized_shards_read = {14},
+                      .num_embedding_bytes_read = 35,
+                      .num_ann_embeddings_scored = 3}));
+}
+
+TEST_P(QueryVisitorTest,
        MatchScoreExpressionFunctionWithInvalidRangeReturnsInvalidArgument) {
   // The expression is invalid, since low > high.
   EXPECT_THAT(ProcessQuery("matchScoreExpression(\"1 + 1\", 10, -10)"),
@@ -4666,23 +5676,25 @@ TEST_F(QueryVisitorTest,
               IsOk());
 }
 
-TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionSimpleLowerBound) {
+TEST_P(QueryVisitorTest, MatchScoreExpressionFunctionSimpleLowerBound) {
   // Create two documents with different document scores.
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
           .AddType(SchemaTypeConfigBuilder().SetType("Simple"))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri0")
-                                           .SetSchema("Simple")
-                                           .SetScore(4)
-                                           .Build()));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri1")
-                                           .SetSchema("Simple")
-                                           .SetScore(0)
-                                           .Build()));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri0")
+                                               .SetSchema("Simple")
+                                               .SetScore(4)
+                                               .Build())));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri1")
+                                               .SetSchema("Simple")
+                                               .SetScore(0)
+                                               .Build())));
 
   // Test that `matchScoreExpression("this.documentScore()", 0)` matches
   // all documents.
@@ -4717,23 +5729,25 @@ TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionSimpleLowerBound) {
   EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), IsEmpty());
 }
 
-TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionSimpleUpperBound) {
+TEST_P(QueryVisitorTest, MatchScoreExpressionFunctionSimpleUpperBound) {
   // Create two documents with different document scores.
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
           .AddType(SchemaTypeConfigBuilder().SetType("Simple"))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri0")
-                                           .SetSchema("Simple")
-                                           .SetScore(4)
-                                           .Build()));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri1")
-                                           .SetSchema("Simple")
-                                           .SetScore(0)
-                                           .Build()));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri0")
+                                               .SetSchema("Simple")
+                                               .SetScore(4)
+                                               .Build())));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri1")
+                                               .SetSchema("Simple")
+                                               .SetScore(0)
+                                               .Build())));
 
   // Test that `matchScoreExpression("this.documentScore()", -100, 100)` matches
   // all documents.
@@ -4769,30 +5783,33 @@ TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionSimpleUpperBound) {
   EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()), IsEmpty());
 }
 
-TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionComplex) {
+TEST_P(QueryVisitorTest, MatchScoreExpressionFunctionComplex) {
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
           .AddType(SchemaTypeConfigBuilder().SetType("Simple"))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri0")
-                                           .SetSchema("Simple")
-                                           .SetScore(4)
-                                           .SetCreationTimestampMs(1)
-                                           .Build()));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri1")
-                                           .SetSchema("Simple")
-                                           .SetScore(2)
-                                           .SetCreationTimestampMs(2)
-                                           .Build()));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri2")
-                                           .SetSchema("Simple")
-                                           .SetScore(0)
-                                           .SetCreationTimestampMs(3)
-                                           .Build()));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri0")
+                                               .SetSchema("Simple")
+                                               .SetScore(4)
+                                               .SetCreationTimestampMs(1)
+                                               .Build())));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri1")
+                                               .SetSchema("Simple")
+                                               .SetScore(2)
+                                               .SetCreationTimestampMs(2)
+                                               .Build())));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri2")
+                                               .SetSchema("Simple")
+                                               .SetScore(0)
+                                               .SetCreationTimestampMs(3)
+                                               .Build())));
 
   // Query with a complex score expression:
   //   `pow(this.creationTimestamp(), 2) + this.documentScore() - 1`.
@@ -4812,23 +5829,25 @@ TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionComplex) {
               UnorderedElementsAre(kDocumentId1));
 }
 
-TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionWithEvaluationErrors) {
+TEST_P(QueryVisitorTest, MatchScoreExpressionFunctionWithEvaluationErrors) {
   // Create two documents with different document scores.
   ICING_ASSERT_OK(schema_store_->SetSchema(
       SchemaBuilder()
           .AddType(SchemaTypeConfigBuilder().SetType("Simple"))
           .Build(),
       /*ignore_errors_and_delete_documents=*/false));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri0")
-                                           .SetSchema("Simple")
-                                           .SetScore(4)
-                                           .Build()));
-  ICING_ASSERT_OK(document_store_->Put(DocumentBuilder()
-                                           .SetKey("ns", "uri1")
-                                           .SetSchema("Simple")
-                                           .SetScore(0)
-                                           .Build()));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri0")
+                                               .SetSchema("Simple")
+                                               .SetScore(4)
+                                               .Build())));
+  ICING_ASSERT_OK(document_store_->Put(
+      document_util::CreateDocumentWrapper(DocumentBuilder()
+                                               .SetKey("ns", "uri1")
+                                               .SetSchema("Simple")
+                                               .SetScore(0)
+                                               .Build())));
 
   // Test that documents with evaluation errors will be filtered out.
   // Specifically, document1 will be filtered out because its document score is
@@ -4844,9 +5863,167 @@ TEST_F(QueryVisitorTest, MatchScoreExpressionFunctionWithEvaluationErrors) {
               UnorderedElementsAre(kDocumentId0));
 }
 
-INSTANTIATE_TEST_SUITE_P(QueryVisitorTest, QueryVisitorTest,
-                         testing::Values(QueryType::kPlain,
-                                         QueryType::kSearch));
+TEST_P(QueryVisitorTest, SemanticSearchFunctionMixedAnnAndLinear) {
+  ICING_ASSERT_OK(schema_store_->SetSchema(
+      SchemaBuilder()
+          .AddType(
+              SchemaTypeConfigBuilder()
+                  .SetType("type")
+                  .AddProperty(
+                      PropertyConfigBuilder()
+                          .SetName("annProp")
+                          .SetDataTypeVector(
+                              EMBEDDING_INDEXING_APPROXIMATE_NEAREST_NEIGHBOR)
+                          .SetCardinality(CARDINALITY_OPTIONAL))
+                  .AddProperty(
+                      PropertyConfigBuilder()
+                          .SetName("linearProp")
+                          .SetDataTypeVector(EMBEDDING_INDEXING_LINEAR_SEARCH)
+                          .SetCardinality(CARDINALITY_OPTIONAL)))
+          .Build(),
+      /*ignore_errors_and_delete_documents=*/false));
+
+  constexpr SectionId kAnnSectionId = 0;
+  constexpr SectionId kLinearSectionId = 1;
+
+  ICING_ASSERT_OK(document_store_->Put(document_util::CreateDocumentWrapper(
+      DocumentBuilder().SetKey("ns", "uri0").SetSchema("type").Build())));
+
+  ICING_ASSERT_OK(embedding_index_->BufferEmbeddingIvf(
+      BasicHit(kAnnSectionId, kDocumentId0),
+      CreateVector("my_model", {1, 1, 1}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+  ICING_ASSERT_OK(embedding_index_->BufferEmbedding(
+      BasicHit(kLinearSectionId, kDocumentId0),
+      CreateVector("my_model", {1, 1, 1}), QUANTIZATION_TYPE_NONE,
+      /*schema_name=*/"type"));
+
+  ICING_ASSERT_OK(embedding_index_->CommitBufferToIndex());
+
+  MaintainAnnIndexOptions maintain_options;
+  maintain_options.set_min_size_for_ivf(1);
+  maintain_options.set_rebuild_threshold(0.0);
+  ICING_ASSERT_OK(embedding_index_->MaintainAllIvf(
+      *document_store_, *schema_store_, maintain_options));
+
+  std::vector<PropertyProto::VectorProto> embedding_query_vectors = {
+      CreateVector("my_model", {1, 1, 1})};
+
+  std::string query =
+      CreateQuery("semanticSearch(getEmbeddingParameter(0), 0.5)");
+  ICING_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Node> root_node,
+                             ParseQueryHelper(query));
+  SearchSpecProto search_spec =
+      CreateSearchSpec(query, TERM_MATCH_PREFIX, embedding_query_vectors,
+                       EMBEDDING_METRIC_DOT_PRODUCT);
+  search_spec.set_embedding_query_nprobe(2);  // ensure we hit the ANN clusters
+
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(search_spec, root_node.get()));
+  EXPECT_THAT(ExtractKeys(query_results.query_term_iterators), IsEmpty());
+  EXPECT_THAT(query_results.query_terms, IsEmpty());
+
+  DocHitInfoIterator* itr = query_results.root_iterator.get();
+  ICING_ASSERT_OK(itr->Advance());
+  EXPECT_THAT(
+      itr->doc_hit_info(),
+      EqualsDocHitInfo(kDocumentId0, std::vector<SectionId>{kAnnSectionId,
+                                                            kLinearSectionId}));
+
+  if (GetParam().get_embedding_match_info) {
+    const EmbeddingMatchInfos* match_infos =
+        query_results.embedding_query_results.GetMatchedInfosForDocument(
+            /*query_vector_index=*/0, EMBEDDING_METRIC_DOT_PRODUCT,
+            kDocumentId0);
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/3.0,
+                                       /*position_in_section=*/-1,
+                                       /*section_id=*/kAnnSectionId));
+    EXPECT_TRUE(ContainsMatchInfoEntry(query_results.embedding_query_results,
+                                       match_infos, /*score=*/3.0,
+                                       /*position_in_section=*/0,
+                                       /*section_id=*/kLinearSectionId));
+  } else {
+    EXPECT_THAT(*query_results.embedding_query_results.global_section_infos,
+                IsEmpty());
+  }
+}
+
+TEST_P(QueryVisitorTest, PinyinNormalizerDoesNotTransliterateQueryTerm) {
+  if (IsCfStringTokenization() || IsReverseJniTokenization()) {
+    GTEST_SKIP() << "Pinyin transliteration requires ICU.";
+  }
+
+  NormalizerRulesConfig pinyin_rules_config;
+  pinyin_rules_config.enable_pinyin_normalization = true;
+  NormalizerOptions pinyin_normalizer_options(
+      /*max_term_byte_size=*/std::numeric_limits<int32_t>::max(),
+      /*enable_icu_normalizer=*/true, pinyin_rules_config);
+  ICING_ASSERT_OK_AND_ASSIGN(
+      normalizer_, normalizer_factory::Create(pinyin_normalizer_options));
+
+  // Doc 0 is indexed with Hanzi "北京" and its Pinyin terms.
+  Index::Editor editor = index_->Edit(kDocumentId0, kSectionId0,
+                                      /*namespace_id=*/0);
+  ICING_ASSERT_OK(editor.BufferTerm("北京", TERM_MATCH_PREFIX));
+  ICING_ASSERT_OK(editor.BufferTerm("bei jing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("beijing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("bei", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
+
+  // Doc 1 is indexed with homophone Hanzi "背景" and its Pinyin terms.
+  editor = index_->Edit(kDocumentId1, kSectionId0, /*namespace_id=*/0);
+  ICING_ASSERT_OK(editor.BufferTerm("背景", TERM_MATCH_PREFIX));
+  ICING_ASSERT_OK(editor.BufferTerm("bei jing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("beijing", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.BufferTerm("bei", TERM_MATCH_EXACT));
+  ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
+
+  // Doc 2 is indexed with only the Latin Pinyin string "beijing".
+  editor = index_->Edit(kDocumentId2, kSectionId0, /*namespace_id=*/0);
+  ICING_ASSERT_OK(editor.BufferTerm("beijing", TERM_MATCH_PREFIX));
+  ICING_ASSERT_OK(editor.IndexAllBufferedTerms());
+
+  // 1. A Hanzi query "北京" should NOT be transliterated into Pinyin during
+  // query normalization (is_query_term = true), so it matches only Doc 0
+  // (neither homophone Doc 1 nor Pinyin-only Doc 2).
+  std::string hanzi_query0 = CreateQuery("北京");
+  ICING_ASSERT_OK_AND_ASSIGN(QueryResults query_results,
+                             ProcessQuery(hanzi_query0));
+  EXPECT_THAT(ExtractKeys(query_results.query_terms), UnorderedElementsAre(""));
+  EXPECT_THAT(query_results.query_terms[""], UnorderedElementsAre("北京"));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId0));
+
+  // 2. Similarly, homophone Hanzi query "背景" matches only Doc 1.
+  std::string hanzi_query1 = CreateQuery("背景");
+  ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(hanzi_query1));
+  EXPECT_THAT(ExtractKeys(query_results.query_terms), UnorderedElementsAre(""));
+  EXPECT_THAT(query_results.query_terms[""], UnorderedElementsAre("背景"));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId1));
+
+  // 3. A Pinyin query "beijing" matches all three documents (Doc 2, Doc 1,
+  // Doc 0).
+  std::string pinyin_query = CreateQuery("beijing");
+  ICING_ASSERT_OK_AND_ASSIGN(query_results, ProcessQuery(pinyin_query));
+  EXPECT_THAT(ExtractKeys(query_results.query_terms), UnorderedElementsAre(""));
+  EXPECT_THAT(query_results.query_terms[""], UnorderedElementsAre("beijing"));
+  EXPECT_THAT(GetDocumentIds(query_results.root_iterator.get()),
+              ElementsAre(kDocumentId2, kDocumentId1, kDocumentId0));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    QueryVisitorTest, QueryVisitorTest,
+    testing::Values(
+        QueryVisitorTestParams(QueryType::kSearch,
+                               /*get_embedding_match_info=*/true),
+        QueryVisitorTestParams(QueryType::kSearch,
+                               /*get_embedding_match_info=*/false),
+        QueryVisitorTestParams(QueryType::kPlain,
+                               /*get_embedding_match_info=*/true),
+        QueryVisitorTestParams(QueryType::kPlain,
+                               /*get_embedding_match_info=*/false)));
 
 }  // namespace
 

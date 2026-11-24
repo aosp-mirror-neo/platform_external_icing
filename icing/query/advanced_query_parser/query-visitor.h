@@ -31,8 +31,8 @@
 #include "icing/index/embed/embedding-index.h"
 #include "icing/index/embed/embedding-query-results.h"
 #include "icing/index/index.h"
-#include "icing/index/iterator/doc-hit-info-iterator-filter.h"
 #include "icing/index/iterator/doc-hit-info-iterator.h"
+#include "icing/index/iterator/document-filter-predicate.h"
 #include "icing/index/numeric/numeric-index.h"
 #include "icing/join/join-children-fetcher.h"
 #include "icing/query/advanced_query_parser/abstract-syntax-tree.h"
@@ -60,13 +60,15 @@ class QueryVisitor : public AbstractSyntaxTreeVisitor {
       const Normalizer* normalizer, const Tokenizer* tokenizer,
       const JoinChildrenFetcher* join_children_fetcher,
       const SearchSpecProto& search_spec,
-      DocHitInfoIteratorFilter::Options filter_options,
-      bool needs_term_frequency_info, const FeatureFlags* feature_flags,
-      int64_t current_time_ms)
+      const DocumentFilterPredicate* filter_predicate,
+      bool needs_term_frequency_info, bool get_embedding_match_info,
+      const FeatureFlags* feature_flags, int64_t current_time_ms)
       : QueryVisitor(index, numeric_index, embedding_index, document_store,
                      schema_store, normalizer, tokenizer, join_children_fetcher,
-                     search_spec, filter_options, needs_term_frequency_info,
-                     feature_flags, PendingPropertyRestricts(),
+                     search_spec, filter_predicate, needs_term_frequency_info,
+                     get_embedding_match_info, feature_flags,
+                     /*embedding_query_results=*/nullptr,
+                     PendingPropertyRestricts(),
                      /*processing_not=*/false, current_time_ms) {}
 
   void VisitString(const StringNode* node) override;
@@ -118,11 +120,20 @@ class QueryVisitor : public AbstractSyntaxTreeVisitor {
       const Normalizer* normalizer, const Tokenizer* tokenizer,
       const JoinChildrenFetcher* join_children_fetcher,
       const SearchSpecProto& search_spec,
-      DocHitInfoIteratorFilter::Options filter_options,
-      bool needs_term_frequency_info, const FeatureFlags* feature_flags,
+      const DocumentFilterPredicate* filter_predicate,
+      bool needs_term_frequency_info, bool get_embedding_match_info,
+      const FeatureFlags* feature_flags,
+      EmbeddingQueryResults* embedding_query_results,
       PendingPropertyRestricts pending_property_restricts, bool processing_not,
       int64_t current_time_ms)
-      : index_(*index),
+      : owned_embedding_query_results_(
+            embedding_query_results == nullptr
+                ? search_spec.embedding_query_vectors_size()
+                : 0),
+        embedding_query_results_(embedding_query_results != nullptr
+                                     ? *embedding_query_results
+                                     : owned_embedding_query_results_),
+        index_(*index),
         numeric_index_(*numeric_index),
         embedding_index_(*embedding_index),
         document_store_(*document_store),
@@ -131,8 +142,9 @@ class QueryVisitor : public AbstractSyntaxTreeVisitor {
         tokenizer_(*tokenizer),
         join_children_fetcher_(join_children_fetcher),
         search_spec_(search_spec),
-        filter_options_(std::move(filter_options)),
+        filter_predicate_(filter_predicate),
         needs_term_frequency_info_(needs_term_frequency_info),
+        get_embedding_match_info_(get_embedding_match_info),
         feature_flags_(*feature_flags),
         pending_property_restricts_(std::move(pending_property_restricts)),
         processing_not_(processing_not),
@@ -361,7 +373,11 @@ class QueryVisitor : public AbstractSyntaxTreeVisitor {
 
   QueryTermIteratorsMap query_term_iterators_;
 
-  EmbeddingQueryResults embedding_query_results_;
+  // Owned EmbeddingQueryResults for the top-level QueryVisitor. Nested
+  // QueryVisitors created by SearchFunction reference the top-level instance
+  // via embedding_query_results_ so that iterators outlive the nested visitor.
+  EmbeddingQueryResults owned_embedding_query_results_;
+  EmbeddingQueryResults& embedding_query_results_;
 
   // Set of features invoked in the query.
   std::unordered_set<Feature> features_;
@@ -378,14 +394,18 @@ class QueryVisitor : public AbstractSyntaxTreeVisitor {
   // parent query for a join query, in which case child scores are available.
   const JoinChildrenFetcher* join_children_fetcher_;  // Does not own.
 
-  const SearchSpecProto& search_spec_;
+  const SearchSpecProto& search_spec_;  // Does not own.
 
-  DocHitInfoIteratorFilter::Options filter_options_;
+  const DocumentFilterPredicate* filter_predicate_;  // Does not own.
 
   // Whether or not term_frequency information is needed. This affects:
   //  - how DocHitInfoIteratorTerms are constructed
   //  - whether the QueryTermIteratorsMap is populated in the QueryResults.
   bool needs_term_frequency_info_;
+
+  // Whether or not to get embedding match info. This affects whether
+  // SectionInfos are populated in the EmbeddingQueryResults.
+  bool get_embedding_match_info_;
 
   const FeatureFlags& feature_flags_;  // Does not own.
   // TODO(b/377215223): Pass enabled scoring features from top level.

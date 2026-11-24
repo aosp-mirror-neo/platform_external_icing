@@ -78,6 +78,11 @@ class DummyNumericIndex : public NumericIndex<T> {
       const std::vector<DocumentId>& document_id_old_to_new,
       DocumentId new_last_added_document_id) override;
 
+  libtextclassifier3::Status OptimizeInto(
+      const std::string& new_working_path,
+      const std::vector<DocumentId>& document_id_old_to_new,
+      DocumentId new_last_added_document_id) const override;
+
   libtextclassifier3::Status Clear() override {
     storage_.clear();
     last_added_document_id_ = kInvalidDocumentId;
@@ -332,11 +337,15 @@ libtextclassifier3::Status DummyNumericIndex<T>::Optimize(
     for (const auto& [key, hits] : old_property_map) {
       for (const BasicHit& hit : hits) {
         DocumentId old_doc_id = hit.document_id();
-        if (old_doc_id >= document_id_old_to_new.size() ||
-            document_id_old_to_new[old_doc_id] == kInvalidDocumentId) {
-          continue;
+        if (old_doc_id < 0 || old_doc_id >= document_id_old_to_new.size()) {
+          return absl_ports::InternalError(
+              "Dummy numeric index hit document id is out of range. The index "
+              "may have been corrupted.");
         }
 
+        if (document_id_old_to_new[old_doc_id] == kInvalidDocumentId) {
+          continue;
+        }
         new_property_map[key].push_back(
             BasicHit(hit.section_id(), document_id_old_to_new[old_doc_id]));
       }
@@ -350,6 +359,22 @@ libtextclassifier3::Status DummyNumericIndex<T>::Optimize(
   storage_ = std::move(new_storage);
   last_added_document_id_ = new_last_added_document_id;
   return libtextclassifier3::Status::OK;
+}
+
+template <typename T>
+libtextclassifier3::Status DummyNumericIndex<T>::OptimizeInto(
+    const std::string& new_working_path,
+    const std::vector<DocumentId>& document_id_old_to_new,
+    DocumentId new_last_added_document_id) const {
+  if (new_working_path == this->working_path_) {
+    return absl_ports::InvalidArgumentError(
+        "New working path is the same as the current one.");
+  }
+  ICING_ASSIGN_OR_RETURN(std::unique_ptr<DummyNumericIndex<T>> new_index,
+                         Create(this->filesystem_, new_working_path));
+  new_index->storage_ = storage_;
+  return new_index->Optimize(document_id_old_to_new,
+                             new_last_added_document_id);
 }
 
 }  // namespace lib

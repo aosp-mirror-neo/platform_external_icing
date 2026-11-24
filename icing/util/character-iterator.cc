@@ -36,6 +36,18 @@ int GetUTF8StartPosition(std::string_view text, int current_byte_index) {
 }  // namespace
 
 UChar32 CharacterIterator::GetCurrentChar() const {
+  if (utf8_index_ > text_.length() || utf8_index_ < 0) {
+    return i18n_utils::kInvalidUChar32;
+  }
+
+  if (utf8_index_ == text_.length()) {
+    // This is allowed and it means the iterator is at the end. Since
+    // std::string_view is not guaranteed to be null-terminated, we cannot read
+    // any bytes out of bound.
+    // Therefore, return 0 (null character) directly here.
+    return 0;
+  }
+
   if (cached_current_char_ == i18n_utils::kInvalidUChar32) {
     // Our indices point to the right character, we just need to read that
     // character. No need to worry about an error. If GetUChar32At fails, then
@@ -52,33 +64,50 @@ bool CharacterIterator::MoveToUtf8(int desired_utf8_index) {
 }
 
 bool CharacterIterator::AdvanceToUtf8(int desired_utf8_index) {
-  ResetToStartIfNecessary();
-
-  if (desired_utf8_index > text_.length()) {
-    // Enforce the requirement.
+  // Check the boundary first to ensure we only handle desired_utf8_index in
+  // range [0, text_.length()].
+  //
+  // Note that desired_utf8_index == text_.length() is allowed.
+  if (desired_utf8_index > text_.length() || desired_utf8_index < 0) {
     return false;
   }
+
+  ResetToStartIfNecessary();
+
   // Need to work forwards.
   UChar32 uchar32 = cached_current_char_;
   while (utf8_index_ < desired_utf8_index) {
+    // At this point, utf8_index_ is a valid index in range [0, text_length() -
+    // 1], so we can call GetUChar32At safely.
     uchar32 =
         i18n_utils::GetUChar32At(text_.data(), text_.length(), utf8_index_);
-    if (uchar32 == i18n_utils::kInvalidUChar32) {
-      // Unable to retrieve a valid UTF-32 character at the previous position.
-      cached_current_char_ = i18n_utils::kInvalidUChar32;
-      return false;
+    int utf8_length = 1;
+    int utf16_length = 1;
+    if (uchar32 != i18n_utils::kInvalidUChar32) {
+      utf8_length = i18n_utils::GetUtf8Length(uchar32);
+      utf16_length = i18n_utils::GetUtf16Length(uchar32);
     }
-    int utf8_length = i18n_utils::GetUtf8Length(uchar32);
     if (utf8_index_ + utf8_length > desired_utf8_index) {
       // Ah! Don't go too far!
       break;
     }
     utf8_index_ += utf8_length;
-    utf16_index_ += i18n_utils::GetUtf16Length(uchar32);
+    utf16_index_ += utf16_length;
     ++utf32_index_;
   }
-  cached_current_char_ =
-      i18n_utils::GetUChar32At(text_.data(), text_.length(), utf8_index_);
+
+  if (utf8_index_ == text_.length()) {
+    // This is allowed and it means the iterator is at the end. Since
+    // std::string_view is not guaranteed to be null-terminated, we cannot read
+    // any bytes out of bound.
+    // Therefore, return 0 (null character) directly here.
+    cached_current_char_ = 0;
+  } else {
+    // At this point, utf8_index_ is a valid index in range [0, text_length() -
+    // 1], so we can call GetUChar32At safely.
+    cached_current_char_ =
+        i18n_utils::GetUChar32At(text_.data(), text_.length(), utf8_index_);
+  }
   return true;
 }
 
@@ -131,17 +160,16 @@ bool CharacterIterator::AdvanceToUtf16(int desired_utf16_index) {
   while (utf16_index_ < desired_utf16_index) {
     uchar32 =
         i18n_utils::GetUChar32At(text_.data(), text_.length(), utf8_index_);
-    if (uchar32 == i18n_utils::kInvalidUChar32) {
-      // Unable to retrieve a valid UTF-32 character at the previous position.
-      cached_current_char_ = i18n_utils::kInvalidUChar32;
-      return false;
+    int utf16_length = 1;
+    int utf8_length = 1;
+    if (uchar32 != i18n_utils::kInvalidUChar32) {
+      utf16_length = i18n_utils::GetUtf16Length(uchar32);
+      utf8_length = i18n_utils::GetUtf8Length(uchar32);
     }
-    int utf16_length = i18n_utils::GetUtf16Length(uchar32);
     if (utf16_index_ + utf16_length > desired_utf16_index) {
       // Ah! Don't go too far!
       break;
     }
-    int utf8_length = i18n_utils::GetUtf8Length(uchar32);
     if (utf8_index_ + utf8_length > text_.length()) {
       // Enforce the requirement.
       cached_current_char_ = i18n_utils::kInvalidUChar32;
@@ -203,13 +231,12 @@ bool CharacterIterator::AdvanceToUtf32(int desired_utf32_index) {
   while (utf32_index_ < desired_utf32_index) {
     uchar32 =
         i18n_utils::GetUChar32At(text_.data(), text_.length(), utf8_index_);
-    if (uchar32 == i18n_utils::kInvalidUChar32) {
-      // Unable to retrieve a valid UTF-32 character at the previous position.
-      cached_current_char_ = i18n_utils::kInvalidUChar32;
-      return false;
+    int utf16_length = 1;
+    int utf8_length = 1;
+    if (uchar32 != i18n_utils::kInvalidUChar32) {
+      utf16_length = i18n_utils::GetUtf16Length(uchar32);
+      utf8_length = i18n_utils::GetUtf8Length(uchar32);
     }
-    int utf16_length = i18n_utils::GetUtf16Length(uchar32);
-    int utf8_length = i18n_utils::GetUtf8Length(uchar32);
     if (utf8_index_ + utf8_length > text_.length()) {
       // Enforce the requirement.
       cached_current_char_ = i18n_utils::kInvalidUChar32;
@@ -263,8 +290,12 @@ void CharacterIterator::ResetToStartIfNecessary() {
     utf8_index_ = 0;
     utf16_index_ = 0;
     utf32_index_ = 0;
-    cached_current_char_ =
-        i18n_utils::GetUChar32At(text_.data(), text_.length(), 0);
+    if (!text_.empty()) {
+      cached_current_char_ =
+          i18n_utils::GetUChar32At(text_.data(), text_.length(), 0);
+    } else {
+      cached_current_char_ = i18n_utils::kInvalidUChar32;
+    }
   }
 }
 
