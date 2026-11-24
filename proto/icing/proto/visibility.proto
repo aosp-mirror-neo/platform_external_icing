@@ -43,13 +43,39 @@ message AndroidVOverlayProto {
 // relationship. A caller must match ALL requirements to access the schema. For
 // example, a caller must hold required permissions AND it is a specified
 // package.
+//
+// Placeholder packages: a reader that predates a field ignores it. When the
+// field narrows access, i.e. a caller has to match it in addition to the other
+// requirements, such a reader is left with the other requirements only, and
+// grants access to more callers than the writer intended. A writer that sets
+// such a field in one of AndroidVOverlayProto.visible_to_configs must therefore
+// also add a placeholder package to visible_to_packages of the same config: a
+// PackageIdentifierProto whose package_name cannot be the name of a real
+// package. A reader that predates the field then requires the caller to be the
+// placeholder package, so it grants access to no one through the config.
+//
+// Every field that narrows access has a placeholder of its own. A reader
+// removes the placeholders of the fields it knows before it uses a config, and
+// never returns them to callers. It does not remove any other placeholder: a
+// placeholder it does not know is treated as a real package, and matches no
+// caller.
+//
+// A reader that predates a field returns its placeholder to callers as a
+// package, and a caller can set it back, which stores the placeholder without
+// the field. A reader that knows the placeholder must skip such a config if the
+// placeholder is its only package, since the config would otherwise be left
+// with the other requirements only.
+//
+// Placeholder package names in use:
+//   "VS#PackagesWithTags" for visible_to_packages_with_tags.
 // Next tag: 6
 message VisibilityConfigProto {
   // OPTIONAL: whether this schema could be visible to the platform.
   optional bool not_platform_surfaceable = 1;
 
   // OPTIONAL: the package identifiers of the while list packages that have
-  // access to this schema.
+  // access to this schema. May also hold placeholder packages, see the comment
+  // of this message.
   repeated PackageIdentifierProto visible_to_packages = 2;
 
   // OPTIONAL: the required permission combinations that the caller need to
@@ -61,7 +87,10 @@ message VisibilityConfigProto {
   optional PackageIdentifierProto publicly_visible_target_package = 4;
 
   // OPTIONAL: the package identifiers paired with required attribution tags
-  // that have access to this schema.
+  // that have access to this schema. Only set in
+  // AndroidVOverlayProto.visible_to_configs. This field narrows access, so a
+  // config that sets it also has the "VS#PackagesWithTags" placeholder package
+  // in visible_to_packages, see the comment of this message.
   repeated VisibleToPackageWithTagsProto visible_to_packages_with_tags = 5;
 }
 
@@ -91,10 +120,10 @@ message VisibleToPermissionProto {
 // attribution tags. A caller from the package matches this entry only if it
 // presents one of the tags.
 //
-// The tags apply to this entry only. If the same package is also present in
-// visible_to_packages, that entry continues to match every caller from the
-// package, regardless of attribution tag. A package is therefore restricted
-// to tagged callers only when it is absent from visible_to_packages.
+// A config has either packages (visible_to_packages) or packages paired with
+// attribution tags (visible_to_packages_with_tags), not both. The placeholder
+// package described in VisibilityConfigProto does not count as a package here.
+// A config that has both is invalid, and readers skip it.
 // Next tag: 3
 message VisibleToPackageWithTagsProto {
   // REQUIRED: the package identifier that is granted access when presenting a

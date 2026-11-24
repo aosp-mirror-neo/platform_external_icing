@@ -780,12 +780,11 @@ message IcingSearchEngineOptions {
   optional bool enable_handle_zero_filled_magic_recovery = 68;
 
   // [PURE_ROLLOUT_FLAG]
-  // Whether to pass compression_mem_level to GzipOutputStream when writing
-  // compressed protos in PortableFileBackedProtoLog.
-  //
-  // Previously compression_mem_level was validated and stored on
-  // PortableFileBackedProtoLog without being assigned to
-  // GzipOutputStream::Options, so writes defaulted to memLevel 8.
+  // Whether to enable low-memory zlib compression in
+  // PortableFileBackedProtoLog: pass compression_mem_level and cap windowBits
+  // at 14 on compressed writes, and emit RFC 1950 stored frames directly
+  // without deflateInit2 when compression is skipped (below threshold or
+  // compression_level == 0).
   optional bool enable_proto_log_compression_mem_level = 69;
 
   reserved 2, 20, 25;
