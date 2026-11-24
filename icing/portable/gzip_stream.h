@@ -39,6 +39,7 @@ namespace protobuf_ports {
 
 static constexpr size_t kDefaultBufferSize = 64 * 1024;  // 64kb
 static constexpr int kDefaultMemLevel = 8;
+static constexpr int kDefaultWindowBits = 15;
 
 // A ZeroCopyInputStream that reads compressed data through zlib
 class GzipInputStream : public google::protobuf::io::ZeroCopyInputStream {
@@ -60,6 +61,13 @@ class GzipInputStream : public google::protobuf::io::ZeroCopyInputStream {
                            Format format, void* output_buffer,
                            size_t buffer_size);
   virtual ~GzipInputStream();
+
+  // Prepares this object to decompress a new, independent stream read from
+  // sub_stream into output_buffer, keeping the format given at construction.
+  // If zlib state was already allocated, it is reused via inflateReset()
+  // instead of being freed and allocated again.
+  void Reset(google::protobuf::io::ZeroCopyInputStream* sub_stream, void* output_buffer,
+             size_t buffer_size);
 
   // Return last error message or NULL if no error.
   inline const char* ZlibErrorMessage() const { return zcontext_.msg; }
@@ -125,6 +133,12 @@ class GzipOutputStream : public google::protobuf::io::ZeroCopyOutputStream {
     // See the documentation for deflateInit2 in zlib.h for more details.
     int mem_level;
 
+    // Base-2 logarithm of the window size (history buffer) for deflateInit2,
+    // between 9 and 15. Defaults to 15 (32 KiB window). Setting 14 (16 KiB
+    // window) keeps zlib's s->window allocation (32,784 B) inside Android
+    // Scudo's Primary allocator instead of spilling 16 B into Secondary.
+    int window_bits;
+
     Options();  // Initializes with default values.
   };
 
@@ -161,6 +175,23 @@ class GzipOutputStream : public google::protobuf::io::ZeroCopyOutputStream {
   // Returns true if no error.
   bool Close();
 
+  // Writes out all data and finishes the compressed stream, like Close(), but
+  // keeps the zlib state allocated so that this object can be reused for
+  // another stream via Reset(). The zlib state is released by Close() or the
+  // destructor.
+  // Returns true if no error.
+  bool Finish();
+
+  // Prepares this object to compress a new, independent stream into
+  // sub_stream with the given options. If the current zlib state is compatible
+  // (same format, mem_level, and window_bits), it is reused via deflateReset()
+  // and deflateParams() instead of being freed and allocated again; otherwise
+  // it is reinitialized. The produced bytes are identical to those of a newly
+  // constructed GzipOutputStream with the same options.
+  // Returns true if no error.
+  bool Reset(google::protobuf::io::ZeroCopyOutputStream* sub_stream,
+             const Options& options);
+
   // implements ZeroCopyOutputStream ---------------------------------
   bool Next(void** data, int* size) override;
   void BackUp(int count) override;
@@ -176,10 +207,22 @@ class GzipOutputStream : public google::protobuf::io::ZeroCopyOutputStream {
   int zerror_;
   void* input_buffer_;
   size_t input_buffer_length_;
+  size_t input_buffer_capacity_;
+
+  // Parameters that zlib cannot change without reinitializing the stream.
+  Format format_;
+  int mem_level_;
+  int window_bits_;
 
   // Shared constructor code.
   void Init(google::protobuf::io::ZeroCopyOutputStream* sub_stream,
             const Options& options);
+
+  // Resets the stream bookkeeping and the sub stream.
+  void ResetStreamState(google::protobuf::io::ZeroCopyOutputStream* sub_stream);
+
+  // Calls deflateInit2 with the given options. Returns zlib error code.
+  int DeflateInit(const Options& options);
 
   // Do some compression.
   // Takes zlib flush mode.
