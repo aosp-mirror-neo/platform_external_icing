@@ -48,6 +48,27 @@ import java.io.Closeable;
 
 /** A common user-facing interface to expose the functionalities provided by Icing Library. */
 public interface IcingSearchEngineInterface extends Closeable {
+  /** The environment that an implementation runs in and persists its data in. */
+  enum Environment {
+    /** Runs in the same environment as its caller. The persisted data is not isolated from it. */
+    NOT_ISOLATED,
+    /**
+     * Runs in an environment that is isolated from its caller. The data of all users is persisted
+     * in storage that is shared inside the isolated environment.
+     */
+    ISOLATED,
+    /**
+     * Runs in an environment that is isolated from its caller. The data of each user is persisted
+     * in separate encrypted storage that is bound to that user.
+     */
+    ISOLATED_WITH_PER_USER_STORAGE,
+  }
+
+  /** Returns the environment that this implementation runs in and persists its data in. */
+  default Environment getEnvironment() {
+    return Environment.NOT_ISOLATED;
+  }
+
   /**
    * Initializes the current IcingSearchEngine implementation.
    *
@@ -205,7 +226,8 @@ public interface IcingSearchEngineInterface extends Closeable {
 
   /**
    * Marks the blob is committed along with its blob key. The blob key is persisted as-is, so the
-   * caller must not pass plaintext key material.
+   * caller must not pass plaintext key material unless {@link #getEnvironment()} returns {@link
+   * Environment#ISOLATED_WITH_PER_USER_STORAGE}.
    */
   default BlobProto commitEncryptedBlob(
       PropertyProto.BlobHandleProto blobHandle, BlobKeyProto blobKey) {

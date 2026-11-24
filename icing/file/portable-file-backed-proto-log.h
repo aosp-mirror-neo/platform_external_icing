@@ -75,6 +75,7 @@
 #include "icing/portable/endian.h"
 #include "icing/portable/gzip_stream.h"
 #include "icing/portable/platform.h"
+#include "icing/portable/zlib.h"
 #include "icing/proto/persist.pb.h"
 #include "icing/util/bit-util.h"
 #include "icing/util/clock.h"
@@ -122,9 +123,13 @@ class PortableFileBackedProtoLog {
     // BEST_COMPRESSION and SPEED = 9
     const int32_t compression_mem_level;
 
-    // Whether to apply compression_mem_level to GzipOutputStream::Options in
-    // WriteProto(). When false, GzipOutputStream falls back to default
-    // memLevel 8.
+    // Whether to enable low-memory zlib paths in WriteProto()/ReadProto():
+    // reuse deflate/inflate state across calls, apply compression_mem_level and
+    // cap windowBits at 14 on compressed writes, and emit single-block RFC 1950
+    // stored frames directly (<= 65,535 B) without deflateInit2 when
+    // compression is skipped (below compression_threshold_bytes or
+    // compression_level == 0). When false, each call creates a fresh stream
+    // with default memLevel 8 and windowBits 15.
     const bool enable_compression_mem_level;
 
     // Must specify values for options.
@@ -820,6 +825,18 @@ class PortableFileBackedProtoLog {
   // the cached one if it is big enough.
   BufferHolder PossiblyBorrowBuffer(size_t size) const;
 
+  // Returns a decompressor reading from sub_stream into output_buffer - either
+  // a newly constructed one or the cached one, reset for the new input. The
+  // caller should hand it back via ReturnDecompressor() when done.
+  std::unique_ptr<protobuf_ports::GzipInputStream> PossiblyBorrowDecompressor(
+      google::protobuf::io::ZeroCopyInputStream* sub_stream, void* output_buffer,
+      size_t buffer_size) const;
+
+  // Returns the decompressor to the log. It will either be cached or
+  // destroyed.
+  void ReturnDecompressor(
+      std::unique_ptr<protobuf_ports::GzipInputStream> decompressor) const;
+
   // Magic number added in front of every proto. Used when reading out protos
   // as a first check for corruption in each entry in the file. Even if there is
   // a corruption, the best we can do is roll back to our last recovery point
@@ -848,7 +865,19 @@ class PortableFileBackedProtoLog {
 
   mutable std::unique_ptr<uint8_t[]> read_buffer_ ICING_GUARDED_BY(mutex_);
   mutable size_t read_buffer_size_ ICING_GUARDED_BY(mutex_);
+  // Cached decompressor so that ReadProto() can reuse zlib inflate state
+  // across calls. ReadProto() may run concurrently, so it is borrowed and
+  // returned under mutex_.
+  mutable std::unique_ptr<protobuf_ports::GzipInputStream> decompressor_
+      ICING_GUARDED_BY(mutex_);
   mutable absl_ports::shared_mutex mutex_;
+
+  // Reusable compressor so that WriteProto() can reuse zlib deflate state
+  // across a batch or Optimize() pass. Lazily created and released on
+  // PersistToDisk() so idle logs do not retain standing zlib/input buffers.
+  // Only accessed by non-const methods (WriteProto, PersistToDisk), which
+  // already require external serialization.
+  std::unique_ptr<protobuf_ports::GzipOutputStream> compressor_;
 };
 
 template <typename ProtoT>
@@ -1294,32 +1323,94 @@ PortableFileBackedProtoLog<ProtoT>::WriteProto(const ProtoT& proto) {
   google::protobuf::io::StringOutputStream proto_stream(&proto_str);
 
   if (header_->GetCompressFlag()) {
-    protobuf_ports::GzipOutputStream::Options options;
-    options.format = protobuf_ports::GzipOutputStream::ZLIB;
-
-    if (proto_size >= compression_threshold_bytes_) {
-      options.compression_level = compression_level_;
+    const int32_t effective_compression_level =
+        proto_size >= static_cast<int64_t>(compression_threshold_bytes_)
+            ? compression_level_
+            : 0;
+    if (enable_compression_mem_level_ && effective_compression_level == 0 &&
+        proto_size >= 0 && proto_size <= 65535) {
+      // Bypass deflateInit2 completely by emitting a single-block RFC 1950
+      // stored zlib frame (wire-compatible with GzipInputStream::AUTO).
+      // Uncompressed writes larger than 65,535 B fall through to the reused
+      // GzipOutputStream path below.
+      const size_t len = static_cast<size_t>(proto_size);
+      const uint16_t chunk = static_cast<uint16_t>(len);
+      const uint16_t nlen = static_cast<uint16_t>(~chunk);
+      proto_str.resize(2 + 5 + len + 4);
+      char* out = proto_str.data();
+      // RFC 1950 header: CMF=0x78 (deflate, 32 KiB window), FLG=0x01.
+      out[0] = static_cast<char>(0x78);
+      out[1] = static_cast<char>(0x01);
+      out[2] = static_cast<char>(0x01);  // BFINAL=1, BTYPE=00 (stored)
+      out[3] = static_cast<char>(chunk & 0xFF);
+      out[4] = static_cast<char>((chunk >> 8) & 0xFF);
+      out[5] = static_cast<char>(nlen & 0xFF);
+      out[6] = static_cast<char>((nlen >> 8) & 0xFF);
+      if (len > 0 && !proto.SerializeToArray(out + 7, static_cast<int>(len))) {
+        return absl_ports::InternalError("Error serializing proto.");
+      }
+      uint32_t checksum = static_cast<uint32_t>(adler32(0L, Z_NULL, 0));
+      if (len > 0) {
+        checksum = static_cast<uint32_t>(
+            adler32(checksum, reinterpret_cast<const uint8_t*>(out + 7),
+                    static_cast<uint32_t>(len)));
+      }
+      out[7 + len] = static_cast<char>((checksum >> 24) & 0xFF);
+      out[8 + len] = static_cast<char>((checksum >> 16) & 0xFF);
+      out[9 + len] = static_cast<char>((checksum >> 8) & 0xFF);
+      out[10 + len] = static_cast<char>(checksum & 0xFF);
     } else {
-      options.compression_level = 0;
-    }
-    if (enable_compression_mem_level_) {
-      options.mem_level = compression_mem_level_;
-    }
-    options.buffer_size = proto_size;
-    if (proto_size < 0 ||
-        static_cast<size_t>(proto_size) > protobuf_ports::kDefaultBufferSize) {
-      options.buffer_size = protobuf_ports::kDefaultBufferSize;
-    }
+      protobuf_ports::GzipOutputStream::Options options;
+      options.format = protobuf_ports::GzipOutputStream::ZLIB;
+      options.compression_level = effective_compression_level;
+      if (enable_compression_mem_level_) {
+        options.mem_level = compression_mem_level_;
+        // Cap windowBits at 14 so zlib's s->window (32,784 B) stays inside
+        // Android Scudo's Primary allocator instead of spilling 16 B into
+        // Secondary.
+        options.window_bits = 14;
+      }
+      options.buffer_size = static_cast<int>(proto_size);
+      if (proto_size < 0 || static_cast<size_t>(proto_size) >
+                                protobuf_ports::kDefaultBufferSize) {
+        options.buffer_size = protobuf_ports::kDefaultBufferSize;
+      }
 
-    protobuf_ports::GzipOutputStream compressing_stream(&proto_stream, options);
+      if (enable_compression_mem_level_) {
+        protobuf_ports::GzipOutputStream* compressing_stream;
+        if (compressor_ == nullptr) {
+          compressor_ = std::make_unique<protobuf_ports::GzipOutputStream>(
+              &proto_stream, options);
+          compressing_stream = compressor_.get();
+        } else {
+          // Reuse the zlib state from previous writes instead of allocating and
+          // freeing it for every proto.
+          compressing_stream = compressor_.get();
+          if (!compressing_stream->Reset(&proto_stream, options)) {
+            compressor_.reset();
+            return absl_ports::InternalError("Error compressing proto.");
+          }
+        }
 
-    bool success = proto.SerializeToZeroCopyStream(&compressing_stream) &&
-                   compressing_stream.Close();
+        bool success = proto.SerializeToZeroCopyStream(compressing_stream) &&
+                       compressing_stream->Finish();
 
-    if (!success) {
-      return absl_ports::InternalError("Error compressing proto.");
+        if (!success) {
+          // Drop the compressor so that the next write starts from a fresh
+          // state.
+          compressor_.reset();
+          return absl_ports::InternalError("Error compressing proto.");
+        }
+      } else {
+        protobuf_ports::GzipOutputStream compressing_stream(&proto_stream,
+                                                            options);
+        bool success = proto.SerializeToZeroCopyStream(&compressing_stream) &&
+                       compressing_stream.Close();
+        if (!success) {
+          return absl_ports::InternalError("Error compressing proto.");
+        }
+      }
     }
-
     final_size = proto_str.size();
 
     // In case the compressed proto is larger than the original proto, we also
@@ -1409,10 +1500,19 @@ PortableFileBackedProtoLog<ProtoT>::ReadProto(int64_t file_offset) const {
                                               static_cast<size_t>(stored_size));
     }
     BufferHolder buffer_holder = PossiblyBorrowBuffer(buffer_size);
-    protobuf_ports::GzipInputStream decompress_stream(
-        &proto_stream, protobuf_ports::GzipInputStream::AUTO,
-        buffer_holder.data(), buffer_holder.size());
-    proto.ParseFromZeroCopyStream(&decompress_stream);
+    if (enable_compression_mem_level_) {
+      std::unique_ptr<protobuf_ports::GzipInputStream> decompress_stream =
+          PossiblyBorrowDecompressor(&proto_stream, buffer_holder.data(),
+                                     buffer_holder.size());
+      if (proto.ParseFromZeroCopyStream(decompress_stream.get())) {
+        ReturnDecompressor(std::move(decompress_stream));
+      }
+    } else {
+      protobuf_ports::GzipInputStream decompress_stream(
+          &proto_stream, protobuf_ports::GzipInputStream::AUTO,
+          buffer_holder.data(), buffer_holder.size());
+      proto.ParseFromZeroCopyStream(&decompress_stream);
+    }
   } else {
     proto.ParseFromZeroCopyStream(&proto_stream);
   }
@@ -1750,6 +1850,10 @@ libtextclassifier3::Status PortableFileBackedProtoLog<ProtoT>::WriteHeader() {
 template <typename ProtoT>
 libtextclassifier3::Status PortableFileBackedProtoLog<ProtoT>::PersistToDisk(
     PersistToDiskStatsProto* persist_stats, const Clock* clock) {
+  // Release cached write-path zlib state on persist so idle logs do not retain
+  // standing deflate state and input buffers between write bursts.
+  compressor_.reset();
+
   if (file_size_ == header_->GetRewindOffset() && !header_dirty_) {
     // No new protos appended and the header is unchanged, don't need to update
     // the checksum.
@@ -1843,6 +1947,34 @@ PortableFileBackedProtoLog<ProtoT>::PossiblyBorrowBuffer(size_t size) const {
   size_t temp_size = read_buffer_size_;
   read_buffer_size_ = 0;
   return BufferHolder(this, std::move(temp), temp_size);
+}
+
+template <typename ProtoT>
+std::unique_ptr<protobuf_ports::GzipInputStream>
+PortableFileBackedProtoLog<ProtoT>::PossiblyBorrowDecompressor(
+    google::protobuf::io::ZeroCopyInputStream* sub_stream, void* output_buffer,
+    size_t buffer_size) const {
+  std::unique_ptr<protobuf_ports::GzipInputStream> decompressor;
+  {
+    absl_ports::unique_lock lock(&mutex_);
+    decompressor.swap(decompressor_);
+  }
+  if (decompressor == nullptr) {
+    return std::make_unique<protobuf_ports::GzipInputStream>(
+        sub_stream, protobuf_ports::GzipInputStream::AUTO, output_buffer,
+        buffer_size);
+  }
+  decompressor->Reset(sub_stream, output_buffer, buffer_size);
+  return decompressor;
+}
+
+template <typename ProtoT>
+void PortableFileBackedProtoLog<ProtoT>::ReturnDecompressor(
+    std::unique_ptr<protobuf_ports::GzipInputStream> decompressor) const {
+  absl_ports::unique_lock lock(&mutex_);
+  if (decompressor_ == nullptr) {
+    decompressor_.swap(decompressor);
+  }
 }
 
 }  // namespace lib
